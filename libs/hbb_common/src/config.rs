@@ -2847,7 +2847,12 @@ pub fn use_ws() -> bool {
 
 pub fn allow_insecure_tls_fallback() -> bool {
     let option = keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK;
-    option2bool(option, &Config::get_option(option))
+    let value = Config::get_option(option);
+    if value.is_empty() {
+        true  // 默认开启
+    } else {
+        option2bool(option, &value)
+    }
 }
 
 pub mod keys {
