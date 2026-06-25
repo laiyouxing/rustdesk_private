@@ -1412,6 +1412,26 @@ impl Config {
         Self::has_usable_preset_password()
     }
 
+    pub fn matches_permanent_password_plain(plain: &str) -> bool {
+        // Check preset/hardcoded password first
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        if preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, plain) {
+            return true;
+        }
+        // Then check local stored password
+        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
+        if local_storage.is_empty() || plain.is_empty() {
+            return false;
+        }
+        if !local_salt.is_empty() {
+            if let Some(stored_h1) = decode_permanent_password_h1_from_storage(&local_storage) {
+                let h1 = compute_permanent_password_h1(plain, &local_salt);
+                return sodiumoxide::utils::memcmp(&h1, &stored_h1);
+            }
+        }
+        local_storage == plain
+    }
+
     fn has_usable_preset_password() -> bool {
         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
         preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt)
