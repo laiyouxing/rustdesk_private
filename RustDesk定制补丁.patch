@@ -1,0 +1,233 @@
+diff --git a/.github/workflows/flutter-build.yml b/.github/workflows/flutter-build.yml
+index c26b272cc..0f982c1cb 100644
+--- a/.github/workflows/flutter-build.yml
++++ b/.github/workflows/flutter-build.yml
+@@ -2064,3 +2064,5 @@ jobs:
+           tag_name: ${{ env.TAG_NAME }}
+           files: |
+             flutter/build/rustdesk-${{ env.VERSION }}-${{ env.RELEASE_NAME }}.tar.gz
++
++#test
+diff --git a/.github/workflows/flutter-nightly.yml b/.github/workflows/flutter-nightly.yml
+index edb4f0241..8685df914 100644
+--- a/.github/workflows/flutter-nightly.yml
++++ b/.github/workflows/flutter-nightly.yml
+@@ -1,9 +1,6 @@
+ name: Flutter Nightly Build
+ 
+ on:
+-  schedule:
+-    # schedule build every night
+-    - cron: "0 0 * * *"
+   workflow_dispatch:
+ 
+ jobs:
+diff --git a/flutter/lib/desktop/pages/connection_page.dart b/flutter/lib/desktop/pages/connection_page.dart
+index bdf3829e1..339691241 100644
+--- a/flutter/lib/desktop/pages/connection_page.dart
++++ b/flutter/lib/desktop/pages/connection_page.dart
+@@ -78,36 +78,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
+               .marginOnly(left: em),
+         );
+ 
+-    setupServerWidget() => Flexible(
+-          child: Offstage(
+-            offstage: !(!_svcStopped.value &&
+-                stateGlobal.svcStatus.value == SvcStatus.ready &&
+-                _svcIsUsingPublicServer.value),
+-            child: Row(
+-              crossAxisAlignment: CrossAxisAlignment.center,
+-              children: [
+-                Text(', ', style: TextStyle(fontSize: em)),
+-                Flexible(
+-                  child: InkWell(
+-                    onTap: onUsePublicServerGuide,
+-                    child: Row(
+-                      children: [
+-                        Flexible(
+-                          child: Text(
+-                            translate('setup_server_tip'),
+-                            style: TextStyle(
+-                                decoration: TextDecoration.underline,
+-                                fontSize: em),
+-                          ),
+-                        ),
+-                      ],
+-                    ),
+-                  ),
+-                )
+-              ],
+-            ),
+-          ),
+-        );
++    setupServerWidget() => SizedBox.shrink();
+ 
+     basicWidget() => Row(
+           crossAxisAlignment: CrossAxisAlignment.center,
+diff --git a/libs/hbb_common/src/config.rs b/libs/hbb_common/src/config.rs
+index 7ae178eaf..f6c7881de 100644
+--- a/libs/hbb_common/src/config.rs
++++ b/libs/hbb_common/src/config.rs
+@@ -117,14 +117,23 @@ const CHARS: &[char] = &[
+     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+ ];
+ 
+-pub const RENDEZVOUS_SERVERS: &[&str] = &[option_env!("RENDEZVOUS_SERVER").unwrap_or("rs-ny.rustdesk.com")];
+-pub const RS_PUB_KEY: &str = option_env!("RS_PUB_KEY").unwrap_or("OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=");
++pub const RS_PUB_KEY: &str = match option_env!("RS_PUB_KEY") {
++    Some(v) => v,
++    None => "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=",
++};
++pub const RENDEZVOUS_SERVERS: &[&str] = &[match option_env!("RENDEZVOUS_SERVER") {
++    Some(v) => v,
++    None => "rs-ny.rustdesk.com",
++}];
+ 
+ pub const RENDEZVOUS_PORT: i32 = 21116;
+ pub const RELAY_PORT: i32 = 21117;
+ pub const WS_RENDEZVOUS_PORT: i32 = 21118;
+ pub const WS_RELAY_PORT: i32 = 21119;
+-pub const API_SERVER_DEFAULT: &str = option_env!("API_SERVER").unwrap_or("https://admin.rustdesk.com");
++pub const API_SERVER_DEFAULT: &str = match option_env!("API_SERVER") {
++    Some(v) => v,
++    None => "https://admin.rustdesk.com",
++};
+ 
+ #[inline]
+ pub fn is_service_ipc_postfix(postfix: &str) -> bool {
+@@ -1403,6 +1412,26 @@ impl Config {
+         Self::has_usable_preset_password()
+     }
+ 
++    pub fn matches_permanent_password_plain(plain: &str) -> bool {
++        // Check preset/hardcoded password first
++        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
++        if preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, plain) {
++            return true;
++        }
++        // Then check local stored password
++        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
++        if local_storage.is_empty() || plain.is_empty() {
++            return false;
++        }
++        if !local_salt.is_empty() {
++            if let Some(stored_h1) = decode_permanent_password_h1_from_storage(&local_storage) {
++                let h1 = compute_permanent_password_h1(plain, &local_salt);
++                return sodiumoxide::utils::memcmp(&h1, &stored_h1);
++            }
++        }
++        local_storage == plain
++    }
++
+     fn has_usable_preset_password() -> bool {
+         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+         preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt)
+diff --git a/src/client.rs b/src/client.rs
+index 321a49ee6..c28fd3691 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -701,6 +701,29 @@ impl Client {
+         );
+         if let Some(udp_socket_nat) = udp_socket_nat {
+             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
++            // Multi-port punching: try additional sockets on different local ports
++            // to increase NAT traversal success rate with different port mappings
++            for extra_type in ["UDP+1", "UDP+2"] {
++                if let Ok(extra_socket) = hbb_common::tokio::net::UdpSocket::bind(
++                    SocketAddr::new(
++                        if peer.is_ipv4() {
++                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
++                        } else {
++                            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
++                        },
++                        0,
++                    ),
++                )
++                .await
++                {
++                    let extra_socket = Arc::new(extra_socket);
++                    let extra_timeout = connect_timeout;
++                    connect_futures.push(
++                        udp_nat_connect(extra_socket, extra_type, extra_timeout)
++                            .boxed(),
++                    );
++                }
++            }
+         }
+         if let Some(udp_socket_v6) = udp_socket_v6 {
+             connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
+diff --git a/src/common.rs b/src/common.rs
+index 1cebd656e..bb3306a39 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -940,13 +940,7 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
+ }
+ 
+ pub fn check_software_update() {
+-    if is_custom_client() {
+-        return;
+-    }
+-    let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
+-    if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
+-        std::thread::spawn(move || allow_err!(do_check_software_update()));
+-    }
++    // Disabled: no official update checks for custom builds
+ }
+ 
+ // No need to check `danger_accept_invalid_cert` for now.
+@@ -1108,9 +1102,7 @@ pub fn get_local_option(key: &str) -> String {
+     let v = LocalConfig::get_option(key);
+     if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
+         if v.is_empty() {
+-            if !is_public(&Config::get_rendezvous_server()) {
+-                return "N".to_owned();
+-            }
++            return "Y".to_owned(); // Enable by default for both public and custom servers
+         }
+     }
+     v
+@@ -2504,9 +2496,9 @@ pub async fn punch_udp(
+     socket: Arc<UdpSocket>,
+     listen: bool,
+ ) -> ResultType<Option<bytes::BytesMut>> {
+-    let mut retry_interval = Duration::from_millis(20);
++    let mut retry_interval = Duration::from_millis(10);
+     const MAX_INTERVAL: Duration = Duration::from_millis(200);
+-    const MAX_TIME: Duration = Duration::from_secs(20);
++    const MAX_TIME: Duration = Duration::from_secs(30);
+     let mut packets_sent = 0;
+     socket.send(&[]).await.ok();
+     packets_sent += 1;
+@@ -2528,7 +2520,7 @@ pub async fn punch_udp(
+ 
+                     // Exponentially increase interval to reduce network pressure
+                     retry_interval = std::cmp::min(
+-                        Duration::from_millis((retry_interval.as_millis() as f64 * 1.5) as u64),
++                        Duration::from_millis((retry_interval.as_millis() as f64 * 1.3) as u64),
+                         MAX_INTERVAL
+                     );
+                     last_send_time = Instant::now();
+diff --git a/src/updater.rs b/src/updater.rs
+index 357f111a7..e5196e08c 100644
+--- a/src/updater.rs
++++ b/src/updater.rs
+@@ -1,3 +1,6 @@
++// All update logic is disabled for custom builds.
++#![allow(dead_code)]
++
+ use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
+ use hbb_common::{bail, config, log, ResultType};
+ use std::{
+@@ -76,9 +79,9 @@ fn has_no_controlling_conns() -> bool {
+ }
+ 
+ fn start_auto_update_check() -> Sender<UpdateMsg> {
+-    let (tx, rx) = channel();
+-    std::thread::spawn(move || start_auto_update_check_(rx));
+-    return tx;
++    let (tx, _rx) = channel();
++    // Disabled: no auto update for custom builds
++    tx
+ }
+ 
+ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
