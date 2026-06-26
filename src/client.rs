@@ -703,7 +703,7 @@ impl Client {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
             // Multi-port punching: try additional sockets on different local ports
             // to increase NAT traversal success rate with different port mappings
-            for i in 1..=2 {
+            for extra_type in ["UDP+1", "UDP+2"] {
                 if let Ok(extra_socket) = hbb_common::tokio::net::UdpSocket::bind(
                     SocketAddr::new(
                         if peer.is_ipv4() {
@@ -719,7 +719,7 @@ impl Client {
                     let extra_socket = Arc::new(extra_socket);
                     let extra_timeout = connect_timeout;
                     connect_futures.push(
-                        udp_nat_connect(extra_socket, &format!("UDP+{}", i), extra_timeout)
+                        udp_nat_connect(extra_socket, extra_type, extra_timeout)
                             .boxed(),
                     );
                 }
