@@ -691,16 +691,36 @@ impl Client {
         let start = std::time::Instant::now();
 
         let mut connect_futures = Vec::new();
-        // TCP simultaneous open: multiple staggered connect attempts
+        // TCP simultaneous open: staggered connect attempts
         // to increase chance of SYNs crossing with the peer
-        for (delay_ms, label) in [(0u64, "TCP"), (200, "TCP+1"), (700, "TCP+2")] {
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
             connect_futures.push(
                 async move {
-                    if delay_ms > 0 {
-                        hbb_common::tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    }
-                    let conn = connect_tcp_local(peer, Some(local_addr), connect_timeout).await?;
-                    Ok((conn, None, label))
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP"))
+                }
+                .boxed(),
+            );
+        }
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP+1"))
+                }
+                .boxed(),
+            );
+        }
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP+2"))
                 }
                 .boxed(),
             );
