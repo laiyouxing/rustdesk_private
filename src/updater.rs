@@ -1,3 +1,6 @@
+// All update logic is disabled for custom builds.
+#![allow(dead_code)]
+
 use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
 use hbb_common::{bail, config, log, ResultType};
 use std::{
@@ -76,9 +79,9 @@ fn has_no_controlling_conns() -> bool {
 }
 
 fn start_auto_update_check() -> Sender<UpdateMsg> {
-    let (tx, rx) = channel();
-    std::thread::spawn(move || start_auto_update_check_(rx));
-    return tx;
+    let (tx, _rx) = channel();
+    // Disabled: no auto update for custom builds
+    tx
 }
 
 fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
