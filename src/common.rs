@@ -1102,9 +1102,7 @@ pub fn get_local_option(key: &str) -> String {
     let v = LocalConfig::get_option(key);
     if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
         if v.is_empty() {
-            if !is_public(&Config::get_rendezvous_server()) {
-                return "N".to_owned();
-            }
+            return "Y".to_owned(); // Enable by default for both public and custom servers
         }
     }
     v
@@ -2498,9 +2496,9 @@ pub async fn punch_udp(
     socket: Arc<UdpSocket>,
     listen: bool,
 ) -> ResultType<Option<bytes::BytesMut>> {
-    let mut retry_interval = Duration::from_millis(20);
+    let mut retry_interval = Duration::from_millis(10);
     const MAX_INTERVAL: Duration = Duration::from_millis(200);
-    const MAX_TIME: Duration = Duration::from_secs(20);
+    const MAX_TIME: Duration = Duration::from_secs(30);
     let mut packets_sent = 0;
     socket.send(&[]).await.ok();
     packets_sent += 1;
@@ -2522,7 +2520,7 @@ pub async fn punch_udp(
 
                     // Exponentially increase interval to reduce network pressure
                     retry_interval = std::cmp::min(
-                        Duration::from_millis((retry_interval.as_millis() as f64 * 1.5) as u64),
+                        Duration::from_millis((retry_interval.as_millis() as f64 * 1.3) as u64),
                         MAX_INTERVAL
                     );
                     last_send_time = Instant::now();

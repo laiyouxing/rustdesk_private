@@ -701,6 +701,29 @@ impl Client {
         );
         if let Some(udp_socket_nat) = udp_socket_nat {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
+            // Multi-port punching: try additional sockets on different local ports
+            // to increase NAT traversal success rate with different port mappings
+            for i in 1..=2 {
+                if let Ok(extra_socket) = hbb_common::tokio::net::UdpSocket::bind(
+                    SocketAddr::new(
+                        if peer.is_ipv4() {
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                        } else {
+                            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                        },
+                        0,
+                    ),
+                )
+                .await
+                {
+                    let extra_socket = Arc::new(extra_socket);
+                    let extra_timeout = connect_timeout;
+                    connect_futures.push(
+                        udp_nat_connect(extra_socket, &format!("UDP+{}", i), extra_timeout)
+                            .boxed(),
+                    );
+                }
+            }
         }
         if let Some(udp_socket_v6) = udp_socket_v6 {
             connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
