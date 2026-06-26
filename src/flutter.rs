@@ -732,13 +732,13 @@ impl InvokeUiSession for FlutterHandler {
         );
     }
 
-    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str) {
-        self.push_event(
+    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str) {\n        let relay_server = if !direct {\n            hbb_common::config::Config::get_option("relay-server")\n        } else {\n            String::new()\n        };\n        self.push_event(
             "connection_ready",
             &[
                 ("secure", &is_secured.to_string()),
                 ("direct", &direct.to_string()),
                 ("stream_type", &stream_type.to_string()),
+                ("relay_server", &relay_server),
             ],
             &[],
         );

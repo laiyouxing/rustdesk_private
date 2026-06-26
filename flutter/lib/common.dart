@@ -4111,9 +4111,6 @@ String getConnectionText(bool secure, bool direct, String streamType) {
   } else {
     connectionText = translate("Relayed and unencrypted connection");
   }
-  if (streamType == 'Relay') {
-    streamType = 'TCP';
-  }
   if (streamType.isEmpty) {
     return connectionText;
   } else {
