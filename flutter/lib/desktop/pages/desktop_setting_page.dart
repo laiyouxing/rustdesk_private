@@ -2433,7 +2433,20 @@ class _AboutState extends State<_About> {
                     ),
                   ],
                 )),
-              ).marginSymmetric(vertical: 4.0)
+              ).marginSymmetric(vertical: 4.0),
+              SelectionArea(
+                child: Text(
+                  "广州聚杰芯科智能有限公司定制版",
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Theme.of(context)
+                        .textTheme
+                        .titleLarge
+                        ?.color
+                        ?.withOpacity(0.6),
+                  ),
+                ).marginSymmetric(vertical: 8.0),
+              ),
             ],
           ).marginOnly(left: _kContentHMargin)
         ]),
