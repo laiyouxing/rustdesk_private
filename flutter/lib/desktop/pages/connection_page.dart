@@ -283,12 +283,13 @@ class _ConnectionPageState extends State<ConnectionPage>
             child: Column(
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Flexible(child: _buildRemoteIDTextField(context)),
+                SizedBox(width: 12),
+                hostnameColumn(context),
               ],
             ).marginOnly(top: 22),
-            // Hostname row
-            hostnameRow(context),
             SizedBox(height: 12),
             Divider().paddingOnly(right: 12),
             Expanded(child: PeerTabPage()),
@@ -588,44 +589,43 @@ class _ConnectionPageState extends State<ConnectionPage>
         constraints: const BoxConstraints(maxWidth: 600), child: w);
   }
 
-  /// Hostname row: editable text field for custom device name.
-  Widget hostnameRow(BuildContext context) {
+  /// Hostname panel: displayed next to the remote ID input.
+  Widget hostnameColumn(BuildContext context) {
     final model = gFFI.serverModel;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
-    return Padding(
-      padding: const EdgeInsets.only(left: 12, right: 24, top: 8),
-      child: Row(
+    return Container(
+      width: 200,
+      padding: const EdgeInsets.fromLTRB(16, 24, 16, 22),
+      decoration: BoxDecoration(
+        borderRadius: const BorderRadius.all(Radius.circular(13)),
+        border: Border.all(color: Theme.of(context).colorScheme.background),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text("主机名",
               style: TextStyle(
-                  fontSize: 13,
+                  fontSize: 14,
                   color: textColor?.withOpacity(0.5))),
-          SizedBox(width: 8),
-          Expanded(
-            child: TextFormField(
-              controller: model.hostname,
-              decoration: InputDecoration(
-                isDense: true,
-                contentPadding:
-                    EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(6),
-                  borderSide: BorderSide(
-                      color: textColor?.withOpacity(0.15) ??
-                          Colors.grey),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(6),
-                  borderSide: BorderSide(
-                      color: textColor?.withOpacity(0.15) ??
-                          Colors.grey),
-                ),
+          SizedBox(height: 8),
+          TextFormField(
+            controller: model.hostname,
+            decoration: InputDecoration(
+              isDense: true,
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
               ),
-              style: TextStyle(fontSize: 13, color: textColor),
-              onFieldSubmitted: (value) {
-                model.saveHostname(value);
-              },
+              hintText: translate('Enter Remote ID'),
+              hintStyle: TextStyle(
+                  fontSize: 14,
+                  color: textColor?.withOpacity(0.3)),
             ),
+            style: TextStyle(fontSize: 14, color: textColor),
+            onFieldSubmitted: (value) {
+              model.saveHostname(value);
+            },
           ),
         ],
       ),
