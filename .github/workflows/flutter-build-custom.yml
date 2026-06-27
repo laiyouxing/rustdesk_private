@@ -200,6 +200,17 @@ jobs:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 12
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -215,6 +226,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: linux-x64
+      - name: Disable rust bridge build
+        run: |
+          sed -i  "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -222,6 +236,7 @@ jobs:
           doNotCache: false
       - name: Install vcpkg dependencies
         run: |
+          sudo apt install -y libva-dev
           $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"
       - name: Build RustDesk
         run: |
