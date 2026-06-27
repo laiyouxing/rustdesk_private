@@ -342,6 +342,11 @@ impl<T: InvokeUiSession> Remote<T> {
             .lock()
             .unwrap()
             .set_disconnected(round);
+        // Clear cached relay server address on disconnect
+        hbb_common::config::Config::set_option(
+            hbb_common::config::Config::OPTION_RELAY_SERVER.to_owned(),
+            String::new(),
+        );
 
         #[cfg(not(target_os = "ios"))]
         if self.handler.is_default() && _set_disconnected_ok {
