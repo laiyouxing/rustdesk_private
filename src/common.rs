@@ -2543,6 +2543,58 @@ pub async fn punch_udp(
     }
 }
 
+/// After relay is established, keep trying UDP punching in background (Tailscale-style).
+/// When punching succeeds, send the new Stream back to io_loop via shared state.
+pub async fn relay_upgrade_task(
+    peer_addr: SocketAddr,
+    notify: Arc<hbb_common::tokio::sync::Notify>,
+    direct_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+) {
+    use crate::kcp_stream::KcpStream;
+
+    // Wait a bit before starting (let relay stabilize)
+    hbb_common::tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Try multiple rounds of punching with increasing intervals
+    for round in 0..10 {
+        // Create UDP socket and punch
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(_) => {
+                hbb_common::tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        // Connect socket to peer (tells the socket where to send)
+        if socket.connect(peer_addr).await.is_err() {
+            hbb_common::tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+
+        // Try punching for up to 10 seconds
+        match punch_udp(socket.clone(), true).await {
+            Ok(Some(_data)) => {
+                // Punching succeeded! Create KCP stream
+                if let Ok((_kcp_stream, stream)) =
+                    KcpStream::connect(socket.clone(), Duration::from_secs(5)).await
+                {
+                    // KCP connection established! Send back to io_loop
+                    let mut guard = direct_stream.lock().await;
+                    *guard = Some(stream);
+                    notify.notify_one();
+                    return;
+                }
+            }
+            _ => {
+                // Punching failed, wait and retry
+                let delay = std::cmp::min(30, 5 + round * 5) as u64;
+                hbb_common::tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+        }
+    }
+    log::info!("Relay upgrade punching finished after 10 rounds without success");
+}
+
 fn test_ipv6_sync() {
     #[tokio::main(flavor = "current_thread")]
     async fn func() {

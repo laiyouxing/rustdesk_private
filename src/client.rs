@@ -202,7 +202,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String),
+        (i32, String, String, std::net::SocketAddr),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String),
+        (i32, String, String, std::net::SocketAddr),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -264,7 +264,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned()),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0))),
                 false,
             ));
         }
@@ -278,7 +278,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned()),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0))),
                 false,
             ));
         }
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String),
+        (i32, String, String, std::net::SocketAddr),
         bool,
     )> {
         let mut start = Instant::now();
@@ -577,7 +577,7 @@ impl Client {
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server, relay_server.clone()),
+                            (feedback, rendezvous_server, relay_server.clone(), peer_addr),
                             false,
                         ));
                     }
@@ -624,7 +624,7 @@ impl Client {
                 punch_type,
             )
             .await?,
-            (feedback, rendezvous_server, relay_server.clone()),
+            (feedback, rendezvous_server, relay_server.clone(), peer_addr),
             true,
         ))
     }
