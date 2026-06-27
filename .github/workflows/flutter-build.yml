@@ -1940,6 +1940,8 @@ jobs:
           sudo apt-get update -y
           # https://github.com/AppImage/AppImageKit/wiki/FUSE
           sudo apt-get install -y libarchive-tools libfuse2
+          # upgrade setuptools to avoid setuptools_scm compatibility issues
+          sudo pip3 install --upgrade setuptools setuptools_scm
           # set-up appimage-builder
           # https://github.com/AppImage/AppImageKit/issues/1395
           sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
