@@ -242,3 +242,40 @@ jobs:
         with:
           name: rustdesk-unsigned-linux-${{ matrix.job.arch }}
           path: rustdesk-${{ env.VERSION }}-${{ matrix.job.deb_arch }}.deb
+
+  # ─── Publish Release ────────────────────────────────────────────────────
+  publish-release:
+    if: ${{ inputs.upload-artifact }}
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: rustdesk-unsigned-windows-x86_64
+          path: release/
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: rustdesk-unsigned-macos-x86_64
+          path: release/
+      - name: Download macOS ARM artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: rustdesk-unsigned-macos-aarch64
+          path: release/
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: rustdesk-unsigned-linux-x86_64
+          path: release/
+      - name: List release files
+        run: ls -la release/
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          prerelease: true
+          files: release/**
+          fail_on_unmatched_files: false
+          generate_release_notes: true
