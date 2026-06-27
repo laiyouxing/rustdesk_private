@@ -9,6 +9,7 @@ import 'package:flutter_hbb/common/widgets/connection_page_title.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
 import 'package:flutter_hbb/models/state_model.dart';
+import 'package:flutter_hbb/models/server_model.dart' show gFFI;
 import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
@@ -52,6 +53,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
   @override
   void initState() {
     super.initState();
+    gFFI.serverModel.fetchHostname();
     _updateTimer = periodic_immediate(Duration(seconds: 1), () async {
       updateStatus();
     });
@@ -285,6 +287,8 @@ class _ConnectionPageState extends State<ConnectionPage>
                 Flexible(child: _buildRemoteIDTextField(context)),
               ],
             ).marginOnly(top: 22),
+            // Hostname row
+            hostnameRow(context),
             SizedBox(height: 12),
             Divider().paddingOnly(right: 12),
             Expanded(child: PeerTabPage()),
@@ -582,5 +586,49 @@ class _ConnectionPageState extends State<ConnectionPage>
     );
     return Container(
         constraints: const BoxConstraints(maxWidth: 600), child: w);
+  }
+
+  /// Hostname row: editable text field for custom device name.
+  Widget hostnameRow(BuildContext context) {
+    final model = gFFI.serverModel;
+    final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    return Padding(
+      padding: const EdgeInsets.only(left: 12, right: 24, top: 8),
+      child: Row(
+        children: [
+          Text("主机名",
+              style: TextStyle(
+                  fontSize: 13,
+                  color: textColor?.withOpacity(0.5))),
+          SizedBox(width: 8),
+          Expanded(
+            child: TextFormField(
+              controller: model.hostname,
+              decoration: InputDecoration(
+                isDense: true,
+                contentPadding:
+                    EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(6),
+                  borderSide: BorderSide(
+                      color: textColor?.withOpacity(0.15) ??
+                          Colors.grey),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(6),
+                  borderSide: BorderSide(
+                      color: textColor?.withOpacity(0.15) ??
+                          Colors.grey),
+                ),
+              ),
+              style: TextStyle(fontSize: 13, color: textColor),
+              onFieldSubmitted: (value) {
+                model.saveHostname(value);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
