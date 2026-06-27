@@ -508,6 +508,9 @@ impl Client {
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
                             relay_server = ph.relay_server;
+                            if !relay_server.is_empty() {
+                                Config::set_option(Config::OPTION_RELAY_SERVER.to_owned(), relay_server.clone());
+                            }
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             let s = udp.0.take();
