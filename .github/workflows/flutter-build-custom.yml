@@ -24,31 +24,24 @@ env:
 jobs:
   # Shared prerequisite: generate Flutter bridge files
   generate-bridge:
-    name: Generate bridge files
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Install flutter
-        uses: subosito/flutter-action@v2.12.0
-        with:
-          channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-      - name: Generate bridge
-        run: |
-          dart run flutter_rust_bridge_codegen create
-          flutter pub get
-      - name: Upload bridge artifact
-        uses: actions/upload-artifact@master
-        with:
-          name: bridge-artifact
-          path: flutter/
+    uses: ./.github/workflows/bridge.yml
+
+  # Windows helper: third-party topmost window
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: ${{ inputs.upload-artifact }}
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+    strategy:
+      fail-fast: false
 
   # ─── Windows x86_64 ──────────────────────────────────────────────────────
   build-windows:
     name: ${{ matrix.job.target }}
-    needs: [generate-bridge]
+    needs: [generate-bridge, build-RustDeskTempTopMostWindow]
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -93,6 +86,12 @@ jobs:
       - name: Install vcpkg dependencies
         run: |
           $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@master
+        if: ${{ inputs.upload-artifact }}
+        with:
+          name: topmostwindow-artifacts
+          path: "./rustdesk"
       - name: Build RustDesk
         shell: bash
         run: |
