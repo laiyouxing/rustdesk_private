@@ -542,15 +542,28 @@ impl RendezvousMediator {
         let peer_addr = AddrMangle::decode(&fla.socket_addr);
         log::debug!("Handle intranet from {:?}", peer_addr);
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
-        let local_addr = socket.local_addr();
-        // we saw invalid local_addr while using proxy, local_addr.ip() == "::1"
-        let local_addr: SocketAddr =
-            format!("{}:{}", local_addr.ip(), local_addr.port()).parse()?;
+        let port = socket.local_addr().port();
+        // enumerate all non-loopback IPv4 addresses for multi-network support
+        let mut local_addrs: Vec<Vec<u8>> = Vec::new();
+        for interface in default_net::get_interfaces() {
+            for ipv4 in &interface.ipv4 {
+                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
+                    let addr = SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), port);
+                    local_addrs.push(AddrMangle::encode(addr).into());
+                }
+            }
+        }
+        if local_addrs.is_empty() {
+            // fallback to TCP socket's local address
+            let addr: SocketAddr =
+                format!("{}:{}", socket.local_addr().ip(), port).parse()?;
+            local_addrs.push(AddrMangle::encode(addr).into());
+        }
         let mut msg_out = Message::new();
         msg_out.set_local_addr(LocalAddr {
             id: Config::get_id(),
             socket_addr: AddrMangle::encode(peer_addr).into(),
-            local_addr: AddrMangle::encode(local_addr).into(),
+            local_addr: local_addrs.into(),
             relay_server,
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
