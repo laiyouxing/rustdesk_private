@@ -2436,7 +2436,7 @@ class _AboutState extends State<_About> {
               ).marginSymmetric(vertical: 4.0),
               SelectionArea(
                 child: Text(
-                  "广州聚杰芯科智能有限公司定制版",
+                  "广州聚杰芯科智能有限公司定制版\n制作人：laiyouxing",
                   style: TextStyle(
                     fontSize: 13,
                     color: Theme.of(context)
