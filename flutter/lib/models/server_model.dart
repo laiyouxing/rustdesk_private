@@ -488,7 +488,13 @@ class ServerModel with ChangeNotifier {
   Future<void> fetchHostname() async {
     _systemHostname = Platform.localHostname;
     final custom = await bind.mainGetOption(key: kOptionCustomHostname);
-    _hostname.text = custom;
+    if (custom.isEmpty) {
+      // 首次使用：用系统主机名作为默认值，自动保存
+      _hostname.text = _systemHostname;
+      await bind.mainSetOption(key: kOptionCustomHostname, value: _systemHostname);
+    } else {
+      _hostname.text = custom;
+    }
     _hostname.selection = TextSelection.fromPosition(
       TextPosition(offset: _hostname.text.length),
     );

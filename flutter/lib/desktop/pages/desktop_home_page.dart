@@ -236,15 +236,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                         border: InputBorder.none,
                         contentPadding:
                             EdgeInsets.only(top: 2, bottom: 2),
-                        hintText: 'Default: ${model.systemHostname}',
-                        hintStyle: TextStyle(
-                          fontSize: 13,
-                          color: Theme.of(context)
-                              .textTheme
-                              .titleLarge
-                              ?.color
-                              ?.withOpacity(0.3),
-                        ),
                       ),
                       style: TextStyle(
                         fontSize: 14,
