@@ -138,17 +138,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         child: Stack(
           children: [
             Column(
-          children: [
-            Expanded(
-              child: SingleChildScrollView(
-                  controller: _leftPaneScrollController,
-                  child: Column(
-                    key: _childKey,
-                    children: children,
-                  ),
-                ),
-            ),
-          ],
+              key: _childKey,
+              children: children,
             ),
             if (isOutgoingOnly)
               Positioned(
