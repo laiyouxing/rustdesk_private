@@ -563,7 +563,7 @@ impl RendezvousMediator {
         msg_out.set_local_addr(LocalAddr {
             id: Config::get_id(),
             socket_addr: AddrMangle::encode(peer_addr).into(),
-            local_addr: local_addrs.into(),
+            local_addr: local_addrs.into_iter().map(|a| bytes::Bytes::from(a)).collect(),
             relay_server,
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
