@@ -1,0 +1,244 @@
+name: Build RustDesk Custom (Win64 + macOS + Ubuntu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload-artifact:
+        type: boolean
+        default: true
+        description: "Upload built artifacts"
+      tag-name:
+        type: string
+        default: "custom-build"
+        description: "Tag name for release (used for artifact naming)"
+
+env:
+  VERSION: "1.4.8.1"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  TAG_NAME: "${{ inputs.tag-name }}"
+
+jobs:
+  # Shared prerequisite: generate Flutter bridge files
+  generate-bridge:
+    name: Generate bridge files
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Generate bridge
+        run: |
+          dart run flutter_rust_bridge_codegen create
+          flutter pub get
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@master
+        with:
+          name: bridge-artifact
+          path: flutter/
+
+  # ─── Windows x86_64 ──────────────────────────────────────────────────────
+  build-windows:
+    name: ${{ matrix.job.target }}
+    needs: [generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              target: x86_64-pc-windows-msvc,
+              os: windows-2022,
+              arch: x86_64,
+              vcpkg-triplet: x64-windows-static,
+            }
+    steps:
+      - uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: ${{ env.LLVM_VERSION }}
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      - name: Install vcpkg dependencies
+        run: |
+          $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"
+      - name: Build RustDesk
+        shell: bash
+        run: |
+          python3 build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+      - name: Upload artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@master
+        with:
+          name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
+          path: rustdesk
+
+  # ─── macOS (x86_64 + aarch64) ───────────────────────────────────────────
+  build-macos:
+    name: ${{ matrix.job.target }}
+    needs: [generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              target: x86_64-apple-darwin,
+              os: macos-15-intel,
+              extra-build-args: "",
+              arch: x86_64,
+              vcpkg-triplet: x64-osx,
+            }
+          - {
+              target: aarch64-apple-darwin,
+              os: macos-14,
+              extra-build-args: "--screencapturekit",
+              arch: aarch64,
+              vcpkg-triplet: arm64-osx,
+            }
+    steps:
+      - uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      - name: Install vcpkg dependencies
+        run: |
+          $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"
+      - name: Build RustDesk
+        run: |
+          if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+          fi
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
+      - name: Create unsigned DMG
+        if: ${{ inputs.upload-artifact }}
+        run: |
+          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" \
+            --window-size 800 400 --app-drop-link 600 185 \
+            rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg \
+            ./flutter/build/macos/Build/Products/Release/RustDesk.app
+      - name: Upload unsigned macOS artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@master
+        with:
+          name: rustdesk-unsigned-macos-${{ matrix.job.arch }}
+          path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg
+
+  # ─── Ubuntu / Linux x86_64 ──────────────────────────────────────────────
+  build-linux:
+    name: build rustdesk linux x86_64
+    needs: [generate-bridge]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              arch: x86_64,
+              target: x86_64-unknown-linux-gnu,
+              distro: ubuntu18.04,
+              deb_arch: amd64,
+              vcpkg-triplet: x64-linux,
+            }
+    steps:
+      - uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: linux-x64
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      - name: Install vcpkg dependencies
+        run: |
+          $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"
+      - name: Build RustDesk
+        run: |
+          ./build.py --flutter --hwcodec --unix-file-copy-paste
+      - name: Build deb package
+        if: ${{ inputs.upload-artifact }}
+        run: |
+          mkdir -p ./rustdesk-deb/usr/lib/rustdesk
+          mkdir -p ./rustdesk-deb/usr/share/applications
+          mkdir -p ./rustdesk-deb/usr/share/rustdesk/files
+          cp -r ./flutter/build/linux/x64/release/bundle/* ./rustdesk-deb/usr/lib/rustdesk/
+          cp ./res/rustdesk.desktop ./rustdesk-deb/usr/share/applications/
+          dpkg-deb --build ./rustdesk-deb rustdesk-${{ env.VERSION }}-${{ matrix.job.deb_arch }}.deb
+      - name: Upload Linux artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@master
+        with:
+          name: rustdesk-unsigned-linux-${{ matrix.job.arch }}
+          path: rustdesk-${{ env.VERSION }}-${{ matrix.job.deb_arch }}.deb
