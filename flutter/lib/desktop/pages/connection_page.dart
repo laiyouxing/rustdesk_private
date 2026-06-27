@@ -598,7 +598,8 @@ class _ConnectionPageState extends State<ConnectionPage>
       padding: const EdgeInsets.fromLTRB(16, 24, 16, 22),
       decoration: BoxDecoration(
         borderRadius: const BorderRadius.all(Radius.circular(13)),
-        border: Border.all(color: Theme.of(context).colorScheme.background),
+        border: Border.all(
+            color: Theme.of(context).dividerColor.withOpacity(0.3)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -612,15 +613,9 @@ class _ConnectionPageState extends State<ConnectionPage>
             controller: model.hostname,
             decoration: InputDecoration(
               isDense: true,
+              border: InputBorder.none,
               contentPadding:
-                  EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-              hintText: translate('Enter Remote ID'),
-              hintStyle: TextStyle(
-                  fontSize: 14,
-                  color: textColor?.withOpacity(0.3)),
+                  EdgeInsets.symmetric(horizontal: 4, vertical: 6),
             ),
             style: TextStyle(fontSize: 14, color: textColor),
             onFieldSubmitted: (value) {
