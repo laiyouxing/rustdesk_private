@@ -193,30 +193,29 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final model = gFFI.serverModel;
     return Container(
       margin: const EdgeInsets.only(left: 20, right: 11),
-      height: 85,
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.baseline,
-        textBaseline: TextBaseline.alphabetic,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Container(
             width: 2,
             decoration: const BoxDecoration(color: MyTheme.accent),
-          ).marginOnly(top: 5),
+          ),
           Expanded(
             child: Padding(
               padding: const EdgeInsets.only(left: 7),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Hostname row
+                  // Hostname section
                   Container(
                     height: 25,
+                    margin: const EdgeInsets.only(top: 8),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          translate("Hostname"),
+                          "主机名",
                           style: TextStyle(
                               fontSize: 14,
                               color: Theme.of(context)
@@ -228,26 +227,32 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       ],
                     ),
                   ),
-                  Flexible(
-                    child: TextFormField(
-                      controller: model.hostname,
-                      focusNode: _hostnameFocusNode,
-                      decoration: InputDecoration(
-                        border: InputBorder.none,
-                        contentPadding:
-                            EdgeInsets.only(top: 2, bottom: 2),
-                      ),
-                      style: TextStyle(
-                        fontSize: 14,
-                      ),
-                      onFieldSubmitted: (value) {
-                        model.saveHostname(value);
-                      },
-                    ).workaroundFreezeLinuxMint(),
+                  TextFormField(
+                    controller: model.hostname,
+                    focusNode: _hostnameFocusNode,
+                    decoration: InputDecoration(
+                      border: InputBorder.none,
+                      contentPadding:
+                          EdgeInsets.only(top: 2, bottom: 6),
+                    ),
+                    style: TextStyle(
+                      fontSize: 14,
+                    ),
+                    onFieldSubmitted: (value) {
+                      model.saveHostname(value);
+                    },
+                  ).workaroundFreezeLinuxMint(),
+                  // Separator
+                  Divider(
+                    height: 12,
+                    thickness: 1,
+                    color: Theme.of(context)
+                        .dividerColor
+                        .withOpacity(0.15),
                   ),
-                  // ID label
+                  // ID section
                   Container(
-                    height: 20,
+                    height: 25,
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -261,32 +266,30 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   .titleLarge
                                   ?.color
                                   ?.withOpacity(0.5)),
-                        ).marginOnly(top: 2),
+                        ),
                         buildPopupMenu(context)
                       ],
                     ),
                   ),
-                  Flexible(
-                    child: GestureDetector(
-                      onDoubleTap: () {
-                        Clipboard.setData(
-                            ClipboardData(text: model.serverId.text));
-                        showToast(translate("Copied"));
-                      },
-                      child: TextFormField(
-                        controller: model.serverId,
-                        readOnly: true,
-                        decoration: InputDecoration(
-                          border: InputBorder.none,
-                          contentPadding:
-                              EdgeInsets.only(top: 2, bottom: 2),
-                        ),
-                        style: TextStyle(
-                          fontSize: 22,
-                        ),
-                      ).workaroundFreezeLinuxMint(),
-                    ),
-                  )
+                  GestureDetector(
+                    onDoubleTap: () {
+                      Clipboard.setData(
+                          ClipboardData(text: model.serverId.text));
+                      showToast(translate("Copied"));
+                    },
+                    child: TextFormField(
+                      controller: model.serverId,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        contentPadding:
+                            EdgeInsets.only(top: 2, bottom: 8),
+                      ),
+                      style: TextStyle(
+                        fontSize: 22,
+                      ),
+                    ).workaroundFreezeLinuxMint(),
+                  ),
                 ],
               ),
             ),
