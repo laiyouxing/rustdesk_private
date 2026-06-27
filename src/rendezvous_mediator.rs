@@ -634,7 +634,8 @@ impl RendezvousMediator {
             let local_addr = socket.local_addr();
             // key important here for punch hole to tell my gateway incoming peer is safe.
             // it can not be async here, because local_addr can not be reused, we must close the connection before use it again.
-            allow_err!(socket_client::connect_tcp_local(peer_addr, Some(local_addr), 30).await);
+            // TCP simultaneous open: 2s timeout gives the peer's SYN time to cross with ours
+            allow_err!(socket_client::connect_tcp_local(peer_addr, Some(local_addr), 2000).await);
             socket
         };
         let mut msg_out = Message::new();

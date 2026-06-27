@@ -691,14 +691,40 @@ impl Client {
         let start = std::time::Instant::now();
 
         let mut connect_futures = Vec::new();
-        let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-        connect_futures.push(
-            async move {
-                let conn = fut.await?;
-                Ok((conn, None, "TCP"))
-            }
-            .boxed(),
-        );
+        // TCP simultaneous open: staggered connect attempts
+        // to increase chance of SYNs crossing with the peer
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP"))
+                }
+                .boxed(),
+            );
+        }
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP+1"))
+                }
+                .boxed(),
+            );
+        }
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP+2"))
+                }
+                .boxed(),
+            );
+        }
         if let Some(udp_socket_nat) = udp_socket_nat {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
             // Multi-port punching: try additional sockets on different local ports

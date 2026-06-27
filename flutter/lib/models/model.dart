@@ -256,7 +256,8 @@ class FfiModel with ChangeNotifier {
   }
 
   setConnectionType(
-      String peerId, bool secure, bool direct, String streamType) {
+      String peerId, bool secure, bool direct, String streamType,
+      {String relayServer = ''}) {
     cachedPeerData.secure = secure;
     cachedPeerData.direct = direct;
     cachedPeerData.streamType = streamType;
@@ -267,6 +268,7 @@ class FfiModel with ChangeNotifier {
       connectionType.setSecure(secure);
       connectionType.setDirect(direct);
       connectionType.setStreamType(streamType);
+      connectionType.setRelayServer(relayServer);
     } catch (e) {
       //
     }
@@ -340,7 +342,8 @@ class FfiModel with ChangeNotifier {
         handlePlatformAdditions(evt, sessionId, peerId);
       } else if (name == 'connection_ready') {
         setConnectionType(peerId, evt['secure'] == 'true',
-            evt['direct'] == 'true', evt['stream_type'] ?? '');
+            evt['direct'] == 'true', evt['stream_type'] ?? '',
+            relayServer: evt['relay_server'] ?? '');
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);
