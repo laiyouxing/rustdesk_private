@@ -50,6 +50,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
+  bool _hostnameFetched = false;
+  FocusNode? _hostnameFocusNode;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -191,7 +193,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final model = gFFI.serverModel;
     return Container(
       margin: const EdgeInsets.only(left: 20, right: 11),
-      height: 57,
+      height: 85,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.baseline,
         textBaseline: TextBaseline.alphabetic,
@@ -206,8 +208,55 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Hostname row
                   Container(
                     height: 25,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          translate("Hostname"),
+                          style: TextStyle(
+                              fontSize: 14,
+                              color: Theme.of(context)
+                                  .textTheme
+                                  .titleLarge
+                                  ?.color
+                                  ?.withOpacity(0.5)),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Flexible(
+                    child: TextFormField(
+                      controller: model.hostname,
+                      focusNode: _hostnameFocusNode,
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        contentPadding:
+                            EdgeInsets.only(top: 2, bottom: 2),
+                        hintText: 'Default: ${model.systemHostname}',
+                        hintStyle: TextStyle(
+                          fontSize: 13,
+                          color: Theme.of(context)
+                              .textTheme
+                              .titleLarge
+                              ?.color
+                              ?.withOpacity(0.3),
+                        ),
+                      ),
+                      style: TextStyle(
+                        fontSize: 14,
+                      ),
+                      onFieldSubmitted: (value) {
+                        model.saveHostname(value);
+                      },
+                    ).workaroundFreezeLinuxMint(),
+                  ),
+                  // ID label
+                  Container(
+                    height: 20,
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -221,7 +270,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   .titleLarge
                                   ?.color
                                   ?.withOpacity(0.5)),
-                        ).marginOnly(top: 5),
+                        ).marginOnly(top: 2),
                         buildPopupMenu(context)
                       ],
                     ),
@@ -238,7 +287,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                         readOnly: true,
                         decoration: InputDecoration(
                           border: InputBorder.none,
-                          contentPadding: EdgeInsets.only(top: 10, bottom: 10),
+                          contentPadding:
+                              EdgeInsets.only(top: 2, bottom: 2),
                         ),
                         style: TextStyle(
                           fontSize: 22,
@@ -697,8 +747,18 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   void initState() {
     super.initState();
+    _hostnameFocusNode = FocusNode();
+    _hostnameFocusNode!.addListener(() {
+      if (!_hostnameFocusNode!.hasFocus) {
+        gFFI.serverModel.saveHostname(gFFI.serverModel.hostname.text);
+      }
+    });
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
+      if (!_hostnameFetched) {
+        await gFFI.serverModel.fetchHostname();
+        _hostnameFetched = true;
+      }
       final error = await bind.mainGetError();
       if (systemError != error) {
         systemError = error;
@@ -879,6 +939,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
+    _hostnameFocusNode?.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
