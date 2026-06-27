@@ -65,16 +65,13 @@ jobs:
           channel: stable
           flutter-version: ${{ env.FLUTTER_VERSION }}
       - name: Replace engine with rustdesk custom flutter engine
-        shell: bash
         run: |
           flutter doctor -v
           flutter precache --windows
-          curl -LO https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip
-          unzip -o windows-x64-release.zip -d windows-x64-release
-          engine_path=$(find /c/hostedtoolcache -type d -name "windows-x64-release" -path "*/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/*" | head -1)
-          if [ -n "$engine_path" ]; then
-            cp -r windows-x64-release/* "$engine_path/"
-          fi
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          $enginePath = Get-ChildItem -Path C:/hostedtoolcache -Recurse -Directory -Filter "windows-x64-release" | Where-Object { $_.FullName -like "*flutter/stable-${{ env.FLUTTER_VERSION }}-x64/*" } | Select-Object -First 1
+          if ($enginePath) { Copy-Item -Recurse -Force windows-x64-release/* $enginePath.FullName/ }
       - name: Patch flutter
         shell: bash
         run: |
@@ -148,11 +145,27 @@ jobs:
         with:
           name: bridge-artifact
           path: ./
+      - name: Install NASM
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
       - name: Install flutter
         uses: subosito/flutter-action@v2.12.0
         with:
           channel: stable
           flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -167,11 +180,9 @@ jobs:
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
-      - name: Install nasm
-        run: brew install nasm
       - name: Install vcpkg dependencies
         run: |
-          if ! $VCPKG_ROOT/vcpkg install --triplet ${{ matrix.job.vcpkg-triplet }} --x-install-root="$VCPKG_ROOT/installed"; then
+          if ! $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"; then
             find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do echo "$_1:"; echo "======"; cat "$_1"; echo "======"; done
             exit 1
           fi
