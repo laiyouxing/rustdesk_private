@@ -740,7 +740,7 @@ impl InvokeUiSession for FlutterHandler {
                 ("secure", &is_secured.to_string()),
                 ("direct", &direct.to_string()),
                 ("stream_type", &stream_type.to_string()),
-                ("relay_server", &relay_server),
+                ("relay_server", &relay_server.to_string()),
             ],
             &[],
         );
