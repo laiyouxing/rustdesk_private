@@ -195,7 +195,7 @@ impl InvokeUiSession for SciterHandler {
         self.call("setCursorPosition", &make_args!(cp.x, cp.y));
     }
 
-    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str) {
+    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str, _relay_server: &str) {
         self.call(
             "setConnectionType",
             &make_args!(is_secured, direct, stream_type.to_string()),

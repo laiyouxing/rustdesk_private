@@ -202,7 +202,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String),
+        (i32, String, String),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String),
+        (i32, String, String),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -264,7 +264,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned()),
+                (0, "".to_owned(), "".to_owned()),
                 false,
             ));
         }
@@ -278,7 +278,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned()),
+                (0, "".to_owned(), "".to_owned()),
                 false,
             ));
         }
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String),
+        (i32, String, String),
         bool,
     )> {
         let mut start = Instant::now();
@@ -508,9 +508,6 @@ impl Client {
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
                             relay_server = ph.relay_server;
-                            if !relay_server.is_empty() {
-                                Config::set_option(Config::OPTION_RELAY_SERVER.to_owned(), relay_server.clone());
-                            }
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             let s = udp.0.take();
@@ -580,7 +577,7 @@ impl Client {
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server),
+                            (feedback, rendezvous_server, relay_server.clone()),
                             false,
                         ));
                     }
@@ -627,7 +624,7 @@ impl Client {
                 punch_type,
             )
             .await?,
-            (feedback, rendezvous_server),
+            (feedback, rendezvous_server, relay_server.clone()),
             true,
         ))
     }
