@@ -95,25 +95,34 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       buildTip(context),
       if (!isOutgoingOnly) buildIDBoard(context),
       if (!isOutgoingOnly) buildPasswordBoard(context),
-      FutureBuilder<Widget>(
-        future: Future.value(
-            Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
-        builder: (_, data) {
-          if (data.hasData) {
-            if (isIncomingOnly) {
-              if (isInHomePage()) {
-                Future.delayed(Duration(milliseconds: 300), () {
-                  _updateWindowSize();
-                });
-              }
-            }
-            return data.data!;
-          } else {
-            return const Offstage();
-          }
-        },
+      // Bottom section: help cards + plugin entries, take remaining space, scroll if needed
+      Expanded(
+        child: SingleChildScrollView(
+          child: Column(
+            children: [
+              FutureBuilder<Widget>(
+                future: Future.value(
+                    Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
+                builder: (_, data) {
+                  if (data.hasData) {
+                    if (isIncomingOnly) {
+                      if (isInHomePage()) {
+                        Future.delayed(Duration(milliseconds: 300), () {
+                          _updateWindowSize();
+                        });
+                      }
+                    }
+                    return data.data!;
+                  } else {
+                    return const Offstage();
+                  }
+                },
+              ),
+              buildPluginEntry(),
+            ],
+          ),
+        ),
       ),
-      buildPluginEntry(),
     ];
     if (isIncomingOnly) {
       children.addAll([
