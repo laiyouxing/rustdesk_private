@@ -50,6 +50,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
+  bool _hostnameFetched = false;
+  FocusNode? _hostnameFocusNode;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -136,16 +138,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         child: Stack(
           children: [
             Column(
-              children: [
-                SingleChildScrollView(
+          children: [
+            Expanded(
+              child: SingleChildScrollView(
                   controller: _leftPaneScrollController,
                   child: Column(
                     key: _childKey,
                     children: children,
                   ),
                 ),
-                Expanded(child: Container())
-              ],
+            ),
+          ],
             ),
             if (isOutgoingOnly)
               Positioned(
@@ -191,21 +194,64 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final model = gFFI.serverModel;
     return Container(
       margin: const EdgeInsets.only(left: 20, right: 11),
-      height: 57,
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.baseline,
-        textBaseline: TextBaseline.alphabetic,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Container(
             width: 2,
             decoration: const BoxDecoration(color: MyTheme.accent),
-          ).marginOnly(top: 5),
+          ),
           Expanded(
             child: Padding(
               padding: const EdgeInsets.only(left: 7),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Hostname section
+                  Container(
+                    height: 25,
+                    margin: const EdgeInsets.only(top: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "主机名",
+                          style: TextStyle(
+                              fontSize: 14,
+                              color: Theme.of(context)
+                                  .textTheme
+                                  .titleLarge
+                                  ?.color
+                                  ?.withOpacity(0.5)),
+                        ),
+                      ],
+                    ),
+                  ),
+                  TextFormField(
+                    controller: model.hostname,
+                    focusNode: _hostnameFocusNode,
+                    decoration: InputDecoration(
+                      border: InputBorder.none,
+                      contentPadding:
+                          EdgeInsets.only(top: 2, bottom: 6),
+                    ),
+                    style: TextStyle(
+                      fontSize: 14,
+                    ),
+                    onFieldSubmitted: (value) {
+                      model.saveHostname(value);
+                    },
+                  ).workaroundFreezeLinuxMint(),
+                  // Separator
+                  Divider(
+                    height: 12,
+                    thickness: 1,
+                    color: Theme.of(context)
+                        .dividerColor
+                        .withOpacity(0.15),
+                  ),
+                  // ID section
                   Container(
                     height: 25,
                     child: Row(
@@ -221,31 +267,30 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   .titleLarge
                                   ?.color
                                   ?.withOpacity(0.5)),
-                        ).marginOnly(top: 5),
+                        ),
                         buildPopupMenu(context)
                       ],
                     ),
                   ),
-                  Flexible(
-                    child: GestureDetector(
-                      onDoubleTap: () {
-                        Clipboard.setData(
-                            ClipboardData(text: model.serverId.text));
-                        showToast(translate("Copied"));
-                      },
-                      child: TextFormField(
-                        controller: model.serverId,
-                        readOnly: true,
-                        decoration: InputDecoration(
-                          border: InputBorder.none,
-                          contentPadding: EdgeInsets.only(top: 10, bottom: 10),
-                        ),
-                        style: TextStyle(
-                          fontSize: 22,
-                        ),
-                      ).workaroundFreezeLinuxMint(),
-                    ),
-                  )
+                  GestureDetector(
+                    onDoubleTap: () {
+                      Clipboard.setData(
+                          ClipboardData(text: model.serverId.text));
+                      showToast(translate("Copied"));
+                    },
+                    child: TextFormField(
+                      controller: model.serverId,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        border: InputBorder.none,
+                        contentPadding:
+                            EdgeInsets.only(top: 2, bottom: 8),
+                      ),
+                      style: TextStyle(
+                        fontSize: 22,
+                      ),
+                    ).workaroundFreezeLinuxMint(),
+                  ),
                 ],
               ),
             ),
@@ -697,8 +742,18 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   void initState() {
     super.initState();
+    _hostnameFocusNode = FocusNode();
+    _hostnameFocusNode!.addListener(() {
+      if (!_hostnameFocusNode!.hasFocus) {
+        gFFI.serverModel.saveHostname(gFFI.serverModel.hostname.text);
+      }
+    });
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
+      if (!_hostnameFetched) {
+        await gFFI.serverModel.fetchHostname();
+        _hostnameFetched = true;
+      }
       final error = await bind.mainGetError();
       if (systemError != error) {
         systemError = error;
@@ -879,6 +934,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
+    _hostnameFocusNode?.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
