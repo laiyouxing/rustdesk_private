@@ -202,7 +202,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>),
         bool,
     )> {
         let mut start = Instant::now();
@@ -585,7 +585,7 @@ impl Client {
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server, relay_server.clone(), peer_addr),
+                            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone()),
                             false,
                         ));
                     }
@@ -633,7 +633,7 @@ impl Client {
                 punch_type,
             )
             .await?,
-            (feedback, rendezvous_server, relay_server.clone(), peer_addr),
+            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone()),
             true,
         ))
     }

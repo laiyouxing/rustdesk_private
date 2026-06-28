@@ -175,7 +175,7 @@ impl<T: InvokeUiSession> Remote<T> {
         )
         .await
         {
-            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr))) => {
+            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs))) => {
                 self.handler
                     .connection_round_state
                     .lock()
@@ -191,9 +191,9 @@ impl<T: InvokeUiSession> Remote<T> {
                 if !direct && stream_type == "Relay" {
                     let n = punch_notify.clone();
                     let s = punch_stream.clone();
-                    let addr = peer_addr;
+                    let p2p_addrs = peer_addrs.clone();
                     tokio::spawn(async move {
-                        relay_upgrade_task(addr, n, s).await;
+                        relay_upgrade_task(p2p_addrs, n, s).await;
                     });
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
