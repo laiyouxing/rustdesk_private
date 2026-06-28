@@ -502,8 +502,6 @@ class ServerModel with ChangeNotifier {
 
   Future<void> saveHostname(String value) async {
     await bind.mainSetOption(key: kOptionCustomHostname, value: value);
-    // 触发立即重新上传 sysinfo，使 API 服务器尽快更新主机名
-    await bind.mainSetOption(key: 'force_sysinfo_upload', value: '1');
   }
 
   changeStatue(String name, bool value) {
