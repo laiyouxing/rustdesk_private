@@ -55,6 +55,7 @@ struct InfoUploaded {
     last_uploaded: Option<Instant>,
     id: String,
     username: Option<String>,
+    last_hostname: String,
 }
 
 impl Default for InfoUploaded {
@@ -65,18 +66,20 @@ impl Default for InfoUploaded {
             last_uploaded: None,
             id: "".to_owned(),
             username: None,
+            last_hostname: "".to_owned(),
         }
     }
 }
 
 impl InfoUploaded {
-    fn uploaded(url: String, id: String, username: String) -> Self {
+    fn uploaded(url: String, id: String, username: String, hostname: String) -> Self {
         Self {
             uploaded: true,
             url,
             last_uploaded: None,
             id,
             username: Some(username),
+            last_hostname: hostname,
         }
     }
 }
@@ -108,6 +111,13 @@ async fn start_hbbs_sync_async() {
                     info_uploaded.uploaded = false;
                     *PRO.lock().unwrap() = false;
                 }
+                // Check if Flutter client requested immediate sysinfo re-upload
+                let force_upload = Config::get_option("force_sysinfo_upload");
+                if !force_upload.is_empty() {
+                    info_uploaded.uploaded = false;
+                    Config::set_option("force_sysinfo_upload".to_owned(), "".to_owned());
+                    log::info!("sysinfo upload forced by client");
+                }
                 // For Windows:
                 // We can't skip uploading sysinfo when the username is empty, because the username may
                 // always be empty before login. We also need to upload the other sysinfo info.
@@ -124,10 +134,17 @@ async fn start_hbbs_sync_async() {
                 // we may not be able to get the username before login after the next restart.
                 let mut v = crate::get_sysinfo();
                 let sys_username = v["username"].as_str().unwrap_or_default().to_string();
+                let device_name = Config::get_option(keys::OPTION_PRESET_DEVICE_NAME);
+                let hostname_changed = !device_name.is_empty() && device_name != info_uploaded.last_hostname;
                 // Though the username comparison is only necessary on Windows,
                 // we still keep the comparison on other platforms for consistency.
-                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username)) &&
-                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
+                let need_upload = (!info_uploaded.uploaded
+                    || info_uploaded.username.as_ref() != Some(&sys_username)
+                    || hostname_changed)
+                    && info_uploaded
+                        .last_uploaded
+                        .map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT)
+                        .unwrap_or(true);
                 if need_upload {
                     v["version"] = json!(crate::VERSION);
                     v["id"] = json!(id);
@@ -201,7 +218,7 @@ async fn start_hbbs_sync_async() {
                                 }
                             };
                             if samever {
-                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username);
+                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username, device_name.clone());
                                 log::info!("sysinfo not changed, skip upload");
                                 continue;
                             }
@@ -210,7 +227,7 @@ async fn start_hbbs_sync_async() {
                     match crate::post_request(url.replace("heartbeat", "sysinfo"), v, "").await {
                         Ok(x)  => {
                             if x == "SYSINFO_UPDATED" {
-                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username);
+                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username, device_name.clone());
                                 log::info!("sysinfo updated");
                                 if !hash.is_empty() {
                                     config::Status::set("sysinfo_hash", hash);
