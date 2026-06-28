@@ -945,8 +945,7 @@ pub fn check_software_update() {
     }
     // Custom build: check API server for new version
     std::thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        if let Err(e) = rt.block_on(check_custom_update()) {
+        if let Err(e) = check_custom_update() {
             log::error!("Custom update check failed: {}", e);
         }
     });
