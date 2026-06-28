@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:auto_size_text/auto_size_text.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/widgets/connection_page_title.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -589,32 +590,42 @@ class _ConnectionPageState extends State<ConnectionPage>
   }
 
   /// Hostname panel: displayed next to the remote ID input.
+  /// Styled to match _buildRemoteIDTextField exactly.
   Widget hostnameColumn(BuildContext context) {
     final model = gFFI.serverModel;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
     return Container(
-      width: 200,
-      padding: const EdgeInsets.fromLTRB(16, 24, 16, 22),
+      width: 240,
+      padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
       decoration: BoxDecoration(
-        borderRadius: const BorderRadius.all(Radius.circular(13)),
-        border: Border.all(
-            color: Theme.of(context).dividerColor.withOpacity(0.3)),
-      ),
+          borderRadius: const BorderRadius.all(Radius.circular(13)),
+          border: Border.all(
+              color: Theme.of(context).colorScheme.background)),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text("主机名",
-              style: TextStyle(
-                  fontSize: 14,
-                  color: textColor?.withOpacity(0.5))),
-          SizedBox(height: 8),
+          AutoSizeText(
+            "主机名",
+            maxLines: 1,
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.merge(const TextStyle(fontSize: 16)),
+          ).marginOnly(bottom: 15),
           TextFormField(
             controller: model.hostname,
             decoration: InputDecoration(
-              isDense: true,
-              border: InputBorder.none,
-              contentPadding:
-                  EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+              filled: false,
+              counterText: '',
+              hintText: translate('Enter Remote ID'),
+              contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 15, vertical: 13),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide(
+                    color: textColor?.withOpacity(0.15) ??
+                        Colors.grey),
+              ),
             ),
             style: TextStyle(fontSize: 14, color: textColor),
             onFieldSubmitted: (value) {
