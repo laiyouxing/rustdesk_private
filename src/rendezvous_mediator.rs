@@ -594,6 +594,35 @@ impl RendezvousMediator {
         let relay = use_ws() || Config::is_proxy() || ph.force_relay;
         let mut socket_addr_v6 = Default::default();
         let control_permissions = ph.control_permissions.into_option();
+
+        // Host-side: always start background punching when receiving punch hole
+        // so that both sides punch simultaneously, enabling NAT traversal
+        {
+            let host_peer_addr = peer_addr;
+            tokio::spawn(async move {
+                for round in 0..10 {
+                    let socket = match hbb_common::tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                        Ok(s) => Arc::new(s),
+                        Err(_) => {
+                            sleep(10.0).await;
+                            continue;
+                        }
+                    };
+                    if socket.connect(host_peer_addr).await.is_err() {
+                        sleep(10.0).await;
+                        continue;
+                    }
+                    if crate::common::punch_udp(socket.clone(), true).await.is_ok() {
+                        log::info!("Host-side punching succeeded!");
+                        return;
+                    }
+                    let delay = std::cmp::min(30, 5 + round * 5) as u64;
+                    sleep(delay as f32).await;
+                }
+                log::info!("Host-side punching finished without success");
+            });
+        }
+
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(
                 peer_addr_v6,
@@ -611,30 +640,6 @@ impl RendezvousMediator {
             || (config::is_disable_tcp_listen() && ph.udp_port <= 0)
         {
             let uuid = Uuid::new_v4().to_string();
-            // Host-side: also punch during relay to help the connecting side upgrade to direct
-            let host_peer_addr = peer_addr;
-            tokio::spawn(async move {
-                for round in 0..10 {
-                    let socket = match hbb_common::tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                        Ok(s) => Arc::new(s),
-                        Err(_) => {
-                            sleep(10.0).await;
-                            continue;
-                        }
-                    };
-                    if socket.connect(host_peer_addr).await.is_err() {
-                        sleep(10.0).await;
-                        continue;
-                    }
-                    if crate::common::punch_udp(socket.clone(), true).await.is_ok() {
-                        log::info!("Host-side punching succeeded during relay!");
-                        return;
-                    }
-                    let delay = std::cmp::min(30, 5 + round * 5) as u64;
-                    sleep(delay as f32).await;
-                }
-                log::info!("Host-side punching finished after relay, no direct connection established");
-            });
             return self
                 .create_relay(
                     ph.socket_addr.into(),
