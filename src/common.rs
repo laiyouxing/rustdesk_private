@@ -940,7 +940,71 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    // Disabled: no official update checks for custom builds
+    if !crate::is_custom_client() {
+        return;
+    }
+    // Custom build: check API server for new version
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        if let Err(e) = rt.block_on(check_custom_update()) {
+            log::error!("Custom update check failed: {}", e);
+        }
+    });
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn check_custom_update() -> hbb_common::ResultType<()> {
+    let api_server = get_api_server(
+        Config::get_option("api-server"),
+        Config::get_option("custom-rendezvous-server"),
+    );
+    if api_server.is_empty() {
+        return Ok(());
+    }
+    let platform = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "ubuntu"
+    };
+    let url = format!("{}/api/version/latest?platform={}", api_server, platform);
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(&url, &proxy_conf);
+    let tls_type = get_cached_tls_type(tls_url);
+    let is_tls_not_cached = tls_type.is_none();
+    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
+    let client = create_http_client_async(tls_type, false);
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) if is_tls_not_cached => {
+            let client = create_http_client_async(TlsType::NativeTls, false);
+            client.get(&url).send().await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = resp.bytes().await?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let latest_version = json["data"]["version"].as_str().unwrap_or("").to_string();
+    let download_url = json["data"]["url"].as_str().unwrap_or("").to_string();
+    if latest_version.is_empty() || download_url.is_empty() {
+        return Ok(());
+    }
+    if get_version_number(&latest_version) > get_version_number(crate::VERSION) {
+        #[cfg(feature = "flutter")]
+        {
+            let mut m = std::collections::HashMap::new();
+            m.insert("name", "check_software_update_finish");
+            m.insert("url", &download_url);
+            if let Ok(data) = serde_json::to_string(&m) {
+                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+            }
+        }
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = download_url;
+    } else {
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
+    }
+    Ok(())
 }
 
 // No need to check `danger_accept_invalid_cert` for now.
