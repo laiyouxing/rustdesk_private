@@ -287,7 +287,7 @@ class _ConnectionPageState extends State<ConnectionPage>
               children: [
                 Flexible(child: _buildRemoteIDTextField(context)),
                 SizedBox(width: 12),
-                hostnameColumn(context),
+                Flexible(child: hostnameColumn(context)),
               ],
             ).marginOnly(top: 22),
             SizedBox(height: 12),
@@ -595,7 +595,6 @@ class _ConnectionPageState extends State<ConnectionPage>
     final model = gFFI.serverModel;
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
     return Container(
-      width: 240,
       padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
       decoration: BoxDecoration(
           borderRadius: const BorderRadius.all(Radius.circular(13)),
