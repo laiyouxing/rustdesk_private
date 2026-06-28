@@ -174,7 +174,7 @@ async fn start_hbbs_sync_async() {
                         v["username"] = json!(device_username);
                     }
                     if !device_name.is_empty() {
-                        v["hostname"] = json!(device_name);
+                        v["hostname"] = json!(&device_name);
                     }
                     let note = Config::get_option(keys::OPTION_PRESET_NOTE);
                     if !note.is_empty() {
