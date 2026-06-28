@@ -131,13 +131,8 @@ async fn start_hbbs_sync_async() {
                 let hostname_changed = !device_name.is_empty() && device_name != info_uploaded.last_hostname;
                 // Though the username comparison is only necessary on Windows,
                 // we still keep the comparison on other platforms for consistency.
-                let need_upload = !info_uploaded.uploaded
-                    || info_uploaded.username.as_ref() != Some(&sys_username)
-                    || hostname_changed
-                    || info_uploaded
-                        .last_uploaded
-                        .map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT)
-                        .unwrap_or(true);
+                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username) || hostname_changed) &&
+                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
                 if need_upload {
                     v["version"] = json!(crate::VERSION);
                     v["id"] = json!(id);
