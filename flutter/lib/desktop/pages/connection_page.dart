@@ -640,16 +640,14 @@ class _ConnectionPageState extends State<ConnectionPage>
                 ),
               ),
               SizedBox(width: 8),
-              Tooltip(
-                message: translate('Save'),
-                child: IconButton(
-                  icon: Icon(Icons.save,
-                      color: textColor?.withOpacity(0.5),
-                      size: 28),
+              SizedBox(
+                height: 28.0,
+                child: ElevatedButton(
                   onPressed: () async {
                     await model.saveHostname(model.hostname.text);
                     showToast(translate('Saved'));
                   },
+                  child: Text("保存"),
                 ),
               ),
             ],
