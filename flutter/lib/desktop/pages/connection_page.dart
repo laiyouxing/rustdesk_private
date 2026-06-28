@@ -604,43 +604,42 @@ class _ConnectionPageState extends State<ConnectionPage>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           AutoSizeText(
-            "主机名",
+            "本机名称",
             maxLines: 1,
             style: Theme.of(context)
                 .textTheme
                 .titleMedium
                 ?.merge(const TextStyle(fontSize: 16)),
           ).marginOnly(bottom: 15),
-          Row(
-            children: [
-              Expanded(
-                child: TextFormField(
-                  controller: model.hostname,
-                  decoration: InputDecoration(
-                    filled: false,
-                    counterText: '',
-                    hintText: translate('Enter Remote ID'),
-                    contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 15, vertical: 13),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide(
-                          color: textColor?.withOpacity(0.15) ??
-                              Colors.grey),
-                    ),
-                  ),
-                  style: const TextStyle(
-                    fontFamily: 'WorkSans',
-                    fontSize: 22,
-                    height: 1.4,
-                  ),
-                  onFieldSubmitted: (value) {
-                    model.saveHostname(value);
-                  },
-                ),
+          TextFormField(
+            controller: model.hostname,
+            decoration: InputDecoration(
+              filled: false,
+              counterText: '',
+              hintText: translate('Enter Remote ID'),
+              contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 15, vertical: 13),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide(
+                    color: textColor?.withOpacity(0.15) ??
+                        Colors.grey),
               ),
-              SizedBox(width: 8),
-              SizedBox(
+            ),
+            style: const TextStyle(
+              fontFamily: 'WorkSans',
+              fontSize: 22,
+              height: 1.4,
+            ),
+            onFieldSubmitted: (value) {
+              model.saveHostname(value);
+            },
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: SizedBox(
                 height: 28.0,
                 child: ElevatedButton(
                   onPressed: () async {
@@ -650,7 +649,7 @@ class _ConnectionPageState extends State<ConnectionPage>
                   child: Text("保存"),
                 ),
               ),
-            ],
+            ),
           ),
         ],
       ),
