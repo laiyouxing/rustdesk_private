@@ -611,29 +611,48 @@ class _ConnectionPageState extends State<ConnectionPage>
                 .titleMedium
                 ?.merge(const TextStyle(fontSize: 16)),
           ).marginOnly(bottom: 15),
-          TextFormField(
-            controller: model.hostname,
-            decoration: InputDecoration(
-              filled: false,
-              counterText: '',
-              hintText: translate('Enter Remote ID'),
-              contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 15, vertical: 13),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: BorderSide(
-                    color: textColor?.withOpacity(0.15) ??
-                        Colors.grey),
+          Row(
+            children: [
+              Expanded(
+                child: TextFormField(
+                  controller: model.hostname,
+                  decoration: InputDecoration(
+                    filled: false,
+                    counterText: '',
+                    hintText: translate('Enter Remote ID'),
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 15, vertical: 13),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: BorderSide(
+                          color: textColor?.withOpacity(0.15) ??
+                              Colors.grey),
+                    ),
+                  ),
+                  style: const TextStyle(
+                    fontFamily: 'WorkSans',
+                    fontSize: 22,
+                    height: 1.4,
+                  ),
+                  onFieldSubmitted: (value) {
+                    model.saveHostname(value);
+                  },
+                ),
               ),
-            ),
-            style: const TextStyle(
-              fontFamily: 'WorkSans',
-              fontSize: 22,
-              height: 1.4,
-            ),
-            onFieldSubmitted: (value) {
-              model.saveHostname(value);
-            },
+              SizedBox(width: 8),
+              Tooltip(
+                message: translate('Save'),
+                child: IconButton(
+                  icon: Icon(Icons.save,
+                      color: textColor?.withOpacity(0.5),
+                      size: 28),
+                  onPressed: () async {
+                    await model.saveHostname(model.hostname.text);
+                    showToast(translate('Saved'));
+                  },
+                ),
+              ),
+            ],
           ),
         ],
       ),
