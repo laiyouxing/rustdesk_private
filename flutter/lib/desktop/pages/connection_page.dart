@@ -627,7 +627,11 @@ class _ConnectionPageState extends State<ConnectionPage>
                         Colors.grey),
               ),
             ),
-            style: TextStyle(fontSize: 14, color: textColor),
+            style: const TextStyle(
+              fontFamily: 'WorkSans',
+              fontSize: 22,
+              height: 1.4,
+            ),
             onFieldSubmitted: (value) {
               model.saveHostname(value);
             },
