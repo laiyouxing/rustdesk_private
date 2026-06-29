@@ -3791,6 +3791,40 @@ Widget _buildPresetPasswordWarning() {
   ); // Show a warning message if the Future completed with true
 }
 
+
+Widget _buildSymmetricNatWarning() {
+  // Only show for desktop (not mobile).
+  if (isMobile) return SizedBox.shrink();
+  final nat = bind.mainGetNatType();
+  if (nat != 2 /* SYMMETRIC */) {
+    return SizedBox.shrink();
+  }
+  return Container(
+    color: Colors.orange.shade100,
+    child: Row(
+      children: [
+        Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800, size: 20).paddingOnly(right: 8),
+        Expanded(
+          child: Text(
+            translate('symmetric_nat_warning'),
+            style: TextStyle(color: Colors.orange.shade900, fontSize: 13),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    ).paddingAll(8),
+  );
+}
+
+Widget buildSymmetricNatWarningMobile() => SizedBox.shrink();
+
+Widget buildSymmetricNatWarning() {
+  return _buildSymmetricNatWarning();
+}
+
+
+
 Widget buildPresetPasswordWarningMobile() {
   if (bind.isPresetPasswordMobileOnly()) {
     return _buildPresetPasswordWarning();

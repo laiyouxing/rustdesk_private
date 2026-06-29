@@ -2609,79 +2609,109 @@ pub async fn punch_udp(
 /// After relay is established, keep trying UDP punching in background (Tailscale-style).
 /// Tries all known addresses of the peer (local + public).
 /// Query STUN server using an existing socket to discover the NAT-mapped public address.
-/// Uses the hardcoded STUN server list and tries each one.
-/// Returns (public_addr, stun_server_used).
+/// Serial over the hardcoded STUN server list; tries each one with timeouts.
+/// #4: Validates transaction ID in response.
+/// #1: Each recv has 2s timeout; whole function has 6s timeout.
+/// Query STUN server using an existing socket to discover the NAT-mapped public address.
+/// Serial over the hardcoded STUN server list; tries each one with timeouts.
+/// #4: Validates transaction ID in response.
+/// #1: Each recv has 2s timeout; whole function has 6s timeout.
 pub async fn stun_query_with_socket(
     socket: &UdpSocket,
 ) -> ResultType<(SocketAddr, String)> {
-    use hbb_common::futures::future::{select_ok, FutureExt};
+    use rand::Rng;
 
-    let tests = STUNS_V4
-        .iter()
-        .map(|&stun| {
-            let s = socket;
-            async move {
-                let stun_addr = stun
-                    .to_socket_addrs()?
-                    .filter(|x| x.is_ipv4())
-                    .next()
-                    .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
-                // Send STUN binding request using send_to (not connect, to preserve the original socket state)
-                // Build STUN binding request manually
-                let mut req = vec![0u8; 20];
-                req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
-                req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
-                // Random transaction ID
-                use rand::Rng;
-                let mut tx_id = [0u8; 12];
-                rand::thread_rng().fill(&mut tx_id);
-                req[8..20].copy_from_slice(&tx_id);
+    const SINGLE_RECV_TIMEOUT: Duration = Duration::from_secs(2);
+    const SINGLE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+    const TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 
-                socket.send_to(&req, stun_addr).await?;
+    async fn try_one(socket: &UdpSocket, stun: &str) -> ResultType<(SocketAddr, String)> {
+        let stun_addr = stun
+            .to_socket_addrs()?
+            .filter(|x| x.is_ipv4())
+            .next()
+            .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
 
-                // Receive response
-                let mut buf = vec![0u8; 4096];
-                let (n, _) = socket.recv_from(&mut buf).await?;
-                if n < 20 {
-                    bail!("STUN response too short");
-                }
-                let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
-                if resp_type != 0x0101 {
-                    bail!("Not a STUN Binding Response");
-                }
-                // Parse XOR-MAPPED-ADDRESS attribute (type 0x0020)
-                let mut pos = 20;
-                while pos + 4 < n {
-                    let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-                    let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
-                    if pos + 4 + attr_len > n {
-                        break;
-                    }
-                    if attr_type == 0x0020 && attr_len >= 8 {
-                        let xor_port = u16::from_be_bytes([buf[pos + 6], buf[pos + 7]]);
-                        let port = xor_port ^ 0x2112; // XOR with magic cookie high 16 bits
-                        let mut ip_bytes = [0u8; 4];
-                        for i in 0..4 {
-                            ip_bytes[i] = buf[pos + 8 + i] ^ buf[4 + i];
-                        }
-                        let ip = std::net::Ipv4Addr::new(
-                            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
-                        );
-                        return Ok((SocketAddr::from((ip, port)), stun.to_string()));
-                    }
-                    pos += 4 + attr_len;
-                    if attr_len % 4 != 0 {
-                        pos += 4 - (attr_len % 4);
-                    }
-                }
-                bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
+        // Build STUN binding request
+        let mut req = vec![0u8; 20];
+        req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
+        let mut tx_id = [0u8; 12];
+        rand::thread_rng().fill(&mut tx_id);
+        req[8..20].copy_from_slice(&tx_id);
+
+        socket.send_to(&req, stun_addr).await?;
+
+        // Receive response (with timeout)
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(SINGLE_RECV_TIMEOUT, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| anyhow!("STUN recv timeout from {}", stun))??;
+        if n < 20 {
+            bail!("STUN response too short");
+        }
+        let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
+        if resp_type != 0x0101 {
+            bail!("Not a STUN Binding Response");
+        }
+        // #4: validate transaction ID
+        if &buf[8..20] != &tx_id {
+            bail!("STUN transaction ID mismatch from {}", stun);
+        }
+        // Parse XOR-MAPPED-ADDRESS attribute (type 0x0020)
+        let mut pos = 20;
+        while pos + 4 <= n {
+            let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+            if pos + 4 + attr_len > n {
+                break;
             }
-            .boxed()
-        })
-        .collect::<Vec<_>>();
+            if attr_type == 0x0020 && attr_len >= 8 {
+                let xor_port = u16::from_be_bytes([buf[pos + 6], buf[pos + 7]]);
+                let port = xor_port ^ 0x2112;
+                let mut ip_bytes = [0u8; 4];
+                for i in 0..4 {
+                    ip_bytes[i] = buf[pos + 8 + i] ^ buf[4 + i];
+                }
+                let ip = std::net::Ipv4Addr::new(
+                    ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                );
+                return Ok((SocketAddr::from((ip, port)), stun.to_string()));
+            }
+            pos += 4 + attr_len;
+            if attr_len % 4 != 0 {
+                pos += 4 - (attr_len % 4);
+            }
+        }
+        bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
+    }
 
-    select_ok(tests).await.map(|res| res.0)
+    // Serial: try each STUN server in order, fall through to next on failure
+    let work = async {
+        let mut last_err: Option<anyhow::Error> = None;
+        for &stun in STUNS_V4.iter() {
+            match tokio::time::timeout(SINGLE_QUERY_TIMEOUT, try_one(socket, stun)).await {
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err(e)) => {
+                    log::debug!("STUN {} failed: {:?}", stun, e);
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    log::debug!("STUN {} query timeout", stun);
+                    last_err = Some(anyhow!("STUN query timeout for {}", stun));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("No STUN servers available")))
+    };
+
+    // Whole function has total timeout
+    tokio::time::timeout(TOTAL_TIMEOUT, work)
+        .await
+        .map_err(|_| anyhow!("STUN total timeout"))?
 }
+
+
 
 pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
@@ -2690,15 +2720,39 @@ pub async fn relay_upgrade_task(
 ) {
     use crate::kcp_stream::KcpStream;
 
-    // Wait a bit before starting (let relay stabilize)
-    hbb_common::tokio::time::sleep(Duration::from_secs(5)).await;
+    // #2: if we haven't determined NAT type yet, try STUN-based detection.
+    if Config::get_nat_type() == 0 {
+        if let Ok(true) = detect_symmetric_nat().await {
+            log::info!("relay_upgrade_task: detected SYMMETRIC NAT, switching to relay-only");
+            Config::set_nat_type(NatType::SYMMETRIC as _);
+            return; // No point trying punch
+        } else {
+            // If detection succeeded and result is not symmetric, mark as ASYMMETRIC
+            if Config::get_nat_type() == 0 {
+                Config::set_nat_type(NatType::ASYMMETRIC as _);
+            }
+        }
+    }
+    // #6/#7: total time budget for upgrade attempts - 30 seconds.
+    // Past this, give up and stay on relay to avoid wasting resources.
+    const TOTAL_BUDGET: Duration = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+
+    // Brief initial wait for relay to stabilize
+    hbb_common::tokio::time::sleep(Duration::from_secs(2)).await;
 
     for round in 0..10 {
+        // #6: stop if we exceed total budget
+        if started.elapsed() >= TOTAL_BUDGET {
+            log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
+            return;
+        }
+
         // Create UDP socket and try punching
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Arc::new(s),
             Err(_) => {
-                hbb_common::tokio::time::sleep(Duration::from_secs(10)).await;
+                hbb_common::tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
@@ -2721,6 +2775,9 @@ pub async fn relay_upgrade_task(
 
         // Try each target address
         for &target in &targets {
+            if started.elapsed() >= TOTAL_BUDGET {
+                return;
+            }
             if socket.connect(target).await.is_err() {
                 continue;
             }
@@ -2732,6 +2789,7 @@ pub async fn relay_upgrade_task(
                         let mut guard = direct_stream.lock().await;
                         *guard = Some(stream);
                         notify.notify_one();
+                        log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
                         return;
                     }
                 }
@@ -2739,10 +2797,123 @@ pub async fn relay_upgrade_task(
             }
         }
 
-        let delay = std::cmp::min(30, 5 + round * 5) as u64;
-        hbb_common::tokio::time::sleep(Duration::from_secs(delay)).await;
+        // Sleep before next round, but cap by remaining budget
+        let remaining = TOTAL_BUDGET.saturating_sub(started.elapsed());
+        let delay = std::cmp::min(remaining, Duration::from_secs(5));
+        if delay.is_zero() {
+            return;
+        }
+        hbb_common::tokio::time::sleep(delay).await;
     }
-    log::info!("Relay upgrade punching finished after 10 rounds without success");
+    log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
+}
+
+
+/// Detect NAT type by sending two STUN binding requests from the same socket
+/// to the same STUN server, but to two different destination ports (or two servers).
+/// If the mapped port differs -> Symmetric (NAT4).
+/// If the mapped port is the same -> Cone (NAT1-3).
+/// #2 enhancement: when only one STUN server is reachable, send two requests
+/// to the same server and compare the mapped ports. The server may NAT the
+/// response from different source ports, which can still differentiate symmetric.
+pub async fn detect_symmetric_nat() -> ResultType<bool> {
+
+    // Create a single socket for both queries so we can compare port mappings.
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let socket = Arc::new(socket);
+
+    // Resolve the first STUN server.
+    let stun_str = match STUNS_V4.first() {
+        Some(s) => *s,
+        None => return Ok(false),
+    };
+    let base_addr: SocketAddr = match stun_str.to_socket_addrs()?.find(|x| x.is_ipv4()) {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+
+    // Helper: send a STUN binding request and return the XOR-mapped port.
+    async fn query(socket: &UdpSocket, target: SocketAddr) -> ResultType<u16> {
+        use rand::Rng;
+        let mut req = vec![0u8; 20];
+        req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
+        let mut tx_id = [0u8; 12];
+        rand::thread_rng().fill(&mut tx_id);
+        req[8..20].copy_from_slice(&tx_id);
+
+        socket.send_to(&req, target).await?;
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        .map_err(|_| anyhow!("STUN timeout"))??;
+        if n < 20 {
+            bail!("too short");
+        }
+        if u16::from_be_bytes([buf[0], buf[1]]) != 0x0101 {
+            bail!("not binding response");
+        }
+        if &buf[8..20] != &tx_id {
+            bail!("tx id mismatch");
+        }
+        let mut pos = 20;
+        while pos + 4 <= n {
+            let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+            if pos + 4 + attr_len > n {
+                break;
+            }
+            if attr_type == 0x0020 && attr_len >= 8 {
+                let xor_port = u16::from_be_bytes([buf[pos + 6], buf[pos + 7]]);
+                return Ok(xor_port ^ 0x2112);
+            }
+            pos += 4 + attr_len;
+            if attr_len % 4 != 0 {
+                pos += 4 - (attr_len % 4);
+            }
+        }
+        bail!("no XOR-MAPPED-ADDRESS")
+    }
+
+    // First request to STUN server
+    let p1 = match query(&socket, base_addr).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("detect_symmetric_nat: first query failed: {:?}", e);
+            return Ok(false);
+        }
+    };
+
+    // Second request to same STUN server (or different port if possible).
+    // Most NATs will reuse the same mapping for the same destination, so
+    // both requests will produce the same port even for symmetric NATs.
+    // To force a different mapping on symmetric NATs, we need a DIFFERENT
+    // destination. Try a second STUN server, then fallback to a fake port.
+    let mut target2 = base_addr;
+    if STUNS_V4.len() >= 2 {
+        if let Some(s2) = STUNS_V4.get(1) {
+            if let Some(a2) = s2.to_socket_addrs()?.find(|x| x.is_ipv4()) {
+                target2 = a2;
+            }
+        }
+    } else {
+        // Only one STUN server available - send a second request to the
+        // same server but on a different UDP port. Many servers listen on
+        // multiple ports (e.g. 3478 and 3479); if not, fall back to a
+        // different fake port to at least get a different source mapping
+        // for true symmetric NATs.
+        target2.set_port(target2.port().wrapping_add(1));
+    }
+
+    let p2 = match query(&socket, target2).await {
+        Ok(p) => p,
+        Err(_) => p1, // second query failed; assume cone
+    };
+
+    Ok(p1 != p2)
 }
 
 fn test_ipv6_sync() {

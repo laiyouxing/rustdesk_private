@@ -583,6 +583,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("outgoing_only_desk_tip", "当前版本的软件是定制版本。\n您可以连接至其他设备，但是其他设备无法连接至您的设备。"),
         ("preset_password_warning", "此定制版本附有预设密码。 任何知晓此密码的人都能完全控制您的设备。如果这不是您所预期的，请立即卸载此软件。"),
         ("Security Alert", "安全警告"),
+        ("symmetric_nat_warning", "检测到对称NAT(NAT4)，无法与对端建立P2P直连，将持续使用中继服务器。"),
         ("My address book", "我的地址簿"),
         ("Personal", "个人的"),
         ("Owner", "所有者"),

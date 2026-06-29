@@ -188,7 +188,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 let punch_notify = Arc::new(Notify::new());
                 let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
                     Arc::new(hbb_common::tokio::sync::Mutex::new(None));
-                if !direct && stream_type == "Relay" {
+                if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
                     let n = punch_notify.clone();
                     let s = punch_stream.clone();
                     // Include peer_addr (hbbs-reported public address) AND peer_addrs
