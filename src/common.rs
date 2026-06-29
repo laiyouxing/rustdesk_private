@@ -2608,6 +2608,81 @@ pub async fn punch_udp(
 
 /// After relay is established, keep trying UDP punching in background (Tailscale-style).
 /// Tries all known addresses of the peer (local + public).
+/// Query STUN server using an existing socket to discover the NAT-mapped public address.
+/// Uses the hardcoded STUN server list and tries each one.
+/// Returns (public_addr, stun_server_used).
+pub async fn stun_query_with_socket(
+    socket: &UdpSocket,
+) -> ResultType<(SocketAddr, String)> {
+    use hbb_common::futures::future::{select_ok, FutureExt};
+
+    let tests = STUNS_V4
+        .iter()
+        .map(|&stun| {
+            let s = socket;
+            async move {
+                let stun_addr = stun
+                    .to_socket_addrs()?
+                    .filter(|x| x.is_ipv4())
+                    .next()
+                    .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
+                // Send STUN binding request using send_to (not connect, to preserve the original socket state)
+                // Build STUN binding request manually
+                let mut req = vec![0u8; 20];
+                req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+                req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
+                // Random transaction ID
+                use rand::Rng;
+                let mut tx_id = [0u8; 12];
+                rand::thread_rng().fill(&mut tx_id);
+                req[8..20].copy_from_slice(&tx_id);
+
+                socket.send_to(&req, stun_addr).await?;
+
+                // Receive response
+                let mut buf = vec![0u8; 4096];
+                let (n, _) = socket.recv_from(&mut buf).await?;
+                if n < 20 {
+                    bail!("STUN response too short");
+                }
+                let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
+                if resp_type != 0x0101 {
+                    bail!("Not a STUN Binding Response");
+                }
+                // Parse XOR-MAPPED-ADDRESS attribute (type 0x0020)
+                let mut pos = 20;
+                while pos + 4 < n {
+                    let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+                    let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+                    if pos + 4 + attr_len > n {
+                        break;
+                    }
+                    if attr_type == 0x0020 && attr_len >= 8 {
+                        let xor_port = u16::from_be_bytes([buf[pos + 6], buf[pos + 7]]);
+                        let port = xor_port ^ 0x2112; // XOR with magic cookie high 16 bits
+                        let mut ip_bytes = [0u8; 4];
+                        for i in 0..4 {
+                            ip_bytes[i] = buf[pos + 8 + i] ^ buf[4 + i];
+                        }
+                        let ip = std::net::Ipv4Addr::new(
+                            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                        );
+                        return Ok((SocketAddr::from((ip, port)), stun.to_string()));
+                    }
+                    pos += 4 + attr_len;
+                    if attr_len % 4 != 0 {
+                        pos += 4 - (attr_len % 4);
+                    }
+                }
+                bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
+            }
+            .boxed()
+        })
+        .collect::<Vec<_>>();
+
+    select_ok(tests).await.map(|res| res.0)
+}
+
 pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
     notify: Arc<hbb_common::tokio::sync::Notify>,
@@ -2618,30 +2693,42 @@ pub async fn relay_upgrade_task(
     // Wait a bit before starting (let relay stabilize)
     hbb_common::tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Try multiple rounds of punching with increasing intervals
     for round in 0..10 {
-        for &peer_addr in &peer_addrs {
-            // Create UDP socket and punch
-            let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(s) => Arc::new(s),
-                Err(_) => {
-                    hbb_common::tokio::time::sleep(Duration::from_secs(10)).await;
-                    continue;
-                }
-            };
-            // Connect socket to peer (tells the socket where to send)
-            if socket.connect(peer_addr).await.is_err() {
+        // Create UDP socket and try punching
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(_) => {
+                hbb_common::tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
+        };
 
-            // Try punching for up to 10 seconds
+        // Query STUN to discover the NAT mapping for THIS socket
+        let mut targets = peer_addrs.clone();
+        match stun_query_with_socket(&socket).await {
+            Ok((stun_addr, stun_srv)) => {
+                log::info!("RelayUpgrade STUN: mapped {} (via {})", stun_addr, stun_srv);
+                if !targets.contains(&stun_addr) {
+                    targets.push(stun_addr);
+                }
+            }
+            Err(e) => {
+                if round == 0 {
+                    log::info!("RelayUpgrade STUN failed: {:?}", e);
+                }
+            }
+        }
+
+        // Try each target address
+        for &target in &targets {
+            if socket.connect(target).await.is_err() {
+                continue;
+            }
             match punch_udp(socket.clone(), true).await {
                 Ok(Some(_data)) => {
-                    // Punching succeeded! Create KCP stream
                     if let Ok((_kcp_stream, stream)) =
                         KcpStream::connect(socket.clone(), Duration::from_secs(5)).await
                     {
-                        // KCP connection established! Send back to io_loop
                         let mut guard = direct_stream.lock().await;
                         *guard = Some(stream);
                         notify.notify_one();
@@ -2651,7 +2738,7 @@ pub async fn relay_upgrade_task(
                 _ => {}
             }
         }
-        // All addresses failed this round, wait and retry
+
         let delay = std::cmp::min(30, 5 + round * 5) as u64;
         hbb_common::tokio::time::sleep(Duration::from_secs(delay)).await;
     }

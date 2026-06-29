@@ -191,7 +191,11 @@ impl<T: InvokeUiSession> Remote<T> {
                 if !direct && stream_type == "Relay" {
                     let n = punch_notify.clone();
                     let s = punch_stream.clone();
-                    let p2p_addrs = peer_addrs.clone();
+                    // Include peer_addr (hbbs-reported public address) AND peer_addrs
+                    let mut p2p_addrs = peer_addrs.clone();
+                    if !p2p_addrs.contains(&peer_addr) {
+                        p2p_addrs.push(peer_addr);
+                    }
                     tokio::spawn(async move {
                         relay_upgrade_task(p2p_addrs, n, s).await;
                     });

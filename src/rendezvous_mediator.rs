@@ -597,11 +597,19 @@ impl RendezvousMediator {
 
         // Host-side: always start background punching when receiving punch hole
         // so that both sides punch simultaneously, enabling NAT traversal
+        // Use ph.udp_port if available (known port, NAT mapping predictable),
+        // otherwise fallback to random port.
         {
             let host_peer_addr = peer_addr;
+            let host_udp_port = ph.udp_port;
             tokio::spawn(async move {
                 for round in 0..10 {
-                    let socket = match hbb_common::tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                    let bind_addr = if host_udp_port > 0 {
+                        SocketAddr::from(([0u8; 4], host_udp_port as u16))
+                    } else {
+                        SocketAddr::from(([0u8; 4], 0))
+                    };
+                    let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
                         Ok(s) => Arc::new(s),
                         Err(_) => {
                             sleep(10.0).await;
