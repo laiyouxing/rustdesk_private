@@ -202,7 +202,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -264,7 +264,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0))),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
                 false,
             ));
         }
@@ -278,7 +278,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0))),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
                 false,
             ));
         }
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
         bool,
     )> {
         let mut start = Instant::now();
@@ -585,7 +585,7 @@ impl Client {
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone()),
+                            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
                             false,
                         ));
                     }
@@ -633,7 +633,7 @@ impl Client {
                 punch_type,
             )
             .await?,
-            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone()),
+            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
             true,
         ))
     }
@@ -666,37 +666,28 @@ impl Client {
         &'static str,
     )> {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
-        let mut connect_timeout = 0;
         const MIN: u64 = 1000;
-        if is_local || peer_nat_type == NatType::SYMMETRIC {
-            connect_timeout = MIN;
+
+        let connect_timeout = if is_local || peer_nat_type == NatType::SYMMETRIC {
+            MIN
+        } else if relay_server.is_empty() {
+            CONNECT_TIMEOUT
+        } else if peer_nat_type == NatType::ASYMMETRIC {
+            let mut my_nat_type = my_nat_type;
+            if my_nat_type == NatType::UNKNOWN_NAT as i32 {
+                my_nat_type = crate::get_nat_type(100).await;
+            }
+            match my_nat_type {
+                n if n == NatType::ASYMMETRIC as i32 && direct_failures > 0 => {
+                    std::cmp::max(punch_time_used * 6, MIN)
+                }
+                n if n == NatType::ASYMMETRIC as i32 => CONNECT_TIMEOUT,
+                _ => MIN,
+            }
         } else {
-            if relay_server.is_empty() {
-                connect_timeout = CONNECT_TIMEOUT;
-            } else {
-                if peer_nat_type == NatType::ASYMMETRIC {
-                    let mut my_nat_type = my_nat_type;
-                    if my_nat_type == NatType::UNKNOWN_NAT as i32 {
-                        my_nat_type = crate::get_nat_type(100).await;
-                    }
-                    if my_nat_type == NatType::ASYMMETRIC as i32 {
-                        connect_timeout = CONNECT_TIMEOUT;
-                        if direct_failures > 0 {
-                            connect_timeout = punch_time_used * 6;
-                        }
-                    } else if my_nat_type == NatType::SYMMETRIC as i32 {
-                        connect_timeout = MIN;
-                    }
-                }
-                if connect_timeout == 0 {
-                    let n = if direct_failures > 0 { 3 } else { 6 };
-                    connect_timeout = punch_time_used * (n as u64);
-                }
-            }
-            if connect_timeout < MIN {
-                connect_timeout = MIN;
-            }
-        }
+            let n = if direct_failures > 0 { 3 } else { 6 };
+            std::cmp::max(punch_time_used * (n as u64), MIN)
+        };
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
 

@@ -35,7 +35,10 @@ type Message = RendezvousMessage;
 
 lazy_static::lazy_static! {
     static ref SOLVING_PK_MISMATCH: Mutex<String> = Default::default();
-    static ref LAST_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    // (encoded_socket_addr_bytes, decoded_addr, timestamp)
+    // Using encoded bytes + decoded addr as key to prevent false dedup
+    // when different peers happen to have the same decoded addr (extremely rare).
+    static ref LAST_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -485,9 +488,9 @@ impl RendezvousMediator {
     async fn handle_intranet(&self, fla: FetchLocalAddr, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&fla.socket_addr);
         let last = *LAST_MSG.lock().await;
-        *LAST_MSG.lock().await = (addr, Instant::now());
-        // skip duplicate punch hole messages
-        if last.0 == addr && last.1.elapsed().as_millis() < 100 {
+        *LAST_MSG.lock().await = (fla.socket_addr.to_vec(), addr, Instant::now());
+        // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
+        if last.0 == fla.socket_addr.as_ref() && last.1 == addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
@@ -585,9 +588,9 @@ impl RendezvousMediator {
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
         let last = *LAST_MSG.lock().await;
-        *LAST_MSG.lock().await = (peer_addr, Instant::now());
-        // skip duplicate punch hole messages
-        if last.0 == peer_addr && last.1.elapsed().as_millis() < 100 {
+        *LAST_MSG.lock().await = (ph.socket_addr.to_vec(), peer_addr, Instant::now());
+        // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
+        if last.0 == ph.socket_addr.as_ref() && last.1 == peer_addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
@@ -602,6 +605,8 @@ impl RendezvousMediator {
         {
             let host_peer_addr = peer_addr;
             let host_udp_port = ph.udp_port;
+            let host_server = server.clone();
+            let host_cp = control_permissions.clone();
             tokio::spawn(async move {
                 for round in 0..10 {
                     let bind_addr = if host_udp_port > 0 {
@@ -620,8 +625,25 @@ impl RendezvousMediator {
                         sleep(10.0).await;
                         continue;
                     }
-                    if crate::common::punch_udp(socket.clone(), true).await.is_ok() {
-                        log::info!("Host-side punching succeeded!");
+                    if let Ok(Some(data)) = crate::common::punch_udp(socket.clone(), true).await {
+                        log::info!("Host-side punching succeeded! Setting up KCP accept...");
+                        // [Fix #5]: After successful punch, set up KCP listener so the
+                        // connector's relay_upgrade_task KCP connect can be accepted.
+                        let _ = crate::kcp_stream::KcpStream::accept(
+                            socket.clone(),
+                            Duration::from_millis(CONNECT_TIMEOUT as _),
+                            data,
+                        )
+                        .await
+                        .and_then(|(_kcp, stream)| {
+                            crate::server::create_tcp_connection(
+                                host_server.clone(),
+                                stream,
+                                host_peer_addr,
+                                true,
+                                host_cp.clone(),
+                            )
+                        });
                         return;
                     }
                     let delay = std::cmp::min(30, 5 + round * 5) as u64;

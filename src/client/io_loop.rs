@@ -175,7 +175,7 @@ impl<T: InvokeUiSession> Remote<T> {
         )
         .await
         {
-            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs))) => {
+            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port))) => {
                 self.handler
                     .connection_round_state
                     .lock()
@@ -197,7 +197,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         p2p_addrs.push(peer_addr);
                     }
                     tokio::spawn(async move {
-                        relay_upgrade_task(p2p_addrs, n, s).await;
+                        relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
                     });
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {

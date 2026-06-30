@@ -2717,6 +2717,7 @@ pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
     notify: Arc<hbb_common::tokio::sync::Notify>,
     direct_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+    punch_port: u16,
 ) {
     use crate::kcp_stream::KcpStream;
 
@@ -2741,39 +2742,56 @@ pub async fn relay_upgrade_task(
     // Brief initial wait for relay to stabilize
     hbb_common::tokio::time::sleep(Duration::from_secs(2)).await;
 
+    // [Fix #1]: Create ONE persistent socket for all rounds.
+    // Try to reuse the initial punch port so the host's host-side punching
+    // (which targets our known port from PunchHole.udp_port) can reach us.
+    let socket = {
+        let bind_addr = if punch_port > 0 {
+            SocketAddr::from(([0u8; 4], punch_port))
+        } else {
+            SocketAddr::from(([0u8; 4], 0))
+        };
+        match UdpSocket::bind(bind_addr).await {
+            Ok(s) => Arc::new(s),
+            Err(_) if punch_port > 0 => {
+                // Port in-use, fall back to any available port
+                match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => Arc::new(s),
+                    Err(_) => {
+                        log::info!("RelayUpgrade: failed to create socket, giving up");
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                log::info!("RelayUpgrade: failed to create socket, giving up");
+                return;
+            }
+        }
+    };
+
+    // Do STUN ONCE per socket to discover the NAT-mapped address.
+    // Reusing the socket means the mapped port stays stable across rounds.
+    let mut targets = peer_addrs.clone();
+    match stun_query_with_socket(&socket).await {
+        Ok((stun_addr, stun_srv)) => {
+            log::info!("RelayUpgrade STUN: mapped {} (via {})", stun_addr, stun_srv);
+            if !targets.contains(&stun_addr) {
+                targets.push(stun_addr);
+            }
+        }
+        Err(e) => {
+            log::info!("RelayUpgrade STUN failed: {:?}", e);
+        }
+    }
+
     for round in 0..10 {
-        // #6: stop if we exceed total budget
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return;
         }
 
-        // Create UDP socket and try punching
-        let socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => Arc::new(s),
-            Err(_) => {
-                hbb_common::tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        // Query STUN to discover the NAT mapping for THIS socket
-        let mut targets = peer_addrs.clone();
-        match stun_query_with_socket(&socket).await {
-            Ok((stun_addr, stun_srv)) => {
-                log::info!("RelayUpgrade STUN: mapped {} (via {})", stun_addr, stun_srv);
-                if !targets.contains(&stun_addr) {
-                    targets.push(stun_addr);
-                }
-            }
-            Err(e) => {
-                if round == 0 {
-                    log::info!("RelayUpgrade STUN failed: {:?}", e);
-                }
-            }
-        }
-
-        // Try each target address
+        // Try each target address with the SAME socket
         for &target in &targets {
             if started.elapsed() >= TOTAL_BUDGET {
                 return;
