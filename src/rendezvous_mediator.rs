@@ -487,12 +487,13 @@ impl RendezvousMediator {
 
     async fn handle_intranet(&self, fla: FetchLocalAddr, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&fla.socket_addr);
-        let last = *LAST_MSG.lock().await;
-        *LAST_MSG.lock().await = (fla.socket_addr.to_vec(), addr, Instant::now());
+        let mut last = LAST_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
         if last.0 == fla.socket_addr.as_ref() && last.1 == addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
         }
+        *last = (fla.socket_addr.to_vec(), addr, Instant::now());
+        drop(last);
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
         let relay_server = self.get_relay_server(fla.relay_server.clone());
         let relay = use_ws() || Config::is_proxy();
@@ -587,12 +588,13 @@ impl RendezvousMediator {
 
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
-        let last = *LAST_MSG.lock().await;
-        *LAST_MSG.lock().await = (ph.socket_addr.to_vec(), peer_addr, Instant::now());
+        let mut last = LAST_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
         if last.0 == ph.socket_addr.as_ref() && last.1 == peer_addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
         }
+        *last = (ph.socket_addr.to_vec(), peer_addr, Instant::now());
+        drop(last);
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
         let relay = use_ws() || Config::is_proxy() || ph.force_relay;
         let mut socket_addr_v6 = Default::default();
@@ -632,7 +634,7 @@ impl RendezvousMediator {
                         let _ = crate::kcp_stream::KcpStream::accept(
                             socket.clone(),
                             Duration::from_millis(CONNECT_TIMEOUT as _),
-                            data,
+                            Some(data),
                         )
                         .await
                         .and_then(|(_kcp, stream)| {
@@ -643,6 +645,7 @@ impl RendezvousMediator {
                                 true,
                                 host_cp.clone(),
                             )
+                            .ok()
                         });
                         return;
                     }

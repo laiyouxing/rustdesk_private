@@ -2785,7 +2785,7 @@ pub async fn relay_upgrade_task(
         }
     }
 
-    for round in 0..10 {
+    for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return;
