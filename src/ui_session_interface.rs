@@ -38,6 +38,7 @@ use std::{
     },
     time::SystemTime,
 };
+#[cfg(feature = "flutter")]
 use uuid::Uuid;
 
 use crate::client::io_loop::Remote;
