@@ -7,6 +7,7 @@ use std::{
 #[cfg(not(any(target_os = "ios")))]
 use crate::{ui_interface::get_builtin_option, Connection};
 use hbb_common::{
+    base64::Engine,
     config::{self, keys, Config, LocalConfig},
     log,
     tokio::{self, sync::broadcast, time::Instant},
@@ -188,7 +189,7 @@ async fn start_hbbs_sync_async() {
                         hasher.update(url.as_bytes());
                         hasher.update(&v.as_bytes());
                         let res = hasher.finalize();
-                        hash = hbb_common::base64::encode(&res[..]);
+                        hash = hbb_common::base64::engine::general_purpose::STANDARD.encode(&res[..]);
                         let old_hash = config::Status::get("sysinfo_hash");
                         let ver = config::Status::get("sysinfo_ver"); // sysinfo_ver is the version of sysinfo on server's side
                         if hash == old_hash {

@@ -631,22 +631,22 @@ impl RendezvousMediator {
                         log::info!("Host-side punching succeeded! Setting up KCP accept...");
                         // [Fix #5]: After successful punch, set up KCP listener so the
                         // connector's relay_upgrade_task KCP connect can be accepted.
-                        let _ = crate::kcp_stream::KcpStream::accept(
+                        if let Ok((_kcp, stream)) = crate::kcp_stream::KcpStream::accept(
                             socket.clone(),
                             Duration::from_millis(CONNECT_TIMEOUT as _),
                             Some(data),
                         )
                         .await
-                        .and_then(|(_kcp, stream)| {
-                            crate::server::create_tcp_connection(
+                        {
+                            let _ = crate::server::create_tcp_connection(
                                 host_server.clone(),
                                 stream,
                                 host_peer_addr,
                                 true,
                                 host_cp.clone(),
                             )
-                            .ok()
-                        });
+                            .await;
+                        }
                         return;
                     }
                     let delay = std::cmp::min(30, 5 + round * 5) as u64;
