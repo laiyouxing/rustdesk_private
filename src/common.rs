@@ -2988,7 +2988,6 @@ pub fn get_control_permission(
     permissions: u64,
     permission: hbb_common::rendezvous_proto::control_permissions::Permission,
 ) -> Option<bool> {
-    use hbb_common::protobuf::Enum;
     let index = permission.value();
     if index >= 0 && index < 32 {
         let shift = index * 2;
