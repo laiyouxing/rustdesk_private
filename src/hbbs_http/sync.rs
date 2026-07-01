@@ -7,6 +7,7 @@ use std::{
 #[cfg(not(any(target_os = "ios")))]
 use crate::{ui_interface::get_builtin_option, Connection};
 use hbb_common::{
+    base64::Engine as _,
     config::{self, keys, Config, LocalConfig},
     log,
     tokio::{self, sync::broadcast, time::Instant},
@@ -55,6 +56,7 @@ struct InfoUploaded {
     last_uploaded: Option<Instant>,
     id: String,
     username: Option<String>,
+    last_hostname: String,
 }
 
 impl Default for InfoUploaded {
@@ -65,18 +67,20 @@ impl Default for InfoUploaded {
             last_uploaded: None,
             id: "".to_owned(),
             username: None,
+            last_hostname: "".to_owned(),
         }
     }
 }
 
 impl InfoUploaded {
-    fn uploaded(url: String, id: String, username: String) -> Self {
+    fn uploaded(url: String, id: String, username: String, hostname: String) -> Self {
         Self {
             uploaded: true,
             url,
             last_uploaded: None,
             id,
             username: Some(username),
+            last_hostname: hostname,
         }
     }
 }
@@ -124,9 +128,11 @@ async fn start_hbbs_sync_async() {
                 // we may not be able to get the username before login after the next restart.
                 let mut v = crate::get_sysinfo();
                 let sys_username = v["username"].as_str().unwrap_or_default().to_string();
+                let device_name = Config::get_option(keys::OPTION_PRESET_DEVICE_NAME);
+                let hostname_changed = !device_name.is_empty() && device_name != info_uploaded.last_hostname;
                 // Though the username comparison is only necessary on Windows,
                 // we still keep the comparison on other platforms for consistency.
-                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username)) &&
+                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username) || hostname_changed) &&
                     info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
                 if need_upload {
                     v["version"] = json!(crate::VERSION);
@@ -168,9 +174,8 @@ async fn start_hbbs_sync_async() {
                     if !device_username.is_empty() {
                         v["username"] = json!(device_username);
                     }
-                    let device_name = Config::get_option(keys::OPTION_PRESET_DEVICE_NAME);
                     if !device_name.is_empty() {
-                        v["hostname"] = json!(device_name);
+                        v["hostname"] = json!(&device_name);
                     }
                     let note = Config::get_option(keys::OPTION_PRESET_NOTE);
                     if !note.is_empty() {
@@ -184,7 +189,7 @@ async fn start_hbbs_sync_async() {
                         hasher.update(url.as_bytes());
                         hasher.update(&v.as_bytes());
                         let res = hasher.finalize();
-                        hash = hbb_common::base64::encode(&res[..]);
+                        hash = hbb_common::base64::engine::general_purpose::STANDARD.encode(&res[..]);
                         let old_hash = config::Status::get("sysinfo_hash");
                         let ver = config::Status::get("sysinfo_ver"); // sysinfo_ver is the version of sysinfo on server's side
                         if hash == old_hash {
@@ -201,7 +206,7 @@ async fn start_hbbs_sync_async() {
                                 }
                             };
                             if samever {
-                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username);
+                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username, device_name.clone());
                                 log::info!("sysinfo not changed, skip upload");
                                 continue;
                             }
@@ -210,7 +215,7 @@ async fn start_hbbs_sync_async() {
                     match crate::post_request(url.replace("heartbeat", "sysinfo"), v, "").await {
                         Ok(x)  => {
                             if x == "SYSINFO_UPDATED" {
-                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username);
+                                info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username, device_name.clone());
                                 log::info!("sysinfo updated");
                                 if !hash.is_empty() {
                                     config::Status::set("sysinfo_hash", hash);

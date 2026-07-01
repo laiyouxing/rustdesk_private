@@ -128,7 +128,7 @@ fn check_update(manually: bool) -> ResultType<()> {
     }
     if do_check_software_update().is_err() {
         // ignore
-        return Ok(());
+        // check_software_update is handled in common.rs for custom builds
     }
 
     let update_url = crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone();

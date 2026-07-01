@@ -195,7 +195,7 @@ impl InvokeUiSession for SciterHandler {
         self.call("setCursorPosition", &make_args!(cp.x, cp.y));
     }
 
-    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str) {
+    fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str, _relay_server: &str) {
         self.call(
             "setConnectionType",
             &make_args!(is_secured, direct, stream_type.to_string()),
@@ -203,6 +203,8 @@ impl InvokeUiSession for SciterHandler {
     }
 
     fn set_fingerprint(&self, _fingerprint: String) {}
+
+    fn set_punch_status(&self, _status: &str, _info: &str) {}
 
     fn job_error(&self, id: i32, err: String, file_num: i32) {
         self.call("jobError", &make_args!(id, err, file_num));

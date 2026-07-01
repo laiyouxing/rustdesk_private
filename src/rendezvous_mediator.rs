@@ -35,7 +35,10 @@ type Message = RendezvousMessage;
 
 lazy_static::lazy_static! {
     static ref SOLVING_PK_MISMATCH: Mutex<String> = Default::default();
-    static ref LAST_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    // (encoded_socket_addr_bytes, decoded_addr, timestamp)
+    // Using encoded bytes + decoded addr as key to prevent false dedup
+    // when different peers happen to have the same decoded addr (extremely rare).
+    static ref LAST_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -484,12 +487,13 @@ impl RendezvousMediator {
 
     async fn handle_intranet(&self, fla: FetchLocalAddr, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&fla.socket_addr);
-        let last = *LAST_MSG.lock().await;
-        *LAST_MSG.lock().await = (addr, Instant::now());
-        // skip duplicate punch hole messages
-        if last.0 == addr && last.1.elapsed().as_millis() < 100 {
+        let mut last = LAST_MSG.lock().await;
+        // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
+        if last.0 == fla.socket_addr.as_ref() && last.1 == addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
         }
+        *last = (fla.socket_addr.to_vec(), addr, Instant::now());
+        drop(last);
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
         let relay_server = self.get_relay_server(fla.relay_server.clone());
         let relay = use_ws() || Config::is_proxy();
@@ -542,15 +546,28 @@ impl RendezvousMediator {
         let peer_addr = AddrMangle::decode(&fla.socket_addr);
         log::debug!("Handle intranet from {:?}", peer_addr);
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
-        let local_addr = socket.local_addr();
-        // we saw invalid local_addr while using proxy, local_addr.ip() == "::1"
-        let local_addr: SocketAddr =
-            format!("{}:{}", local_addr.ip(), local_addr.port()).parse()?;
+        let port = socket.local_addr().port();
+        // enumerate all non-loopback IPv4 addresses for multi-network support
+        let mut local_addrs: Vec<Vec<u8>> = Vec::new();
+        for interface in default_net::get_interfaces() {
+            for ipv4 in &interface.ipv4 {
+                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
+                    let addr = SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), port);
+                    local_addrs.push(AddrMangle::encode(addr).into());
+                }
+            }
+        }
+        if local_addrs.is_empty() {
+            // fallback to TCP socket's local address
+            let addr: SocketAddr =
+                format!("{}:{}", socket.local_addr().ip(), port).parse()?;
+            local_addrs.push(AddrMangle::encode(addr).into());
+        }
         let mut msg_out = Message::new();
         msg_out.set_local_addr(LocalAddr {
             id: Config::get_id(),
             socket_addr: AddrMangle::encode(peer_addr).into(),
-            local_addr: AddrMangle::encode(local_addr).into(),
+            local_addr: local_addrs.into_iter().map(|a| bytes::Bytes::from(a)).collect(),
             relay_server,
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
@@ -571,16 +588,74 @@ impl RendezvousMediator {
 
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
-        let last = *LAST_MSG.lock().await;
-        *LAST_MSG.lock().await = (peer_addr, Instant::now());
-        // skip duplicate punch hole messages
-        if last.0 == peer_addr && last.1.elapsed().as_millis() < 100 {
+        let mut last = LAST_MSG.lock().await;
+        // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
+        if last.0 == ph.socket_addr.as_ref() && last.1 == peer_addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
         }
+        *last = (ph.socket_addr.to_vec(), peer_addr, Instant::now());
+        drop(last);
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
         let relay = use_ws() || Config::is_proxy() || ph.force_relay;
         let mut socket_addr_v6 = Default::default();
         let control_permissions = ph.control_permissions.into_option();
+
+        // Host-side: always start background punching when receiving punch hole
+        // so that both sides punch simultaneously, enabling NAT traversal
+        // Use ph.udp_port if available (known port, NAT mapping predictable),
+        // otherwise fallback to random port.
+        {
+            let host_peer_addr = peer_addr;
+            let host_udp_port = ph.udp_port;
+            let host_server = server.clone();
+            let host_cp = control_permissions.clone();
+            tokio::spawn(async move {
+                for round in 0..10 {
+                    let bind_addr = if host_udp_port > 0 {
+                        SocketAddr::from(([0u8; 4], host_udp_port as u16))
+                    } else {
+                        SocketAddr::from(([0u8; 4], 0))
+                    };
+                    let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
+                        Ok(s) => Arc::new(s),
+                        Err(_) => {
+                            sleep(10.0).await;
+                            continue;
+                        }
+                    };
+                    if socket.connect(host_peer_addr).await.is_err() {
+                        sleep(10.0).await;
+                        continue;
+                    }
+                    if let Ok(Some(data)) = crate::common::punch_udp(socket.clone(), true).await {
+                        log::info!("Host-side punching succeeded! Setting up KCP accept...");
+                        // [Fix #5]: After successful punch, set up KCP listener so the
+                        // connector's relay_upgrade_task KCP connect can be accepted.
+                        if let Ok((_kcp, stream)) = crate::kcp_stream::KcpStream::accept(
+                            socket.clone(),
+                            Duration::from_millis(CONNECT_TIMEOUT as _),
+                            Some(data),
+                        )
+                        .await
+                        {
+                            let _ = crate::server::create_tcp_connection(
+                                host_server.clone(),
+                                stream,
+                                host_peer_addr,
+                                true,
+                                host_cp.clone(),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    let delay = std::cmp::min(30, 5 + round * 5) as u64;
+                    sleep(delay as f32).await;
+                }
+                log::info!("Host-side punching finished without success");
+            });
+        }
+
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(
                 peer_addr_v6,

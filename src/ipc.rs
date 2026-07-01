@@ -25,7 +25,7 @@ use hbb_common::{
     bytes_codec::BytesCodec,
     config::{
         self,
-        keys::{self, OPTION_ALLOW_WEBSOCKET},
+        keys::OPTION_ALLOW_WEBSOCKET,
         Config, Config2,
     },
     futures::StreamExt as _,

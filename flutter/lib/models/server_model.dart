@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -41,6 +42,8 @@ class ServerModel with ChangeNotifier {
 
   late String _emptyIdShow;
   late final IDTextEditingController _serverId;
+  late final TextEditingController _hostname;
+  String _systemHostname = "";
   final _serverPasswd =
       TextEditingController(text: translate("Generating ..."));
 
@@ -121,6 +124,8 @@ class ServerModel with ChangeNotifier {
   }
 
   TextEditingController get serverId => _serverId;
+  TextEditingController get hostname => _hostname;
+  String get systemHostname => _systemHostname;
 
   TextEditingController get serverPasswd => _serverPasswd;
 
@@ -133,6 +138,7 @@ class ServerModel with ChangeNotifier {
   ServerModel(this.parent) {
     _emptyIdShow = translate("Generating ...");
     _serverId = IDTextEditingController(text: _emptyIdShow);
+    _hostname = TextEditingController(text: "");
 
     /*
     // initital _hideCm at startup
@@ -477,6 +483,25 @@ class ServerModel with ChangeNotifier {
       _serverId.id = id;
       notifyListeners();
     }
+  }
+
+  Future<void> fetchHostname() async {
+    _systemHostname = Platform.localHostname;
+    final custom = await bind.mainGetOption(key: kOptionCustomHostname);
+    if (custom.isEmpty) {
+      // 首次使用：用系统主机名作为默认值，自动保存
+      _hostname.text = _systemHostname;
+      await bind.mainSetOption(key: kOptionCustomHostname, value: _systemHostname);
+    } else {
+      _hostname.text = custom;
+    }
+    _hostname.selection = TextSelection.fromPosition(
+      TextPosition(offset: _hostname.text.length),
+    );
+  }
+
+  Future<void> saveHostname(String value) async {
+    await bind.mainSetOption(key: kOptionCustomHostname, value: value);
   }
 
   changeStatue(String name, bool value) {

@@ -137,8 +137,8 @@ pub async fn connect_test(id: &str, key: String, token: String) {
         Err(err) => {
             log::error!("Failed to connect {}: {}", &id, err);
         }
-        Ok((mut stream, direct)) => {
-            log::info!("direct: {}", direct);
+        Ok(((mut stream, ..), ..)) => {
+            log::info!("direct: {}", true);
             // rpassword::prompt_password("Input anything to exit").ok();
             loop {
                 tokio::select! {

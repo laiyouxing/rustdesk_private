@@ -950,6 +950,16 @@ pub fn main_get_async_status() -> String {
 pub fn main_get_http_status(url: String) -> Option<String> {
     get_async_http_status(url)
 }
+pub fn main_get_nat_type() -> i32 {
+    // 0=UNKNOWN 1=ASYMMETRIC (cone) 2=SYMMETRIC (NAT4)
+    hbb_common::config::Config::get_nat_type()
+}
+
+pub fn main_get_public_addr() -> String {
+    crate::common::PUBLIC_ADDR.lock().unwrap_or_default().clone()
+}
+
+
 
 pub fn main_get_option(key: String) -> String {
     get_option(key)

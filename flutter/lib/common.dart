@@ -1024,7 +1024,9 @@ makeMobileActionsOverlayEntry(VoidCallback? onHide, {FFI? ffi}) {
 
 void showToast(String text,
     {Duration timeout = const Duration(seconds: 3),
-    Alignment alignment = const Alignment(0.0, 0.8)}) {
+    Alignment alignment = const Alignment(0.0, 0.8),
+    Color? bgColor,
+    Color? textColor}) {
   final overlayState = globalKey.currentState?.overlay;
   if (overlayState == null) return;
   final entry = OverlayEntry(builder: (context) {
@@ -1033,7 +1035,7 @@ void showToast(String text,
             alignment: alignment,
             child: Container(
               decoration: BoxDecoration(
-                color: MyTheme.color(context).toastBg,
+                color: bgColor ?? MyTheme.color(context).toastBg,
                 borderRadius: const BorderRadius.all(
                   Radius.circular(20),
                 ),
@@ -1046,7 +1048,7 @@ void showToast(String text,
                     decoration: TextDecoration.none,
                     fontWeight: FontWeight.w300,
                     fontSize: 18,
-                    color: MyTheme.color(context).toastText),
+                    color: textColor ?? MyTheme.color(context).toastText),
               ),
             )));
   });
@@ -3790,6 +3792,52 @@ Widget _buildPresetPasswordWarning() {
     ).paddingAll(8),
   ); // Show a warning message if the Future completed with true
 }
+
+
+Widget _buildSymmetricNatWarning() {
+  // Only show for desktop (not mobile).
+  if (isMobile) return SizedBox.shrink();
+  final nat = bind.mainGetNatType();
+  final publicAddr = bind.mainGetPublicAddr();
+  if (nat != 2 && publicAddr.isEmpty) {
+    return SizedBox.shrink();
+  }
+  final color = nat == 2 ? Colors.orange : Colors.green;
+  final icon = nat == 2
+      ? Icons.warning_amber_rounded
+      : Icons.language;
+  final message = nat == 2
+      ? translate('symmetric_nat_warning')
+      : '${translate('Public Address')}: $publicAddr';
+  final subtitle = publicAddr.isNotEmpty
+      ? '\n${translate('Public Address')}: $publicAddr'
+      : '';
+
+  return Container(
+    color: color.shade100,
+    child: Row(
+      children: [
+        Icon(icon, color: color.shade800, size: 20).paddingOnly(right: 8),
+        Expanded(
+          child: Text(
+            message + subtitle,
+            style: TextStyle(color: color.shade900, fontSize: 13),
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    ).paddingAll(8),
+  );
+}
+
+Widget buildSymmetricNatWarningMobile() => SizedBox.shrink();
+
+Widget buildSymmetricNatWarning() {
+  return _buildSymmetricNatWarning();
+}
+
+
 
 Widget buildPresetPasswordWarningMobile() {
   if (bind.isPresetPasswordMobileOnly()) {

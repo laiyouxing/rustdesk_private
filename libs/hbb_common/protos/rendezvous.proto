@@ -129,6 +129,7 @@ message PunchHoleResponse {
   bool is_udp = 9;
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
+  repeated bytes socket_addrs = 12;
 }
 
 message ConfigUpdate {
@@ -178,7 +179,7 @@ message FetchLocalAddr {
 
 message LocalAddr {
   bytes socket_addr = 1;
-  bytes local_addr = 2;
+  repeated bytes local_addr = 2;
   string relay_server = 3;
   string id = 4;
   string version = 5;

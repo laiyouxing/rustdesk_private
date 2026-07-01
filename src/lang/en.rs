@@ -214,6 +214,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("powered_by_me", "Powered by RustDesk"),
         ("outgoing_only_desk_tip", "This is a customized edition.\nYou can connect to other devices, but other devices cannot connect to your device."),
         ("preset_password_warning", "This customized edition comes with a preset password. Anyone knowing this password could gain full control of your device. If you did not expect this, uninstall the software immediately."),
+        ("symmetric_nat_warning", "Symmetric NAT (NAT4) detected. Cannot establish P2P direct connection, will keep using relay server."),
         ("share_warning_tip", "The fields above are shared and visible to others."),
         ("ab_web_console_tip", "More on web console"),
         ("allow-only-conn-window-open-tip", "Only allow connection if RustDesk window is open"),
@@ -274,5 +275,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("keep-awake-during-incoming-sessions-label", "Keep screen awake during incoming sessions"),
         ("password-hidden-tip", "Permanent password is set (hidden)."),
         ("preset-password-in-use-tip", "Preset password is currently in use."),
+        ("punch_trying", "Trying to punch hole to establish P2P direct connection..."),
+        ("punch_succeeded", "Punch hole succeeded, upgraded to P2P direct connection!"),
+        ("punch_failed", "Punch hole failed, staying on relay server."),
+        ("Public Address", "Public Address"),
+        ("NAT", "NAT Type"),
+        ("symmetric_nat", "Symmetric NAT (NAT4)"),
     ].iter().cloned().collect();
 }

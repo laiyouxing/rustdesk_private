@@ -7,7 +7,7 @@ use crate::{
         self, new_voice_call_request, Client, Data, Interface, MediaData, MediaSender,
         QualityStatus, MILLI1, SEC30,
     },
-    common::get_default_sound_input,
+    common::{get_default_sound_input, relay_upgrade_task},
     ui_session_interface::{InvokeUiSession, Session},
 };
 #[cfg(feature = "unix-file-copy-paste")]
@@ -39,6 +39,7 @@ use hbb_common::{
     },
     Stream,
 };
+use hbb_common::tokio::sync::Notify;
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 use hbb_common::{tokio::sync::Mutex as TokioMutex, ResultType};
 use scrap::CodecFormat;
@@ -174,15 +175,38 @@ impl<T: InvokeUiSession> Remote<T> {
         )
         .await
         {
-            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server))) => {
+            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port))) => {
                 self.handler
                     .connection_round_state
                     .lock()
                     .unwrap()
                     .set_connected();
                 self.handler
-                    .set_connection_type(peer.is_secured(), direct, stream_type); // flutter -> connection_ready
+                    .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
+                // Relay upgrade to direct (Tailscale-style background UDP punching)
+                let punch_notify = Arc::new(Notify::new());
+                let punch_done = Arc::new(Notify::new());
+                let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
+                    Arc::new(hbb_common::tokio::sync::Mutex::new(None));
+                let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
+                    let n = punch_notify.clone();
+                    let d = punch_done.clone();
+                    let s = punch_stream.clone();
+                    let succ = punch_success.clone();
+                    // Include peer_addr (hbbs-reported public address) AND peer_addrs
+                    let mut p2p_addrs = peer_addrs.clone();
+                    if !p2p_addrs.contains(&peer_addr) {
+                        p2p_addrs.push(peer_addr);
+                    }
+                    self.handler.set_punch_status("trying", "");
+                    tokio::spawn(async move {
+                        relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
+                        succ.store(true, std::sync::atomic::Ordering::SeqCst);
+                        d.notify_one();
+                    });
+                }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
                     self.handler
                         .set_fingerprint(crate::common::pk_to_fingerprint(pk.unwrap_or_default()));
@@ -262,6 +286,24 @@ impl<T: InvokeUiSession> Remote<T> {
                         _msg = rx_clip_client.recv() => {
                             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                             self.handle_local_clipboard_msg(&mut peer, _msg).await;
+                        }
+                        _ = punch_notify.notified() => {
+                            let mut guard = punch_stream.lock().await;
+                            if let Some(new_peer) = guard.take() {
+                                log::info!("Relay upgraded to direct connection!");
+                                peer = new_peer;
+                                self.handler.update_direct(Some(true));
+                                self.handler.set_connection_type(
+                                    peer.is_secured(), true, "UDP", &relay_server
+                                );
+                                self.handler.set_punch_status("succeeded", "UDP");
+                            }
+                        }
+                        _ = punch_done.notified() => {
+                            if !punch_success.load(std::sync::atomic::Ordering::SeqCst) {
+                                log::info!("RelayUpgrade: punch failed, staying on relay");
+                                self.handler.set_punch_status("failed", "");
+                            }
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {

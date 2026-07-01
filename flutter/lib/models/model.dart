@@ -269,6 +269,20 @@ class FfiModel with ChangeNotifier {
       connectionType.setDirect(direct);
       connectionType.setStreamType(streamType);
       connectionType.setRelayServer(relayServer);
+      if (direct) {
+        connectionType.setPunchStatus('succeeded');
+      } else {
+        connectionType.setPunchStatus('');
+      }
+    } catch (e) {
+      //
+    }
+  }
+
+  updatePunchStatus(String peerId, String status, String info) {
+    try {
+      var connectionType = ConnectionTypeState.find(peerId);
+      connectionType.setPunchStatus(status);
     } catch (e) {
       //
     }
@@ -344,6 +358,8 @@ class FfiModel with ChangeNotifier {
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '',
             relayServer: evt['relay_server'] ?? '');
+      } else if (name == 'punch_status') {
+        updatePunchStatus(peerId, evt['status'] ?? '', evt['info'] ?? '');
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);

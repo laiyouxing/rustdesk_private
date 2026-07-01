@@ -202,7 +202,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -264,7 +264,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned()),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
                 false,
             ));
         }
@@ -278,7 +278,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned()),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
                 false,
             ));
         }
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
         bool,
     )> {
         let mut start = Instant::now();
@@ -413,6 +413,7 @@ impl Client {
         let mut signed_id_pk = Vec::new();
         let mut relay_server = "".to_owned();
         let mut peer_addr = Config::get_any_listen_addr(true);
+        let mut peer_addrs: Vec<SocketAddr> = Vec::new();
         let mut peer_nat_type = NatType::UNKNOWN_NAT;
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
@@ -509,6 +510,13 @@ impl Client {
                             signed_id_pk = ph.pk.into();
                             relay_server = ph.relay_server;
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
+                            peer_addrs.clear();
+                            for addr_bytes in &ph.socket_addrs {
+                                let a = AddrMangle::decode(addr_bytes);
+                                if a.port() > 0 {
+                                    peer_addrs.push(a);
+                                }
+                            }
                             feedback = ph.feedback;
                             let s = udp.0.take();
                             if ph.is_udp && s.is_some() {
@@ -577,7 +585,7 @@ impl Client {
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server),
+                            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
                             false,
                         ));
                     }
@@ -607,6 +615,7 @@ impl Client {
             Self::connect(
                 my_addr,
                 peer_addr,
+                peer_addrs.clone(),
                 &peer,
                 signed_id_pk,
                 &relay_server,
@@ -624,7 +633,7 @@ impl Client {
                 punch_type,
             )
             .await?,
-            (feedback, rendezvous_server),
+            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
             true,
         ))
     }
@@ -633,6 +642,7 @@ impl Client {
     async fn connect(
         local_addr: SocketAddr,
         peer: SocketAddr,
+        peer_addrs: Vec<SocketAddr>,
         peer_id: &str,
         signed_id_pk: Vec<u8>,
         relay_server: &str,
@@ -656,74 +666,82 @@ impl Client {
         &'static str,
     )> {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
-        let mut connect_timeout = 0;
         const MIN: u64 = 1000;
-        if is_local || peer_nat_type == NatType::SYMMETRIC {
-            connect_timeout = MIN;
+
+        let connect_timeout = if is_local || peer_nat_type == NatType::SYMMETRIC {
+            MIN
+        } else if relay_server.is_empty() {
+            CONNECT_TIMEOUT
+        } else if peer_nat_type == NatType::ASYMMETRIC {
+            let mut my_nat_type = my_nat_type;
+            if my_nat_type == NatType::UNKNOWN_NAT as i32 {
+                my_nat_type = crate::get_nat_type(100).await;
+            }
+            match my_nat_type {
+                n if n == NatType::ASYMMETRIC as i32 && direct_failures > 0 => {
+                    std::cmp::max(punch_time_used * 6, MIN)
+                }
+                n if n == NatType::ASYMMETRIC as i32 => CONNECT_TIMEOUT,
+                _ => MIN,
+            }
         } else {
-            if relay_server.is_empty() {
-                connect_timeout = CONNECT_TIMEOUT;
-            } else {
-                if peer_nat_type == NatType::ASYMMETRIC {
-                    let mut my_nat_type = my_nat_type;
-                    if my_nat_type == NatType::UNKNOWN_NAT as i32 {
-                        my_nat_type = crate::get_nat_type(100).await;
-                    }
-                    if my_nat_type == NatType::ASYMMETRIC as i32 {
-                        connect_timeout = CONNECT_TIMEOUT;
-                        if direct_failures > 0 {
-                            connect_timeout = punch_time_used * 6;
-                        }
-                    } else if my_nat_type == NatType::SYMMETRIC as i32 {
-                        connect_timeout = MIN;
-                    }
-                }
-                if connect_timeout == 0 {
-                    let n = if direct_failures > 0 { 3 } else { 6 };
-                    connect_timeout = punch_time_used * (n as u64);
-                }
-            }
-            if connect_timeout < MIN {
-                connect_timeout = MIN;
-            }
-        }
+            let n = if direct_failures > 0 { 3 } else { 6 };
+            std::cmp::max(punch_time_used * (n as u64), MIN)
+        };
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
 
         let mut connect_futures = Vec::new();
         // TCP simultaneous open: staggered connect attempts
         // to increase chance of SYNs crossing with the peer
-        {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            connect_futures.push(
-                async move {
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP"))
-                }
-                .boxed(),
-            );
-        }
-        {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            connect_futures.push(
-                async move {
-                    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP+1"))
-                }
-                .boxed(),
-            );
-        }
-        {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            connect_futures.push(
-                async move {
-                    hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP+2"))
-                }
-                .boxed(),
-            );
+        if is_local && !peer_addrs.is_empty() {
+            for (i, addr) in peer_addrs.iter().enumerate() {
+                let fut = connect_tcp_local(*addr, Some(local_addr), connect_timeout);
+                let delay = i as u64 * 300;
+                connect_futures.push(
+                    async move {
+                        if delay > 0 {
+                            hbb_common::tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        let conn = fut.await?;
+                        Ok((conn, None, "TCP"))
+                    }
+                    .boxed(),
+                );
+            }
+        } else {
+            {
+                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+                connect_futures.push(
+                    async move {
+                        let conn = fut.await?;
+                        Ok((conn, None, "TCP"))
+                    }
+                    .boxed(),
+                );
+            }
+            {
+                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+                connect_futures.push(
+                    async move {
+                        hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
+                        let conn = fut.await?;
+                        Ok((conn, None, "TCP+1"))
+                    }
+                    .boxed(),
+                );
+            }
+            {
+                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+                connect_futures.push(
+                    async move {
+                        hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
+                        let conn = fut.await?;
+                        Ok((conn, None, "TCP+2"))
+                    }
+                    .boxed(),
+                );
+            }
         }
         if let Some(udp_socket_nat) = udp_socket_nat {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
