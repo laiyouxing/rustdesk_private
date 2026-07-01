@@ -644,7 +644,9 @@ class _ConnectionPageState extends State<ConnectionPage>
                 child: ElevatedButton(
                   onPressed: () async {
                     await model.saveHostname(model.hostname.text);
-                    showToast(translate('Saved'));
+                    showToast('保存成功',
+                        bgColor: const Color(0xFFE8F5E9),
+                        textColor: const Color(0xFF2E7D32));
                   },
                   child: Text("保存"),
                 ),

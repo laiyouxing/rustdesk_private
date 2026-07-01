@@ -1024,7 +1024,9 @@ makeMobileActionsOverlayEntry(VoidCallback? onHide, {FFI? ffi}) {
 
 void showToast(String text,
     {Duration timeout = const Duration(seconds: 3),
-    Alignment alignment = const Alignment(0.0, 0.8)}) {
+    Alignment alignment = const Alignment(0.0, 0.8),
+    Color? bgColor,
+    Color? textColor}) {
   final overlayState = globalKey.currentState?.overlay;
   if (overlayState == null) return;
   final entry = OverlayEntry(builder: (context) {
@@ -1033,7 +1035,7 @@ void showToast(String text,
             alignment: alignment,
             child: Container(
               decoration: BoxDecoration(
-                color: MyTheme.color(context).toastBg,
+                color: bgColor ?? MyTheme.color(context).toastBg,
                 borderRadius: const BorderRadius.all(
                   Radius.circular(20),
                 ),
@@ -1046,7 +1048,7 @@ void showToast(String text,
                     decoration: TextDecoration.none,
                     fontWeight: FontWeight.w300,
                     fontSize: 18,
-                    color: MyTheme.color(context).toastText),
+                    color: textColor ?? MyTheme.color(context).toastText),
               ),
             )));
   });
