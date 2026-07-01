@@ -3798,19 +3798,31 @@ Widget _buildSymmetricNatWarning() {
   // Only show for desktop (not mobile).
   if (isMobile) return SizedBox.shrink();
   final nat = bind.mainGetNatType();
-  if (nat != 2 /* SYMMETRIC */) {
+  final publicAddr = bind.mainGetPublicAddr();
+  if (nat != 2 && publicAddr.isEmpty) {
     return SizedBox.shrink();
   }
+  final color = nat == 2 ? Colors.orange : Colors.green;
+  final icon = nat == 2
+      ? Icons.warning_amber_rounded
+      : Icons.language;
+  final message = nat == 2
+      ? translate('symmetric_nat_warning')
+      : '${translate('Public Address')}: $publicAddr';
+  final subtitle = publicAddr.isNotEmpty
+      ? '\n${translate('Public Address')}: $publicAddr'
+      : '';
+
   return Container(
-    color: Colors.orange.shade100,
+    color: color.shade100,
     child: Row(
       children: [
-        Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800, size: 20).paddingOnly(right: 8),
+        Icon(icon, color: color.shade800, size: 20).paddingOnly(right: 8),
         Expanded(
           child: Text(
-            translate('symmetric_nat_warning'),
-            style: TextStyle(color: Colors.orange.shade900, fontSize: 13),
-            maxLines: 2,
+            message + subtitle,
+            style: TextStyle(color: color.shade900, fontSize: 13),
+            maxLines: 3,
             overflow: TextOverflow.ellipsis,
           ),
         ),

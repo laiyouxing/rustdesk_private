@@ -275,5 +275,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("keep-awake-during-incoming-sessions-label", "Keep screen awake during incoming sessions"),
         ("password-hidden-tip", "Permanent password is set (hidden)."),
         ("preset-password-in-use-tip", "Preset password is currently in use."),
+        ("punch_trying", "Trying to punch hole to establish P2P direct connection..."),
+        ("punch_succeeded", "Punch hole succeeded, upgraded to P2P direct connection!"),
+        ("Public Address", "Public Address"),
+        ("NAT", "NAT Type"),
+        ("symmetric_nat", "Symmetric NAT (NAT4)"),
     ].iter().cloned().collect();
 }

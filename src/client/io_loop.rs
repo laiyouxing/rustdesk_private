@@ -196,6 +196,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     if !p2p_addrs.contains(&peer_addr) {
                         p2p_addrs.push(peer_addr);
                     }
+                    self.handler.set_punch_status("trying", "");
                     tokio::spawn(async move {
                         relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
                     });
@@ -289,6 +290,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.set_connection_type(
                                     peer.is_secured(), true, "UDP", &relay_server
                                 );
+                                self.handler.set_punch_status("succeeded", "UDP");
                             }
                         }
                         _ = self.timer.tick() => {

@@ -59,6 +59,10 @@ pub const PLATFORM_LINUX: &str = "Linux";
 pub const PLATFORM_MACOS: &str = "Mac OS";
 pub const PLATFORM_ANDROID: &str = "Android";
 
+// STUN-detected public (mapped) address, populated on startup by test_nat_type_
+// and also during relay_upgrade_task for the latest NAT mapping.
+pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
@@ -678,8 +682,15 @@ async fn test_nat_type_() -> ResultType<bool> {
         };
         Config::set_nat_type(t as _);
         log::info!("Tested nat type: {:?} in {:?}", t, start.elapsed());
+        // Discover public address via STUN for NAT status display in UI
+        if let Ok((addr, _srv)) = stun_ipv4_test(STUNS_V4[0]).await {
+            if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                *public = addr.to_string();
+            }
+        }
     }
     Ok(ok)
+}
 }
 
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, bool) {
@@ -2777,6 +2788,10 @@ pub async fn relay_upgrade_task(
             log::info!("RelayUpgrade STUN: mapped {} (via {})", stun_addr, stun_srv);
             if !targets.contains(&stun_addr) {
                 targets.push(stun_addr);
+            }
+            // Update global public address for UI display
+            if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                *public = stun_addr.to_string();
             }
         }
         Err(e) => {

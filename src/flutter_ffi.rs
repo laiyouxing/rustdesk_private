@@ -955,6 +955,10 @@ pub fn main_get_nat_type() -> i32 {
     hbb_common::config::Config::get_nat_type()
 }
 
+pub fn main_get_public_addr() -> String {
+    crate::common::PUBLIC_ADDR.lock().unwrap_or_default().clone()
+}
+
 
 
 pub fn main_get_option(key: String) -> String {

@@ -746,6 +746,17 @@ impl InvokeUiSession for FlutterHandler {
         );
     }
 
+    fn set_punch_status(&self, status: &str, info: &str) {
+        self.push_event(
+            "punch_status",
+            &[
+                ("status", status),
+                ("info", info),
+            ],
+            &[],
+        );
+    }
+
     fn set_fingerprint(&self, fingerprint: String) {
         self.push_event("fingerprint", &[("fingerprint", &fingerprint)], &[]);
     }

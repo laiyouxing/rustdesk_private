@@ -204,6 +204,8 @@ impl InvokeUiSession for SciterHandler {
 
     fn set_fingerprint(&self, _fingerprint: String) {}
 
+    fn set_punch_status(&self, _status: &str, _info: &str) {}
+
     fn job_error(&self, id: i32, err: String, file_num: i32) {
         self.call("jobError", &make_args!(id, err, file_num));
     }

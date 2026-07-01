@@ -167,6 +167,18 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
               relayInfo =
                   '\n${translate('Relay Server')}: ${connectionType.relay_server.value}';
             }
+            var punchInfo = '';
+            final punch = connectionType.punch_status.value;
+            if (punch == 'trying') {
+              punchInfo = '\n${translate('NAT')}: ${translate('punch_trying')}';
+            } else if (punch == 'succeeded') {
+              punchInfo = '\n${translate('NAT')}: ✓ ${translate('punch_succeeded')}';
+            }
+            // Show local NAT type in tooltip as well
+            final natType = bind.mainGetNatType();
+            if (natType == 2) {
+              punchInfo += '\n${translate('symmetric_nat')}';
+            }
             var msgFingerprint = '${translate('Fingerprint')}:\n';
             var fingerprint = FingerprintState.find(key).value;
             if (fingerprint.isEmpty) {
@@ -185,7 +197,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
               children: [
                 icon,
                 Tooltip(
-                  message: '$msgConn$relayInfo\n$msgFingerprint',
+                  message: '$msgConn$relayInfo$punchInfo\n$msgFingerprint',
                   child: SvgPicture.asset(
                     'assets/${connectionType.secure.value}${connectionType.direct.value}.svg',
                     width: themeConf.iconSize,
