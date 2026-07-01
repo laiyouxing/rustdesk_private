@@ -173,6 +173,8 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
               punchInfo = '\n${translate('NAT')}: ${translate('punch_trying')}';
             } else if (punch == 'succeeded') {
               punchInfo = '\n${translate('NAT')}: ✓ ${translate('punch_succeeded')}';
+            } else if (punch == 'failed') {
+              punchInfo = '\n${translate('NAT')}: ✗ ${translate('punch_failed')}';
             }
             // Show local NAT type in tooltip as well
             final natType = bind.mainGetNatType();

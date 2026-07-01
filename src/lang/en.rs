@@ -277,6 +277,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("preset-password-in-use-tip", "Preset password is currently in use."),
         ("punch_trying", "Trying to punch hole to establish P2P direct connection..."),
         ("punch_succeeded", "Punch hole succeeded, upgraded to P2P direct connection!"),
+        ("punch_failed", "Punch hole failed, staying on relay server."),
         ("Public Address", "Public Address"),
         ("NAT", "NAT Type"),
         ("symmetric_nat", "Symmetric NAT (NAT4)"),

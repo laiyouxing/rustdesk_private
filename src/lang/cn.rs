@@ -747,6 +747,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Enable privacy mode", "允许隐私模式"),
         ("punch_trying", "正在穿透打洞建立P2P直连..."),
         ("punch_succeeded", "穿透成功，已升级为P2P直连！"),
+        ("punch_failed", "穿透失败，将持续使用中继服务器。"),
         ("Public Address", "公网地址"),
         ("NAT", "NAT类型"),
         ("symmetric_nat", "对称NAT (NAT4)"),

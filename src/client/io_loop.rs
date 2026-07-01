@@ -186,11 +186,15 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler.update_direct(Some(direct));
                 // Relay upgrade to direct (Tailscale-style background UDP punching)
                 let punch_notify = Arc::new(Notify::new());
+                let punch_done = Arc::new(Notify::new());
                 let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
                     Arc::new(hbb_common::tokio::sync::Mutex::new(None));
+                let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
                     let n = punch_notify.clone();
+                    let d = punch_done.clone();
                     let s = punch_stream.clone();
+                    let succ = punch_success.clone();
                     // Include peer_addr (hbbs-reported public address) AND peer_addrs
                     let mut p2p_addrs = peer_addrs.clone();
                     if !p2p_addrs.contains(&peer_addr) {
@@ -199,6 +203,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.set_punch_status("trying", "");
                     tokio::spawn(async move {
                         relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
+                        succ.store(true, std::sync::atomic::Ordering::SeqCst);
+                        d.notify_one();
                     });
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
@@ -291,6 +297,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                     peer.is_secured(), true, "UDP", &relay_server
                                 );
                                 self.handler.set_punch_status("succeeded", "UDP");
+                            }
+                        }
+                        _ = punch_done.notified() => {
+                            if !punch_success.load(std::sync::atomic::Ordering::SeqCst) {
+                                log::info!("RelayUpgrade: punch failed, staying on relay");
+                                self.handler.set_punch_status("failed", "");
                             }
                         }
                         _ = self.timer.tick() => {
