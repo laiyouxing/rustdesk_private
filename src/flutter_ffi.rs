@@ -955,8 +955,8 @@ pub fn main_get_nat_type() -> i32 {
     hbb_common::config::Config::get_nat_type()
 }
 
-pub fn main_get_public_addr() -> String {
-    crate::common::PUBLIC_ADDR.lock().map(|s| s.clone()).unwrap_or_default()
+pub fn main_get_public_addr() -> SyncReturn<String> {
+    SyncReturn(crate::common::PUBLIC_ADDR.lock().map(|s| s.clone()).unwrap_or_default())
 }
 
 
