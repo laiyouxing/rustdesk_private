@@ -956,7 +956,7 @@ pub fn main_get_nat_type() -> i32 {
 }
 
 pub fn main_get_public_addr() -> String {
-    crate::common::PUBLIC_ADDR.lock().unwrap_or_default().clone()
+    crate::common::PUBLIC_ADDR.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
 
