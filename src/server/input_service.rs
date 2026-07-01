@@ -449,6 +449,11 @@ lazy_static::lazy_static! {
     static ref ENIGO: Arc<Mutex<Enigo>> = {
         Arc::new(Mutex::new(Enigo::new()))
     };
+    // Dedicated Enigo instance for mouse operations only, to avoid contention
+    // with keyboard events on the main ENIGO lock when disk I/O is heavy.
+    static ref ENIGO_MOUSE: Arc<Mutex<Enigo>> = {
+        Arc::new(Mutex::new(Enigo::new()))
+    };
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
     static ref LATEST_SYS_CURSOR_POS: Arc<Mutex<(Option<Instant>, (i32, i32))>> = Arc::new(Mutex::new((None, (INVALID_CURSOR_POS, INVALID_CURSOR_POS))));
@@ -685,7 +690,7 @@ pub fn is_left_up(evt: &MouseEvent) -> bool {
 #[cfg(windows)]
 pub fn mouse_move_relative(x: i32, y: i32) {
     crate::platform::windows::try_change_desktop();
-    let mut en = ENIGO.lock().unwrap();
+    let mut en = ENIGO_MOUSE.lock().unwrap();
     en.mouse_move_relative(x, y);
 }
 
@@ -1063,7 +1068,7 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     crate::platform::windows::try_change_desktop();
     let buttons = evt.mask >> 3;
     let evt_type = evt.mask & MOUSE_TYPE_MASK;
-    let mut en = ENIGO.lock().unwrap();
+    let mut en = ENIGO_MOUSE.lock().unwrap();
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
     #[cfg(not(target_os = "macos"))]
@@ -2236,7 +2241,7 @@ impl TemporaryMouseMoveHandle {
         let thread_handle = std::thread::spawn(move || {
             log::debug!("TemporaryMouseMoveHandle thread started");
             for (x, y) in rx {
-                ENIGO.lock().unwrap().mouse_move_to(x, y);
+                ENIGO_MOUSE.lock().unwrap().mouse_move_to(x, y);
             }
             log::debug!("TemporaryMouseMoveHandle thread exiting");
         });
