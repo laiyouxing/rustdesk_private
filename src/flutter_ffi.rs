@@ -952,7 +952,7 @@ pub fn main_get_http_status(url: String) -> Option<String> {
 }
 pub fn main_get_nat_type() -> i32 {
     // 0=UNKNOWN 1=ASYMMETRIC (cone) 2=SYMMETRIC (NAT4)
-    crate::common::Config::get_nat_type()
+    hbb_common::config::Config::get_nat_type()
 }
 
 

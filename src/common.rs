@@ -2618,7 +2618,7 @@ pub async fn punch_udp(
 pub async fn stun_query_with_socket(
     socket: &UdpSocket,
 ) -> ResultType<(SocketAddr, String)> {
-    use rand::Rng;
+    use hbb_common::rand::{self, Rng};
 
     const SINGLE_RECV_TIMEOUT: Duration = Duration::from_secs(2);
     const SINGLE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2687,7 +2687,7 @@ pub async fn stun_query_with_socket(
 
     // Serial: try each STUN server in order, fall through to next on failure
     let work = async {
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<hbb_common::anyhow::Error> = None;
         for &stun in STUNS_V4.iter() {
             match tokio::time::timeout(SINGLE_QUERY_TIMEOUT, try_one(socket, stun)).await {
                 Ok(Ok(v)) => return Ok(v),
@@ -2851,7 +2851,7 @@ pub async fn detect_symmetric_nat() -> ResultType<bool> {
 
     // Helper: send a STUN binding request and return the XOR-mapped port.
     async fn query(socket: &UdpSocket, target: SocketAddr) -> ResultType<u16> {
-        use rand::Rng;
+        use hbb_common::rand::{self, Rng};
         let mut req = vec![0u8; 20];
         req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
         req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
