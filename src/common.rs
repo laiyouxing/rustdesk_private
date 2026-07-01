@@ -691,7 +691,6 @@ async fn test_nat_type_() -> ResultType<bool> {
     }
     Ok(ok)
 }
-}
 
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, bool) {
     #[cfg(any(target_os = "android", target_os = "ios"))]
