@@ -2799,7 +2799,7 @@ pub async fn relay_upgrade_task(
         }
     }
 
-    for _round in 0..10 {
+    for _round in 0..5 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return false;
@@ -2813,25 +2813,33 @@ pub async fn relay_upgrade_task(
             if socket.connect(target).await.is_err() {
                 continue;
             }
-            match punch_udp(socket.clone(), true).await {
-                Ok(Some(_data)) => {
-                    if let Ok((_kcp_stream, stream)) =
-                        KcpStream::connect(socket.clone(), Duration::from_secs(5)).await
-                    {
-                        let mut guard = direct_stream.lock().await;
-                        *guard = Some(stream);
-                        notify.notify_one();
-                        log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
-                        return true;
-                    }
+            // Send a burst of empty packets first to establish our NAT mapping
+            // and (hopefully) reach the peer's NAT before we send KCP.
+            // (Otherwise the peer's NAT drops our packets because it
+            // doesn't know us yet.)
+            for _ in 0..10 {
+                if started.elapsed() >= TOTAL_BUDGET {
+                    return false;
                 }
-                _ => {}
+                socket.send(&[]).await.ok();
+                hbb_common::tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Now try KCP connect — whoever's KCP arrives first at peer wins.
+            // KCP handshake needs 1-2 RTTs; give it ample time.
+            if let Ok((_kcp_stream, stream)) =
+                KcpStream::connect(socket.clone(), Duration::from_secs(15)).await
+            {
+                let mut guard = direct_stream.lock().await;
+                *guard = Some(stream);
+                notify.notify_one();
+                log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
+                return true;
             }
         }
 
         // Sleep before next round, but cap by remaining budget
         let remaining = TOTAL_BUDGET.saturating_sub(started.elapsed());
-        let delay = std::cmp::min(remaining, Duration::from_secs(5));
+        let delay = std::cmp::min(remaining, Duration::from_secs(2));
         if delay.is_zero() {
             return false;
         }
@@ -2844,6 +2852,9 @@ pub async fn relay_upgrade_task(
 /// Phase 3 relay upgrade: exchange PunchPeerAddr through relay and try direct UDP connection.
 /// This runs on both connector and host sides after relay is established.
 /// Returns the direct Stream on success.
+///
+/// Symmetric design: send empty packets to open the NAT mapping, then race
+/// KCP connect and KCP accept in parallel. Whichever wins first is used.
 pub async fn relay_phase3_punch_to_peer(peer_addr: SocketAddr) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
@@ -2854,26 +2865,55 @@ pub async fn relay_phase3_punch_to_peer(peer_addr: SocketAddr) -> ResultType<Str
     const MAX_TIME: Duration = Duration::from_secs(30);
     let started = std::time::Instant::now();
 
-    for _round in 0..10 {
+    for _round in 0..5 {
         if started.elapsed() >= MAX_TIME {
             bail!("Phase3 punch timed out after {:?}", started.elapsed());
         }
-        match punch_udp(socket.clone(), true).await {
-            Ok(Some(_data)) => {
-                match KcpStream::connect(socket.clone(), Duration::from_secs(5)).await {
+        // Send a burst of empty packets first to establish our NAT mapping
+        // and (hopefully) reach the peer's NAT before we send KCP.
+        for _ in 0..10 {
+            if started.elapsed() >= MAX_TIME {
+                bail!("Phase3 punch timed out");
+            }
+            socket.send(&[]).await.ok();
+            hbb_common::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Race KCP connect vs KCP accept — whoever wins first we use.
+        // Each side runs this same code; if both connect (no listener) or
+        // both accept (no initiator) it would deadlock. Running both
+        // simultaneously works around this.
+        let socket_for_accept = socket.clone();
+        let mut connect_fut = Box::pin(KcpStream::connect(socket.clone(), Duration::from_secs(15)));
+        let mut accept_fut = Box::pin(async move {
+            KcpStream::accept(
+                socket_for_accept,
+                Duration::from_secs(15),
+                None,
+            )
+            .await
+        });
+        tokio::select! {
+            res = &mut connect_fut => {
+                match res {
                     Ok((_kcp, stream)) => {
-                        log::info!("Phase3 punch succeeded after {:?}", started.elapsed());
+                        log::info!("Phase3 punch succeeded via KCP connect after {:?}", started.elapsed());
                         return Ok(stream);
                     }
-                    Err(e) => {
-                        log::debug!("Phase3 KCP connect failed: {:?}", e);
-                    }
+                    Err(e) => log::debug!("Phase3 KCP connect failed: {:?}", e),
                 }
             }
-            _ => {}
+            res = &mut accept_fut => {
+                match res {
+                    Ok((_kcp, stream)) => {
+                        log::info!("Phase3 punch succeeded via KCP accept after {:?}", started.elapsed());
+                        return Ok(stream.1);
+                    }
+                    Err(e) => log::debug!("Phase3 KCP accept failed: {:?}", e),
+                }
+            }
         }
         let remaining = MAX_TIME.saturating_sub(started.elapsed());
-        let delay = std::cmp::min(remaining, Duration::from_secs(3));
+        let delay = std::cmp::min(remaining, Duration::from_secs(2));
         if delay.is_zero() {
             bail!("Phase3 punch timed out");
         }

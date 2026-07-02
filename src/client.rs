@@ -4324,6 +4324,18 @@ async fn udp_nat_connect(
             log::debug!("{err}");
             anyhow!(err)
         })?;
+    // Brief delay to give the peer time to start its own UDP punch task.
+    // Without this delay, our KCP handshake can arrive at the peer's NAT
+    // before the peer has sent any UDP packet, so the peer's NAT drops
+    // our packet (it doesn't know us yet).
+    // Re-send empty packets during this delay to keep our NAT mapping
+    // active and increase the chance the peer's punch catches us.
+    let delay = Duration::from_millis(150);
+    let delay_start = std::time::Instant::now();
+    while delay_start.elapsed() < delay {
+        socket.send(&[]).await.ok();
+        hbb_common::tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let res = KcpStream::connect(socket, Duration::from_millis(ms_timeout))
         .await
         .map_err(|err| {

@@ -602,8 +602,16 @@ impl RendezvousMediator {
 
         // Host-side: always start background punching when receiving punch hole
         // so that both sides punch simultaneously, enabling NAT traversal
-        // Use ph.udp_port if available (known port, NAT mapping predictable),
-        // otherwise fallback to random port.
+        // host_peer_addr: target connector's public address. Note that PunchHole.socket_addr
+        // carries the connector's TCP address (port), so we must override the port with
+        // ph.udp_port (connector's UDP port) to reach the connector's UDP socket.
+        // Host does NOT need to bind a specific local port — its NAT will allocate
+        // an external port. The earlier code mistakenly used ph.udp_port (connector's
+        // port) as host's bind port, which is wrong.
+        //
+        // Asymmetric: connector uses KcpStream::connect (in relay_upgrade_task),
+        // host uses KcpStream::accept here. Both first send empty packets to
+        // establish NAT mappings, but only the host LISTENS for KCP.
         {
             let host_peer_addr = if ph.udp_port > 0 {
                 let mut addr = peer_addr;
@@ -612,31 +620,29 @@ impl RendezvousMediator {
             } else {
                 peer_addr
             };
-            let host_udp_port = ph.udp_port;
             let host_server = server.clone();
             let host_cp = control_permissions.clone();
             tokio::spawn(async move {
-                for round in 0..10 {
-                    let bind_addr = if host_udp_port > 0 {
-                        SocketAddr::from(([0u8; 4], host_udp_port as u16))
-                    } else {
-                        SocketAddr::from(([0u8; 4], 0))
-                    };
+                for _round in 0..5 {
+                    // Bind to any free local port; NAT will assign external port.
+                    let bind_addr = SocketAddr::from(([0u8; 4], 0u16));
                     let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
                         Ok(s) => Arc::new(s),
                         Err(_) => {
-                            sleep(10.0).await;
+                            sleep(2.0).await;
                             continue;
                         }
                     };
                     if socket.connect(host_peer_addr).await.is_err() {
-                        sleep(10.0).await;
+                        sleep(2.0).await;
                         continue;
                     }
-                    if let Ok(Some(data)) = crate::common::punch_udp(socket.clone(), true).await {
+                    // Send empty packet to establish our NAT mapping for the
+                    // connector's address, then listen for KCP handshake.
+                    if let Ok(Some(data)) =
+                        crate::common::punch_udp(socket.clone(), true).await
+                    {
                         log::info!("Host-side punching succeeded! Setting up KCP accept...");
-                        // [Fix #5]: After successful punch, set up KCP listener so the
-                        // connector's relay_upgrade_task KCP connect can be accepted.
                         if let Ok((_kcp, stream)) = crate::kcp_stream::KcpStream::accept(
                             socket.clone(),
                             Duration::from_millis(CONNECT_TIMEOUT as _),
@@ -656,7 +662,7 @@ impl RendezvousMediator {
                         }
                         return;
                     }
-                    let delay = std::cmp::min(30, 5 + round * 5) as u64;
+                    let delay = std::cmp::min(30, 2 + _round * 2) as u64;
                     sleep(delay as f32).await;
                 }
                 log::info!("Host-side punching finished without success");
