@@ -1200,7 +1200,7 @@ pub fn get_login_device_info() -> LoginDeviceInfo {
     LoginDeviceInfo {
         // std::env::consts::OS is better than whoami::platform() here.
         os: std::env::consts::OS.to_owned(),
-        r#type: "client".to_owned(),
+        r#type: "app".to_owned(),
         name: crate::common::hostname(),
     }
 }
