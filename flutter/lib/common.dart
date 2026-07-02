@@ -3809,7 +3809,7 @@ Widget _buildSymmetricNatWarning() {
   final message = nat == 2
       ? translate('symmetric_nat_warning')
       : '${translate('Public Address')}: $publicAddr';
-  final subtitle = publicAddr.isNotEmpty
+  final subtitle = (nat == 2 && publicAddr.isNotEmpty)
       ? '\n${translate('Public Address')}: $publicAddr'
       : '';
 
