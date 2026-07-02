@@ -2906,7 +2906,7 @@ pub async fn relay_phase3_punch_to_peer(peer_addr: SocketAddr) -> ResultType<Str
                 match res {
                     Ok((_kcp, stream)) => {
                         log::info!("Phase3 punch succeeded via KCP accept after {:?}", started.elapsed());
-                        return Ok(stream.1);
+                        return Ok(stream);
                     }
                     Err(e) => log::debug!("Phase3 KCP accept failed: {:?}", e),
                 }
