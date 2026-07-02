@@ -4216,11 +4216,12 @@ async fn test_udp_uat(
     udp_port: Arc<Mutex<u16>>,
     mut stop_udp_rx: oneshot::Receiver<()>,
 ) -> ResultType<()> {
-    let (tx, mut rx) = oneshot::channel::<_>();
+    let (_tx, mut _rx) = oneshot::channel::<_>();
+    // Run STUN only to detect public IP / NAT type. Do NOT use STUN's port —
+    // the STUN socket is different from the punch socket, so its NAT external
+    // port is unreliable. Always trust the TestNatResponse from hbbs.
     tokio::spawn(async {
-        if let Ok(v) = crate::test_nat_ipv4().await {
-            tx.send(v).ok();
-        }
+        let _ = crate::test_nat_ipv4().await;
     });
 
     let start = Instant::now();
@@ -4248,11 +4249,6 @@ async fn test_udp_uat(
 
     loop {
         tokio::select! {
-            Ok((addr, server)) = &mut rx => {
-                *udp_port.lock().unwrap() = addr.port();
-                log::debug!("UDP NAT test received response from {}: {}", addr, server);
-                break;
-            }
             _ = &mut stop_udp_rx => {
                 log::debug!("UDP NAT test received stop signal after {} packets", packets_sent);
                 break;
@@ -4277,13 +4273,14 @@ async fn test_udp_uat(
                     last_send_time = Instant::now();
                 }
             }
-            res = udp_socket.recv(&mut buf[..]) => {
+            res = udp_socket.recv_from(&mut buf[..]) => {
                 match res {
-                    Ok(n) => {
+                    Ok((n, _src)) => {
                         match RendezvousMessage::parse_from_bytes(&buf[0..n]) {
                             Ok(msg_in) => {
                                 if let Some(rendezvous_message::Union::TestNatResponse(response)) = msg_in.union {
                                     *udp_port.lock().unwrap() = response.port as u16;
+                                    log::info!("UDP NAT test: got TestNatResponse port={} from hbbs", response.port);
                                     break;
                                 }
                             }
