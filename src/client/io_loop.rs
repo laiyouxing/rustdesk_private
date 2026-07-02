@@ -7,7 +7,7 @@ use crate::{
         self, new_voice_call_request, Client, Data, Interface, MediaData, MediaSender,
         QualityStatus, MILLI1, SEC30,
     },
-    common::{get_default_sound_input, relay_upgrade_task},
+    common::{get_default_sound_input, relay_upgrade_task, relay_phase3_punch_to_peer},
     ui_session_interface::{InvokeUiSession, Session},
 };
 #[cfg(feature = "unix-file-copy-paste")]
@@ -79,6 +79,9 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    // Phase 3 relay upgrade
+    punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
+    punch_notify: Option<Arc<Notify>>,
 }
 
 #[derive(Default)]
@@ -128,6 +131,8 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            punch_stream: None,
+            punch_notify: None,
         }
     }
 
@@ -190,6 +195,11 @@ impl<T: InvokeUiSession> Remote<T> {
                 let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
                     Arc::new(hbb_common::tokio::sync::Mutex::new(None));
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Phase 3: channel for sending our STUN-discovered address to peer through relay
+                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+                // Store for handle_msg_from_peer to access
+                self.punch_stream = Some(punch_stream.clone());
+                self.punch_notify = Some(punch_notify.clone());
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
                     let n = punch_notify.clone();
                     let d = punch_done.clone();
@@ -206,6 +216,29 @@ impl<T: InvokeUiSession> Remote<T> {
                         succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                         d.notify_one();
                     });
+                    // Phase 3: Exchange PunchPeerAddr through relay and try direct connection
+                    // Background task: STUN → send own address to io_loop → io_loop forwards to peer
+                    {
+                        let phase3_tx = phase3_out_tx;
+                        tokio::spawn(async move {
+                            // 1. STUN to discover our public address
+                            if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                                let socket = Arc::new(socket);
+                                match crate::common::stun_query_with_socket(&socket).await {
+                                    Ok((stun_addr, _)) => {
+                                        log::info!("Phase3: our public address via STUN: {}", stun_addr);
+                                        // 2. Send address to io_loop which will forward it to peer
+                                        if phase3_tx.send(stun_addr).await.is_err() {
+                                            log::info!("Phase3: failed to send own address");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::info!("Phase3 STUN failed: {:?}", e);
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
                     self.handler
@@ -304,6 +337,18 @@ impl<T: InvokeUiSession> Remote<T> {
                                 log::info!("RelayUpgrade: punch failed, staying on relay");
                                 self.handler.set_punch_status("failed", "");
                             }
+                        }
+                        Some(phase3_my_addr) = phase3_out_rx.recv() => {
+                            // Phase 3: Forward our STUN-discovered address to peer through relay
+                            let mut misc = Misc::new();
+                            let mut ppa = PunchPeerAddr::new();
+                            ppa.set_addr(phase3_my_addr.to_string());
+                            ppa.set_udp_port(phase3_my_addr.port() as u32);
+                            misc.set_punch_peer_addr(ppa);
+                            let mut msg = Message::new();
+                            msg.set_misc(misc);
+                            allow_err!(peer.send(&msg).await);
+                            log::info!("Phase3: sent our address to peer: {}", phase3_my_addr);
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {
@@ -2009,6 +2054,32 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::FollowCurrentDisplay(d_idx)) => {
                         self.handler.set_current_display(d_idx);
+                    }
+                    Some(misc::Union::PunchPeerAddr(ppa)) => {
+                        // Phase 3: Received peer's public address through relay
+                        if let Ok(peer_addr) = ppa.addr().parse::<std::net::SocketAddr>()
+                        {
+                            log::info!("Phase3: received peer address: {}", peer_addr);
+                            let punch_stream = self.punch_stream.clone();
+                            let punch_notify = self.punch_notify.clone();
+                            tokio::spawn(async move {
+                                match relay_phase3_punch_to_peer(peer_addr).await {
+                                    Ok(stream) => {
+                                        if let Some(s) = punch_stream {
+                                            let mut guard = s.lock().await;
+                                            *guard = Some(stream);
+                                        }
+                                        if let Some(n) = punch_notify {
+                                            n.notify_one();
+                                        }
+                                        log::info!("Phase3 punch succeeded!");
+                                    }
+                                    Err(e) => {
+                                        log::info!("Phase3 punch to {} failed: {:?}", peer_addr, e);
+                                    }
+                                }
+                            });
+                        }
                     }
                     _ => {}
                 },

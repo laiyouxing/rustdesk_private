@@ -2841,6 +2841,47 @@ pub async fn relay_upgrade_task(
     false
 }
 
+/// Phase 3 relay upgrade: exchange PunchPeerAddr through relay and try direct UDP connection.
+/// This runs on both connector and host sides after relay is established.
+/// Returns the direct Stream on success.
+pub async fn relay_phase3_punch_to_peer(peer_addr: SocketAddr) -> ResultType<Stream> {
+    use crate::kcp_stream::KcpStream;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let socket = Arc::new(socket);
+    socket.connect(peer_addr).await?;
+
+    const MAX_TIME: Duration = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+
+    for _round in 0..10 {
+        if started.elapsed() >= MAX_TIME {
+            bail!("Phase3 punch timed out after {:?}", started.elapsed());
+        }
+        match punch_udp(socket.clone(), true).await {
+            Ok(Some(_data)) => {
+                match KcpStream::connect(socket.clone(), Duration::from_secs(5)).await {
+                    Ok((_kcp, stream)) => {
+                        log::info!("Phase3 punch succeeded after {:?}", started.elapsed());
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        log::debug!("Phase3 KCP connect failed: {:?}", e);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let remaining = MAX_TIME.saturating_sub(started.elapsed());
+        let delay = std::cmp::min(remaining, Duration::from_secs(3));
+        if delay.is_zero() {
+            bail!("Phase3 punch timed out");
+        }
+        hbb_common::tokio::time::sleep(delay).await;
+    }
+    bail!("Phase3 punch finished without success");
+}
+
 
 /// Detect NAT type by sending two STUN binding requests from the same socket
 /// to the same STUN server, but to two different destination ports (or two servers).

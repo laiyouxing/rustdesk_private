@@ -650,6 +650,7 @@ impl RendezvousMediator {
                                 host_peer_addr,
                                 true,
                                 host_cp.clone(),
+                                false,
                             )
                             .await;
                         }
@@ -898,6 +899,7 @@ async fn direct_server(server: ServerPtr) {
                             addr,
                             false,
                             None, // Direct connections don't have control_permissions
+                            false,
                         )
                         .await
                     );
@@ -975,6 +977,7 @@ async fn udp_nat_listen(
             peer_addr_v4,
             true,
             control_permissions,
+            false,
         )
         .await?;
         Ok(())
