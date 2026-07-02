@@ -2722,12 +2722,13 @@ pub async fn stun_query_with_socket(
 
 
 
+/// Returns true if punch succeeded, false otherwise.
 pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
     notify: Arc<hbb_common::tokio::sync::Notify>,
     direct_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
     punch_port: u16,
-) {
+) -> bool {
     use crate::kcp_stream::KcpStream;
 
     // #2: if we haven't determined NAT type yet, try STUN-based detection.
@@ -2735,7 +2736,7 @@ pub async fn relay_upgrade_task(
         if let Ok(true) = detect_symmetric_nat().await {
             log::info!("relay_upgrade_task: detected SYMMETRIC NAT, switching to relay-only");
             Config::set_nat_type(NatType::SYMMETRIC as _);
-            return; // No point trying punch
+            return false; // No point trying punch
         } else {
             // If detection succeeded and result is not symmetric, mark as ASYMMETRIC
             if Config::get_nat_type() == 0 {
@@ -2768,13 +2769,13 @@ pub async fn relay_upgrade_task(
                     Ok(s) => Arc::new(s),
                     Err(_) => {
                         log::info!("RelayUpgrade: failed to create socket, giving up");
-                        return;
+                        return false;
                     }
                 }
             }
             Err(_) => {
                 log::info!("RelayUpgrade: failed to create socket, giving up");
-                return;
+                return false;
             }
         }
     };
@@ -2801,13 +2802,13 @@ pub async fn relay_upgrade_task(
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
-            return;
+            return false;
         }
 
         // Try each target address with the SAME socket
         for &target in &targets {
             if started.elapsed() >= TOTAL_BUDGET {
-                return;
+                return false;
             }
             if socket.connect(target).await.is_err() {
                 continue;
@@ -2821,7 +2822,7 @@ pub async fn relay_upgrade_task(
                         *guard = Some(stream);
                         notify.notify_one();
                         log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
-                        return;
+                        return true;
                     }
                 }
                 _ => {}
@@ -2832,11 +2833,12 @@ pub async fn relay_upgrade_task(
         let remaining = TOTAL_BUDGET.saturating_sub(started.elapsed());
         let delay = std::cmp::min(remaining, Duration::from_secs(5));
         if delay.is_zero() {
-            return;
+            return false;
         }
         hbb_common::tokio::time::sleep(delay).await;
     }
     log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
+    false
 }
 
 

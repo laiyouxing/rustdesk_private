@@ -202,8 +202,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     self.handler.set_punch_status("trying", "");
                     tokio::spawn(async move {
-                        relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
-                        succ.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let ok = relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
+                        succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                         d.notify_one();
                     });
                 }
