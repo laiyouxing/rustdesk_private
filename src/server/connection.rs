@@ -910,8 +910,8 @@ impl Connection {
                     // Phase 3: Forward host's STUN-discovered address to connector through relay
                     let mut misc = Misc::new();
                     let mut ppa = PunchPeerAddr::new();
-                    ppa.set_addr(phase3_my_addr.to_string());
-                    ppa.set_udp_port(phase3_my_addr.port() as u32);
+                    ppa.addr = phase3_my_addr.to_string().into();
+                    ppa.udp_port = phase3_my_addr.port() as u32;
                     misc.set_punch_peer_addr(ppa);
                     let mut msg = Message::new();
                     msg.set_misc(misc);
@@ -2387,7 +2387,7 @@ impl Connection {
             }
             // Phase 3: Received connector's public address through relay
             if let Some(misc::Union::PunchPeerAddr(ppa)) = &misc.union {
-                if let Ok(peer_addr) = ppa.addr().parse::<std::net::SocketAddr>()
+                if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
                 {
                     log::info!("Phase3(Host): received peer address: {}", peer_addr);
                     let punch_stream = self.punch_stream.clone();
