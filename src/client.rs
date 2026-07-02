@@ -545,6 +545,9 @@ impl Client {
                             start.elapsed(),
                             rr.relay_server
                         );
+                        // [Fix] assign relay_server from RelayResponse so it can be
+                        // displayed in the UI (io_loop uses it for set_connection_type)
+                        relay_server = rr.relay_server.clone();
                         start = Instant::now();
                         let mut connect_futures = Vec::new();
                         if let Some(s) = ipv6.0 {

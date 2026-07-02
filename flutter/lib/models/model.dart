@@ -66,6 +66,7 @@ class CachedPeerData {
   bool secure = false;
   bool direct = false;
   String streamType = '';
+  String relayServer = '';
 
   CachedPeerData();
 
@@ -261,6 +262,7 @@ class FfiModel with ChangeNotifier {
     cachedPeerData.secure = secure;
     cachedPeerData.direct = direct;
     cachedPeerData.streamType = streamType;
+    cachedPeerData.relayServer = relayServer;
     _secure = secure;
     _direct = direct;
     try {
@@ -298,6 +300,11 @@ class FfiModel with ChangeNotifier {
           SvgPicture.asset('assets/$icon.svg', width: 48, height: 48);
       String connectionText =
           getConnectionText(secure!, direct!, cachedPeerData.streamType);
+      // [Fix] Append relay server name when not direct, so mobile shows it too
+      if (direct == false && cachedPeerData.relayServer.isNotEmpty) {
+        connectionText =
+            '$connectionText\n${translate('Relay Server')}: ${cachedPeerData.relayServer}';
+      }
       return Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -326,7 +333,8 @@ class FfiModel with ChangeNotifier {
       'link': '',
     }, sessionId, peerId);
     updatePrivacyMode(data.updatePrivacyMode, sessionId, peerId);
-    setConnectionType(peerId, data.secure, data.direct, data.streamType);
+    setConnectionType(peerId, data.secure, data.direct, data.streamType,
+        relayServer: data.relayServer);
     await handlePeerInfo(data.peerInfo, peerId, true);
     for (final element in data.cursorDataList) {
       updateLastCursorId(element);
