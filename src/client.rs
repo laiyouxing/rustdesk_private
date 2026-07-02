@@ -437,8 +437,12 @@ impl Client {
                 if port > 0 {
                     break;
                 }
-                // await for 0.5 RTT
-                if tm.elapsed() > rtt / 2 {
+                // Wait up to 1.5 RTT for the UDP NAT test to complete.
+                // The TestNatResponse from hbbs carries the actual NAT external
+                // port of the punch socket. Without this, the punch falls back
+                // to TCP and fails.
+                if tm.elapsed() > rtt + rtt / 2 {
+                    log::warn!("UDP NAT test did not complete in time, udp_port={}", port);
                     break;
                 }
                 hbb_common::sleep(0.001).await;
