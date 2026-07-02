@@ -605,7 +605,13 @@ impl RendezvousMediator {
         // Use ph.udp_port if available (known port, NAT mapping predictable),
         // otherwise fallback to random port.
         {
-            let host_peer_addr = peer_addr;
+            let host_peer_addr = if ph.udp_port > 0 {
+                let mut addr = peer_addr;
+                addr.set_port(ph.udp_port as u16);
+                addr
+            } else {
+                peer_addr
+            };
             let host_udp_port = ph.udp_port;
             let host_server = server.clone();
             let host_cp = control_permissions.clone();
