@@ -751,5 +751,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Public Address", "公网地址"),
         ("NAT", "NAT类型"),
         ("symmetric_nat", "对称NAT (NAT4)"),
+        ("cone_nat", "锥形NAT (NAT1-3)"),
     ].iter().cloned().collect();
 }
