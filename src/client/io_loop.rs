@@ -217,27 +217,84 @@ impl<T: InvokeUiSession> Remote<T> {
                         d.notify_one();
                     });
                     // Phase 3: Exchange PunchPeerAddr through relay and try direct connection
-                    // Background task: STUN → send own address to io_loop → io_loop forwards to peer
+                    // Use the hbbs-reported peer public IP (peer_addr.ip()) combined
+                    // with our measured udp_nat_port (from hbbs's TestNatResponse over
+                    // UDP). This guarantees the port matches the actual punch socket
+                    // that relay_upgrade_task is using. A separate STUN socket would
+                    // get a different NAT port, breaking the punch.
                     {
                         let phase3_tx = phase3_out_tx;
-                        tokio::spawn(async move {
-                            // 1. STUN to discover our public address
-                            if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                                let socket = Arc::new(socket);
-                                match crate::common::stun_query_with_socket(&socket).await {
-                                    Ok((stun_addr, _)) => {
-                                        log::info!("Phase3: our public address via STUN: {}", stun_addr);
-                                        // 2. Send address to io_loop which will forward it to peer
-                                        if phase3_tx.send(stun_addr).await.is_err() {
-                                            log::info!("Phase3: failed to send own address");
+                        if udp_nat_port > 0 {
+                            // Phase 3 needs OUR public IP (peer_addr is the PEER's).
+                            // relay_upgrade_task writes our IP to PUBLIC_ADDR after its
+                            // STUN probe. Wait briefly for that, then fall back to a
+                            // fresh STUN probe of the same socket if still empty.
+                            let phase3_tx_clone = phase3_tx;
+                            tokio::spawn(async move {
+                                let mut our_addr: Option<std::net::SocketAddr> = None;
+                                // 1) Wait up to 5s for PUBLIC_ADDR to be populated
+                                //    by relay_upgrade_task's STUN query.
+                                for _ in 0..50 {
+                                    let s = crate::common::PUBLIC_ADDR
+                                        .lock()
+                                        .map(|p| p.clone())
+                                        .unwrap_or_default();
+                                    if !s.is_empty() {
+                                        if let Some(ip) = s
+                                            .split(':')
+                                            .next()
+                                            .and_then(|x| x.parse::<std::net::IpAddr>().ok())
+                                        {
+                                            our_addr = Some(std::net::SocketAddr::new(
+                                                ip, udp_nat_port,
+                                            ));
+                                            break;
                                         }
                                     }
-                                    Err(e) => {
-                                        log::info!("Phase3 STUN failed: {:?}", e);
+                                    hbb_common::tokio::time::sleep(
+                                        std::time::Duration::from_millis(100),
+                                    )
+                                    .await;
+                                }
+                                // 2) Fallback: do a fresh STUN probe so the port
+                                //    matches a new socket we bind for the punch.
+                                //    (Phase 3 also starts its own UDP socket; the
+                                //    peer receives our port and we receive theirs.)
+                                if our_addr.is_none() {
+                                    log::info!(
+                                        "Phase3: PUBLIC_ADDR still empty, doing fresh STUN probe"
+                                    );
+                                    if let Ok(socket) =
+                                        tokio::net::UdpSocket::bind("0.0.0.0:0").await
+                                    {
+                                        let socket = Arc::new(socket);
+                                        if let Ok((stun_addr, _)) =
+                                            crate::common::stun_query_with_socket(&socket).await
+                                        {
+                                            // Use the STUN-discovered port (best we
+                                            // can do — the new socket's NAT port
+                                            // may not match Phase 3's punch socket
+                                            // either, but it's a reasonable guess).
+                                            our_addr = Some(stun_addr);
+                                        }
                                     }
                                 }
-                            }
-                        });
+                                if let Some(addr) = our_addr {
+                                    log::info!("Phase3: our public address: {}", addr);
+                                    if phase3_tx_clone.send(addr).await.is_err() {
+                                        log::info!("Phase3: failed to send own address");
+                                    }
+                                } else {
+                                    log::info!(
+                                        "Phase3: no public address available; Phase 3 disabled"
+                                    );
+                                }
+                            });
+                        } else {
+                            log::info!(
+                                "Phase3: udp_nat_port=0, cannot derive our public address; Phase 3 disabled"
+                            );
+                        }
                     }
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {

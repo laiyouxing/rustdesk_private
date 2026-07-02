@@ -430,7 +430,15 @@ impl Client {
             secure_tcp(&mut socket, &key)
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
-        } else if let Some(udp) = udp.1.as_ref() {
+        }
+        // Wait for UDP NAT test to complete BEFORE sending PunchHoleRequest.
+        // The TestNatResponse from hbbs carries the actual NAT external port
+        // of the punch socket. We need this to populate `udp_port` in the
+        // PunchHoleRequest so the peer can punch back correctly.
+        // Previously this only ran in the else branch, but with secure TCP
+        // (key/token present) the wait was skipped entirely, leaving
+        // udp_nat_port=0 and forcing TCP punch fallback.
+        if let Some(udp) = udp.1.as_ref() {
             let tm = Instant::now();
             loop {
                 let port = *udp.lock().unwrap();
@@ -438,9 +446,6 @@ impl Client {
                     break;
                 }
                 // Wait up to 1.5 RTT for the UDP NAT test to complete.
-                // The TestNatResponse from hbbs carries the actual NAT external
-                // port of the punch socket. Without this, the punch falls back
-                // to TCP and fails.
                 if tm.elapsed() > rtt + rtt / 2 {
                     log::warn!("UDP NAT test did not complete in time, udp_port={}", port);
                     break;
