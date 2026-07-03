@@ -4225,7 +4225,6 @@ async fn test_udp_uat(
     udp_port: Arc<Mutex<u16>>,
     mut stop_udp_rx: oneshot::Receiver<()>,
 ) -> ResultType<()> {
-    let (_tx, mut _rx) = oneshot::channel::<_>();
     // Run STUN only to detect public IP / NAT type. Do NOT use STUN's port —
     // the STUN socket is different from the punch socket, so its NAT external
     // port is unreliable. Always trust the TestNatResponse from hbbs.
