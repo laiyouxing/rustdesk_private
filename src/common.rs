@@ -630,6 +630,23 @@ pub fn test_nat_type() {
 async fn test_nat_type_() -> ResultType<bool> {
     log::info!("Testing nat ...");
     let start = std::time::Instant::now();
+
+    // Discover public address via STUN at the very start, before any TCP
+    // connection attempt.  This ensures the UI can always display the public
+    // IP even when the rendezvous server is temporarily unreachable.
+    if let Ok((addr, _srv)) = {
+        let servers = get_stun_servers_v4();
+        if let Some(first) = servers.first() {
+            stun_ipv4_test(first).await
+        } else {
+            stun_ipv4_test(STUNS_V4_DEFAULT[0]).await
+        }
+    } {
+        if let Ok(mut public) = PUBLIC_ADDR.lock() {
+            *public = addr.to_string();
+        }
+    }
+
     let server1 = Config::get_rendezvous_server();
     let server2 = crate::increase_port(&server1, -1);
     let mut msg_out = RendezvousMessage::new();
@@ -683,19 +700,6 @@ async fn test_nat_type_() -> ResultType<bool> {
         };
         Config::set_nat_type(t as _);
         log::info!("Tested nat type: {:?} in {:?}", t, start.elapsed());
-        // Discover public address via STUN for NAT status display in UI
-        if let Ok((addr, _srv)) = {
-            let servers = get_stun_servers_v4();
-            if let Some(first) = servers.first() {
-                stun_ipv4_test(first).await
-            } else {
-                stun_ipv4_test(STUNS_V4_DEFAULT[0]).await
-            }
-        } {
-            if let Ok(mut public) = PUBLIC_ADDR.lock() {
-                *public = addr.to_string();
-            }
-        }
     }
     Ok(ok)
 }
