@@ -467,7 +467,23 @@ impl Client {
         };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
         let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
-        let local_addr_bytes = hbb_common::AddrMangle::encode(my_addr).into();
+        // Enumerate all non-loopback IPv4 addresses so hbbs can detect LAN
+        // correctly even when the client connects via VPN (different public IP
+        // but same private subnet).  We also include the TCP socket's own
+        // local address (my_addr) as a fallback.
+        let mut local_addrs: Vec<bytes::Bytes> = Vec::new();
+        local_addrs.push(hbb_common::AddrMangle::encode(my_addr).into());
+        for interface in default_net::get_interfaces() {
+            for ipv4 in &interface.ipv4 {
+                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
+                    let addr = SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), my_addr.port());
+                    let encoded = hbb_common::AddrMangle::encode(addr);
+                    if !local_addrs.iter().any(|b| b.as_ref() == encoded.as_slice()) {
+                        local_addrs.push(encoded.into());
+                    }
+                }
+            }
+        }
         msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
@@ -478,7 +494,7 @@ impl Client {
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
-            local_addr: local_addr_bytes,
+            local_addrs: local_addrs.into_iter().collect(),
             ..Default::default()
         });
         for i in 1..=3 {
