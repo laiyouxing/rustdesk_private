@@ -2655,6 +2655,7 @@ pub async fn punch_udp(
 pub async fn stun_query_with_socket(
     socket: &UdpSocket,
 ) -> ResultType<(SocketAddr, String)> {
+    use hbb_common::futures::future::FutureExt;
     use hbb_common::rand::{self, Rng};
 
     const SINGLE_RECV_TIMEOUT: Duration = Duration::from_secs(2);
