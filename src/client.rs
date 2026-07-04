@@ -467,6 +467,7 @@ impl Client {
         };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
         let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
+        let local_addr_bytes = hbb_common::AddrMangle::encode(my_addr).into();
         msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
@@ -477,6 +478,7 @@ impl Client {
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
+            local_addr: local_addr_bytes,
             ..Default::default()
         });
         for i in 1..=3 {
