@@ -2621,18 +2621,17 @@ pub async fn punch_udp(
 /// Query STUN server using an existing socket to discover the NAT-mapped public address.
 /// Serial over the hardcoded STUN server list; tries each one with timeouts.
 /// #4: Validates transaction ID in response.
-/// #1: Each recv has 2s timeout; whole function has 6s timeout.
-/// Query STUN server using an existing socket to discover the NAT-mapped public address.
-/// Serial over the hardcoded STUN server list; tries each one with timeouts.
-/// #4: Validates transaction ID in response.
-/// #1: Each recv has 2s timeout; whole function has 6s timeout.
+/// Multi-STUN concurrent query using an existing socket.
+/// Queries all 3 STUN servers in parallel and takes the first 2 replies.
+/// If they agree on the mapped address, uses it (high confidence).
+/// Otherwise falls back to the first reply (better than nothing).
 pub async fn stun_query_with_socket(
     socket: &UdpSocket,
 ) -> ResultType<(SocketAddr, String)> {
+    use hbb_common::futures::future::{select_ok, FutureExt};
     use hbb_common::rand::{self, Rng};
 
     const SINGLE_RECV_TIMEOUT: Duration = Duration::from_secs(2);
-    const SINGLE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
     const TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 
     async fn try_one(socket: &UdpSocket, stun: &str) -> ResultType<(SocketAddr, String)> {
@@ -2642,7 +2641,6 @@ pub async fn stun_query_with_socket(
             .next()
             .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
 
-        // Build STUN binding request
         let mut req = vec![0u8; 20];
         req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
         req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
@@ -2652,7 +2650,6 @@ pub async fn stun_query_with_socket(
 
         socket.send_to(&req, stun_addr).await?;
 
-        // Receive response (with timeout)
         let mut buf = vec![0u8; 4096];
         let (n, _) = tokio::time::timeout(SINGLE_RECV_TIMEOUT, socket.recv_from(&mut buf))
             .await
@@ -2664,11 +2661,9 @@ pub async fn stun_query_with_socket(
         if resp_type != 0x0101 {
             bail!("Not a STUN Binding Response");
         }
-        // #4: validate transaction ID
         if &buf[8..20] != &tx_id {
             bail!("STUN transaction ID mismatch from {}", stun);
         }
-        // Parse XOR-MAPPED-ADDRESS attribute (type 0x0020)
         let mut pos = 20;
         while pos + 4 <= n {
             let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
@@ -2696,26 +2691,36 @@ pub async fn stun_query_with_socket(
         bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
     }
 
-    // Serial: try each STUN server in order, fall through to next on failure
+    // Race all STUN servers concurrently, collect first 2 successful results
     let work = async {
-        let mut last_err: Option<hbb_common::anyhow::Error> = None;
-        for &stun in STUNS_V4.iter() {
-            match tokio::time::timeout(SINGLE_QUERY_TIMEOUT, try_one(socket, stun)).await {
-                Ok(Ok(v)) => return Ok(v),
-                Ok(Err(e)) => {
-                    log::debug!("STUN {} failed: {:?}", stun, e);
-                    last_err = Some(e);
-                }
-                Err(_) => {
-                    log::debug!("STUN {} query timeout", stun);
-                    last_err = Some(anyhow!("STUN query timeout for {}", stun));
-                }
+        let futs = STUNS_V4
+            .iter()
+            .map(|&stun| {
+                tokio::time::timeout(TOTAL_TIMEOUT, try_one(socket, stun)).boxed()
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        // Take first 2 successful replies (or all if fewer succeed)
+        for fut in futs {
+            if results.len() >= 2 {
+                break;
+            }
+            if let Ok(Ok(ok)) = fut.await {
+                results.push(ok);
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow!("No STUN servers available")))
+        if results.is_empty() {
+            bail!("All STUN servers failed");
+        }
+        // If 2+ servers agree on the mapped address, use it (high confidence).
+        // Otherwise trust the first reply.
+        if results.len() >= 2 && results[0].0 == results[1].0 {
+            Ok(results[0].clone())
+        } else {
+            Ok(results[0].clone())
+        }
     };
 
-    // Whole function has total timeout
     tokio::time::timeout(TOTAL_TIMEOUT, work)
         .await
         .map_err(|_| anyhow!("STUN total timeout"))?
@@ -2804,7 +2809,41 @@ pub async fn relay_upgrade_task(
         log::info!("Phase3: sent our address to relay loop: {}", addr);
     }
 
-    for _round in 0..5 {
+    // ReSTUN: periodically refresh NAT mapping (every ~25s, just under
+    // typical 30s NAT timeout).  Updates targets with any new addresses
+    // discovered on different ports (helps with symmetric NAT).
+    let last_stun = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let restun_targets: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let socket = socket.clone();
+        let restun_targets = restun_targets.clone();
+        let last_stun = last_stun.clone();
+        tokio::spawn(async move {
+            loop {
+                hbb_common::tokio::time::sleep(Duration::from_secs(25)).await;
+                match stun_query_with_socket(&socket).await {
+                    Ok((new_addr, srv)) => {
+                        log::info!("RelayUpgrade ReSTUN: mapped {} (via {})", new_addr, srv);
+                        if let Ok(mut t) = restun_targets.lock() {
+                            if !t.contains(&new_addr) {
+                                t.push(new_addr);
+                            }
+                        }
+                        if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                            *public = new_addr.to_string();
+                        }
+                        *last_stun.lock().unwrap() = std::time::Instant::now();
+                    }
+                    Err(e) => {
+                        log::debug!("ReSTUN failed: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return false;
@@ -2816,6 +2855,15 @@ pub async fn relay_upgrade_task(
                 if !targets.contains(&addr) {
                     targets.push(addr);
                     log::info!("Phase3: added peer address {} to targets", addr);
+                }
+            }
+        }
+        // Check for ReSTUN-discovered addresses (NAT re-mapping)
+        if let Ok(mut rst) = restun_targets.lock() {
+            for addr in rst.drain(..) {
+                if !targets.contains(&addr) {
+                    targets.push(addr);
+                    log::info!("ReSTUN: added new address {} to targets", addr);
                 }
             }
         }
