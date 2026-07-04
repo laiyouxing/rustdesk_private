@@ -591,8 +591,11 @@ impl Connection {
         let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
         conn.punch_stream = Some(punch_stream.clone());
         conn.punch_notify = Some(punch_notify.clone());
-        let is_relay_conn = is_relay;
-        if is_relay_conn {
+        // Phase3 (Host-side): discover our public address via STUN and send it
+        // to the peer so both sides can punch through NAT concurrently.
+        // Run for ALL connections (relay + direct punch), not just relay,
+        // because the host also needs to exchange its public address.
+        {
             let phase3_tx = phase3_out_tx;
             tokio::spawn(async move {
                 // 1. STUN to discover our public address
