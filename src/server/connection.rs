@@ -51,6 +51,7 @@ use serde_derive::Serialize;
 use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{
     collections::HashSet,
     net::Ipv6Addr,
@@ -2392,8 +2393,10 @@ impl Connection {
                     log::info!("Phase3(Host): received peer address: {}", peer_addr);
                     let punch_stream = self.punch_stream.clone();
                     let punch_notify = self.punch_notify.clone();
+                    let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                        Arc::new(std::sync::Mutex::new(None));
                     tokio::spawn(async move {
-                        match relay_phase3_punch_to_peer(peer_addr).await {
+                        match relay_phase3_punch_to_peer(peer_addr, kcp_handle).await {
                             Ok(stream) => {
                                 if let Some(s) = punch_stream {
                                     let mut guard = s.lock().await;

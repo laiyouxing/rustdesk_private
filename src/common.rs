@@ -2766,6 +2766,7 @@ pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
     notify: Arc<hbb_common::tokio::sync::Notify>,
     direct_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+    kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
     punch_port: u16,
     phase3_out_tx: mpsc::Sender<std::net::SocketAddr>,
     phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
@@ -2928,7 +2929,10 @@ pub async fn relay_upgrade_task(
             let punched = tokio::select! {
                 res = &mut connect_fut => {
                     match res {
-                        Ok((_kcp, stream)) => {
+                        Ok((kcp, stream)) => {
+                            if let Ok(mut h) = kcp_handle.lock() {
+                                *h = Some(kcp);
+                            }
                             let mut guard = direct_stream.lock().await;
                             *guard = Some(stream);
                             notify.notify_one();
@@ -2939,7 +2943,10 @@ pub async fn relay_upgrade_task(
                 }
                 res = &mut accept_fut => {
                     match res {
-                        Ok((_kcp, stream)) => {
+                        Ok((kcp, stream)) => {
+                            if let Ok(mut h) = kcp_handle.lock() {
+                                *h = Some(kcp);
+                            }
                             let mut guard = direct_stream.lock().await;
                             *guard = Some(stream);
                             notify.notify_one();
@@ -2985,7 +2992,10 @@ pub async fn relay_upgrade_task(
 /// Host-side Phase 3 punch: called when the host receives PunchPeerAddr
 /// through the relay connection. Uses the same optimizations as
 /// relay_upgrade_task (burst + connect/accept race + keep-alive).
-pub async fn relay_phase3_punch_to_peer(peer_addr: std::net::SocketAddr) -> ResultType<Stream> {
+pub async fn relay_phase3_punch_to_peer(
+    peer_addr: std::net::SocketAddr,
+    kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
+) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -3016,7 +3026,10 @@ pub async fn relay_phase3_punch_to_peer(peer_addr: std::net::SocketAddr) -> Resu
         let result = tokio::select! {
             res = &mut connect_fut => {
                 match res {
-                    Ok((_kcp, stream)) => {
+                    Ok((kcp, stream)) => {
+                        if let Ok(mut h) = kcp_handle.lock() {
+                            *h = Some(kcp);
+                        }
                         log::info!("Phase3(Host) succeeded via connect after {:?}", started.elapsed());
                         Some(stream)
                     }
@@ -3025,7 +3038,10 @@ pub async fn relay_phase3_punch_to_peer(peer_addr: std::net::SocketAddr) -> Resu
             }
             res = &mut accept_fut => {
                 match res {
-                    Ok((_kcp, stream)) => {
+                    Ok((kcp, stream)) => {
+                        if let Ok(mut h) = kcp_handle.lock() {
+                            *h = Some(kcp);
+                        }
                         log::info!("Phase3(Host) succeeded via accept after {:?}", started.elapsed());
                         Some(stream)
                     }

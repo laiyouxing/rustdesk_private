@@ -218,10 +218,12 @@ impl<T: InvokeUiSession> Remote<T> {
                         p2p_addrs.push(peer_addr);
                     }
                     let phase3_peer = phase3_peer_rx.clone();
+                    let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                        Arc::new(std::sync::Mutex::new(None));
                     self.handler.set_punch_status("trying", "");
                     tokio::spawn(async move {
                         let ok = relay_upgrade_task(
-                            p2p_addrs, n, s, udp_nat_port,
+                            p2p_addrs, n, s, kcp_handle, udp_nat_port,
                             phase3_out_tx, phase3_peer,
                         ).await;
                         succ.store(ok, std::sync::atomic::Ordering::SeqCst);
