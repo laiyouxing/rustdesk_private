@@ -64,6 +64,10 @@ pub const PLATFORM_ANDROID: &str = "Android";
 // and also during relay_upgrade_task for the latest NAT mapping.
 pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// Custom build identifier used to verify that the remote peer is also running
+/// this custom fork (not stock RustDesk).  Set in PunchHoleRequest.custom_tag.
+pub const CUSTOM_TAG: &str = "rustdesk-custom";
+
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 

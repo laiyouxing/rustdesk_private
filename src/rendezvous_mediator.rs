@@ -587,6 +587,17 @@ impl RendezvousMediator {
     }
 
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
+        // Verify the connecting peer is also running our custom fork.
+        let expected_tag = crate::common::CUSTOM_TAG.as_bytes();
+        if ph.custom_tag.as_ref() != expected_tag {
+            log::warn!(
+                "Rejecting punch hole from {:?}: custom_tag mismatch (got {:?}, expected {:?})",
+                AddrMangle::decode(&ph.socket_addr),
+                String::from_utf8_lossy(ph.custom_tag.as_ref()),
+                crate::common::CUSTOM_TAG,
+            );
+            return Ok(());
+        }
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
         let mut last = LAST_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
