@@ -725,14 +725,10 @@ impl Client {
         // TCP simultaneous open: staggered connect attempts
         // to increase chance of SYNs crossing with the peer
         if is_local && !peer_addrs.is_empty() {
-            for (i, addr) in peer_addrs.iter().enumerate() {
+            for addr in peer_addrs.iter() {
                 let fut = connect_tcp_local(*addr, Some(local_addr), connect_timeout);
-                let delay = i as u64 * 300;
                 connect_futures.push(
                     async move {
-                        if delay > 0 {
-                            hbb_common::tokio::time::sleep(Duration::from_millis(delay)).await;
-                        }
                         let conn = fut.await?;
                         Ok((conn, None, "TCP"))
                     }
