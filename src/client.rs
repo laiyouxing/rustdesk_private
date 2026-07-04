@@ -741,34 +741,25 @@ impl Client {
         // still has a chance through NAT.  Previously these were gated
         // behind `else`, meaning a misdetected LAN would skip public
         // punching entirely and jump straight to relay.
-        {
+        // Increased from 3→5 attempts with tighter intervals to maximize
+        // the chance of TCP simultaneous open (SYN crossing).
+        const TCP_INTERVALS: [(&str, u64); 5] = [
+            ("TCP", 0),
+            ("TCP+1", 50),
+            ("TCP+2", 150),
+            ("TCP+3", 350),
+            ("TCP+4", 750),
+        ];
+        for (label, delay) in &TCP_INTERVALS {
             let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            let delay = *delay;
             connect_futures.push(
                 async move {
+                    if delay > 0 {
+                        hbb_common::tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
                     let conn = fut.await?;
-                    Ok((conn, None, "TCP"))
-                }
-                .boxed(),
-            );
-        }
-        {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            connect_futures.push(
-                async move {
-                    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP+1"))
-                }
-                .boxed(),
-            );
-        }
-        {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            connect_futures.push(
-                async move {
-                    hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
-                    let conn = fut.await?;
-                    Ok((conn, None, "TCP+2"))
+                    Ok((conn, None, *label))
                 }
                 .boxed(),
             );

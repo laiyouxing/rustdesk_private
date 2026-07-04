@@ -7,7 +7,7 @@ use crate::{
         self, new_voice_call_request, Client, Data, Interface, MediaData, MediaSender,
         QualityStatus, MILLI1, SEC30,
     },
-    common::{get_default_sound_input, relay_upgrade_task, relay_phase3_punch_to_peer},
+    common::{get_default_sound_input, relay_upgrade_task},
     ui_session_interface::{InvokeUiSession, Session},
 };
 #[cfg(feature = "unix-file-copy-paste")]
@@ -79,9 +79,11 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
-    // Phase 3 relay upgrade
+    // Relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
     punch_notify: Option<Arc<Notify>>,
+    // Phase 3: shared vec for relay_upgrade_task to pick up peer addresses
+    punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
 }
 
 #[derive(Default)]
@@ -189,113 +191,41 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
-                // Relay upgrade to direct (Tailscale-style background UDP punching)
+                // Relay upgrade to direct — merged Phase 3 into relay_upgrade_task
                 let punch_notify = Arc::new(Notify::new());
                 let punch_done = Arc::new(Notify::new());
                 let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
                     Arc::new(hbb_common::tokio::sync::Mutex::new(None));
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // Phase 3: channel for sending our STUN-discovered address to peer through relay
+                // Channel for relay_upgrade_task to send our STUN address → io_loop → peer
                 let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+                // Shared state for handle_msg_from_peer to push peer Phase 3 addresses
+                // into relay_upgrade_task's target list (same socket, no duplicate)
+                let phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
                 // Store for handle_msg_from_peer to access
                 self.punch_stream = Some(punch_stream.clone());
                 self.punch_notify = Some(punch_notify.clone());
+                self.punch_peer_addrs = Some(phase3_peer_rx.clone());
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
                     let n = punch_notify.clone();
                     let d = punch_done.clone();
                     let s = punch_stream.clone();
                     let succ = punch_success.clone();
-                    // Include peer_addr (hbbs-reported public address) AND peer_addrs
                     let mut p2p_addrs = peer_addrs.clone();
                     if !p2p_addrs.contains(&peer_addr) {
                         p2p_addrs.push(peer_addr);
                     }
+                    let phase3_peer = phase3_peer_rx.clone();
                     self.handler.set_punch_status("trying", "");
                     tokio::spawn(async move {
-                        let ok = relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
+                        let ok = relay_upgrade_task(
+                            p2p_addrs, n, s, udp_nat_port,
+                            phase3_out_tx, phase3_peer,
+                        ).await;
                         succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                         d.notify_one();
                     });
-                    // Phase 3: Exchange PunchPeerAddr through relay and try direct connection
-                    // Use the hbbs-reported peer public IP (peer_addr.ip()) combined
-                    // with our measured udp_nat_port (from hbbs's TestNatResponse over
-                    // UDP). This guarantees the port matches the actual punch socket
-                    // that relay_upgrade_task is using. A separate STUN socket would
-                    // get a different NAT port, breaking the punch.
-                    {
-                        let phase3_tx = phase3_out_tx;
-                        if udp_nat_port > 0 {
-                            // Phase 3 needs OUR public IP (peer_addr is the PEER's).
-                            // relay_upgrade_task writes our IP to PUBLIC_ADDR after its
-                            // STUN probe. Wait briefly for that, then fall back to a
-                            // fresh STUN probe of the same socket if still empty.
-                            let phase3_tx_clone = phase3_tx;
-                            tokio::spawn(async move {
-                                let mut our_addr: Option<std::net::SocketAddr> = None;
-                                // 1) Wait up to 5s for PUBLIC_ADDR to be populated
-                                //    by relay_upgrade_task's STUN query.
-                                for _ in 0..50 {
-                                    let s = crate::common::PUBLIC_ADDR
-                                        .lock()
-                                        .map(|p| p.clone())
-                                        .unwrap_or_default();
-                                    if !s.is_empty() {
-                                        if let Some(ip) = s
-                                            .split(':')
-                                            .next()
-                                            .and_then(|x| x.parse::<std::net::IpAddr>().ok())
-                                        {
-                                            our_addr = Some(std::net::SocketAddr::new(
-                                                ip, udp_nat_port,
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                    hbb_common::tokio::time::sleep(
-                                        std::time::Duration::from_millis(100),
-                                    )
-                                    .await;
-                                }
-                                // 2) Fallback: do a fresh STUN probe so the port
-                                //    matches a new socket we bind for the punch.
-                                //    (Phase 3 also starts its own UDP socket; the
-                                //    peer receives our port and we receive theirs.)
-                                if our_addr.is_none() {
-                                    log::info!(
-                                        "Phase3: PUBLIC_ADDR still empty, doing fresh STUN probe"
-                                    );
-                                    if let Ok(socket) =
-                                        tokio::net::UdpSocket::bind("0.0.0.0:0").await
-                                    {
-                                        let socket = Arc::new(socket);
-                                        if let Ok((stun_addr, _)) =
-                                            crate::common::stun_query_with_socket(&socket).await
-                                        {
-                                            // Use the STUN-discovered port (best we
-                                            // can do — the new socket's NAT port
-                                            // may not match Phase 3's punch socket
-                                            // either, but it's a reasonable guess).
-                                            our_addr = Some(stun_addr);
-                                        }
-                                    }
-                                }
-                                if let Some(addr) = our_addr {
-                                    log::info!("Phase3: our public address: {}", addr);
-                                    if phase3_tx_clone.send(addr).await.is_err() {
-                                        log::info!("Phase3: failed to send own address");
-                                    }
-                                } else {
-                                    log::info!(
-                                        "Phase3: no public address available; Phase 3 disabled"
-                                    );
-                                }
-                            });
-                        } else {
-                            log::info!(
-                                "Phase3: udp_nat_port=0, cannot derive our public address; Phase 3 disabled"
-                            );
-                        }
-                    }
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
                     self.handler
@@ -2113,29 +2043,18 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.handler.set_current_display(d_idx);
                     }
                     Some(misc::Union::PunchPeerAddr(ppa)) => {
-                        // Phase 3: Received peer's public address through relay
-                        if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
-                        {
+                        // Phase 3: Received peer's public address through relay.
+                        // Push it into relay_upgrade_task's target list so it
+                        // uses the same socket (no duplicate STUN / port mismatch).
+                        if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
                             log::info!("Phase3: received peer address: {}", peer_addr);
-                            let punch_stream = self.punch_stream.clone();
-                            let punch_notify = self.punch_notify.clone();
-                            tokio::spawn(async move {
-                                match relay_phase3_punch_to_peer(peer_addr).await {
-                                    Ok(stream) => {
-                                        if let Some(s) = punch_stream {
-                                            let mut guard = s.lock().await;
-                                            *guard = Some(stream);
-                                        }
-                                        if let Some(n) = punch_notify {
-                                            n.notify_one();
-                                        }
-                                        log::info!("Phase3 punch succeeded!");
-                                    }
-                                    Err(e) => {
-                                        log::info!("Phase3 punch to {} failed: {:?}", peer_addr, e);
+                            if let Some(ref punch_peer) = self.punch_peer_addrs {
+                                if let Ok(mut addrs) = punch_peer.lock() {
+                                    if !addrs.contains(&peer_addr) {
+                                        addrs.push(peer_addr);
                                     }
                                 }
-                            });
+                            }
                         }
                     }
                     _ => {}

@@ -31,6 +31,7 @@ use hbb_common::{
     tokio::{
         self,
         net::UdpSocket,
+        sync::mpsc,
         time::{Duration, Instant, Interval},
     },
     ResultType, Stream,
@@ -2723,11 +2724,18 @@ pub async fn stun_query_with_socket(
 
 
 /// Returns true if punch succeeded, false otherwise.
+///
+/// Merged with Phase 3: after STUN, sends our address out through
+/// `phase3_out_tx` so io_loop can forward it to the peer via relay.
+/// Receives peer's Phase 3 addresses through `phase3_peer_rx` and adds
+/// them to the target list, so both sides punch through the same socket.
 pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
     notify: Arc<hbb_common::tokio::sync::Notify>,
     direct_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
     punch_port: u16,
+    phase3_out_tx: mpsc::Sender<std::net::SocketAddr>,
+    phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
 ) -> bool {
     use crate::kcp_stream::KcpStream;
 
@@ -2736,25 +2744,19 @@ pub async fn relay_upgrade_task(
         if let Ok(true) = detect_symmetric_nat().await {
             log::info!("relay_upgrade_task: detected SYMMETRIC NAT, switching to relay-only");
             Config::set_nat_type(NatType::SYMMETRIC as _);
-            return false; // No point trying punch
-        } else {
-            // If detection succeeded and result is not symmetric, mark as ASYMMETRIC
-            if Config::get_nat_type() == 0 {
-                Config::set_nat_type(NatType::ASYMMETRIC as _);
-            }
+            return false;
+        } else if Config::get_nat_type() == 0 {
+            Config::set_nat_type(NatType::ASYMMETRIC as _);
         }
     }
-    // #6/#7: total time budget for upgrade attempts - 30 seconds.
-    // Past this, give up and stay on relay to avoid wasting resources.
+
     const TOTAL_BUDGET: Duration = Duration::from_secs(30);
     let started = std::time::Instant::now();
 
-    // Brief initial wait for relay to stabilize
-    hbb_common::tokio::time::sleep(Duration::from_secs(2)).await;
+    // Brief initial wait for relay to stabilize (reduced from 2s→0.5s)
+    hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // [Fix #1]: Create ONE persistent socket for all rounds.
-    // Try to reuse the initial punch port so the host's host-side punching
-    // (which targets our known port from PunchHole.udp_port) can reach us.
+    // Create ONE persistent socket for all rounds.
     let socket = {
         let bind_addr = if punch_port > 0 {
             SocketAddr::from(([0u8; 4], punch_port))
@@ -2763,16 +2765,13 @@ pub async fn relay_upgrade_task(
         };
         match UdpSocket::bind(bind_addr).await {
             Ok(s) => Arc::new(s),
-            Err(_) if punch_port > 0 => {
-                // Port in-use, fall back to any available port
-                match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => Arc::new(s),
-                    Err(_) => {
-                        log::info!("RelayUpgrade: failed to create socket, giving up");
-                        return false;
-                    }
+            Err(_) if punch_port > 0 => match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => Arc::new(s),
+                Err(_) => {
+                    log::info!("RelayUpgrade: failed to create socket, giving up");
+                    return false;
                 }
-            }
+            },
             Err(_) => {
                 log::info!("RelayUpgrade: failed to create socket, giving up");
                 return false;
@@ -2781,15 +2780,15 @@ pub async fn relay_upgrade_task(
     };
 
     // Do STUN ONCE per socket to discover the NAT-mapped address.
-    // Reusing the socket means the mapped port stays stable across rounds.
     let mut targets = peer_addrs.clone();
+    let mut our_addr: Option<std::net::SocketAddr> = None;
     match stun_query_with_socket(&socket).await {
         Ok((stun_addr, stun_srv)) => {
             log::info!("RelayUpgrade STUN: mapped {} (via {})", stun_addr, stun_srv);
+            our_addr = Some(stun_addr);
             if !targets.contains(&stun_addr) {
                 targets.push(stun_addr);
             }
-            // Update global public address for UI display
             if let Ok(mut public) = PUBLIC_ADDR.lock() {
                 *public = stun_addr.to_string();
             }
@@ -2799,10 +2798,26 @@ pub async fn relay_upgrade_task(
         }
     }
 
+    // Phase 3: send our public address to peer through relay
+    if let Some(addr) = our_addr {
+        let _ = phase3_out_tx.try_send(addr);
+        log::info!("Phase3: sent our address to relay loop: {}", addr);
+    }
+
     for _round in 0..5 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return false;
+        }
+
+        // Check for peer Phase 3 addresses and add them to targets
+        if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
+            for addr in peer_addrs.drain(..) {
+                if !targets.contains(&addr) {
+                    targets.push(addr);
+                    log::info!("Phase3: added peer address {} to targets", addr);
+                }
+            }
         }
 
         // Try each target address with the SAME socket
@@ -2813,49 +2828,88 @@ pub async fn relay_upgrade_task(
             if socket.connect(target).await.is_err() {
                 continue;
             }
-            // Send a burst of empty packets first to establish our NAT mapping
-            // and (hopefully) reach the peer's NAT before we send KCP.
-            // (Otherwise the peer's NAT drops our packets because it
-            // doesn't know us yet.)
-            for _ in 0..10 {
+
+            // Send a burst of empty packets (increased 10→50, tighter 5ms spacing)
+            // to reliably punch through NAT and establish the mapping before KCP.
+            for _ in 0..50 {
                 if started.elapsed() >= TOTAL_BUDGET {
                     return false;
                 }
                 socket.send(&[]).await.ok();
-                hbb_common::tokio::time::sleep(Duration::from_millis(20)).await;
+                hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            // Now try KCP connect — whoever's KCP arrives first at peer wins.
-            // KCP handshake needs 1-2 RTTs; give it ample time.
-            if let Ok((_kcp_stream, stream)) =
-                KcpStream::connect(socket.clone(), Duration::from_secs(15)).await
-            {
-                let mut guard = direct_stream.lock().await;
-                *guard = Some(stream);
-                notify.notify_one();
+
+            // Race KCP connect vs KCP accept simultaneously.
+            // If both sides call connect, no one is listening → deadlock.
+            // If both call accept, no one initiates → deadlock.
+            // Racing both eliminates this deadlock entirely.
+            let socket_for_accept = socket.clone();
+            let mut connect_fut = Box::pin(KcpStream::connect(socket.clone(), Duration::from_secs(5)));
+            let mut accept_fut = Box::pin(async move {
+                KcpStream::accept(socket_for_accept, Duration::from_secs(5), None)
+                    .await
+            });
+            let punched = tokio::select! {
+                res = &mut connect_fut => {
+                    match res {
+                        Ok((_kcp, stream)) => {
+                            let mut guard = direct_stream.lock().await;
+                            *guard = Some(stream);
+                            notify.notify_one();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                res = &mut accept_fut => {
+                    match res {
+                        Ok((_kcp, stream)) => {
+                            let mut guard = direct_stream.lock().await;
+                            *guard = Some(stream);
+                            notify.notify_one();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+            };
+            if punched {
                 log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
                 return true;
             }
         }
 
-        // Sleep before next round, but cap by remaining budget
-        let remaining = TOTAL_BUDGET.saturating_sub(started.elapsed());
-        let delay = std::cmp::min(remaining, Duration::from_secs(2));
-        if delay.is_zero() {
-            return false;
+        // Keep-alive: send empty packets during inter-round gap to prevent
+        // NAT mapping from expiring. NAT mappings typically time out after
+        // 30-60s of inactivity.
+        let gap_budget = Duration::from_millis(500);
+        let gap_start = std::time::Instant::now();
+        while gap_start.elapsed() < gap_budget {
+            if started.elapsed() >= TOTAL_BUDGET {
+                return false;
+            }
+            socket.send(&[]).await.ok();
+            hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        hbb_common::tokio::time::sleep(delay).await;
+        // Also check for new Phase 3 addresses during gap
+        if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
+            for addr in peer_addrs.drain(..) {
+                if !targets.contains(&addr) {
+                    targets.push(addr);
+                    log::info!("Phase3: added peer address {} to targets (during gap)", addr);
+                }
+            }
+        }
     }
     log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
     false
 }
 
-/// Phase 3 relay upgrade: exchange PunchPeerAddr through relay and try direct UDP connection.
-/// This runs on both connector and host sides after relay is established.
-/// Returns the direct Stream on success.
-///
-/// Symmetric design: send empty packets to open the NAT mapping, then race
-/// KCP connect and KCP accept in parallel. Whichever wins first is used.
-pub async fn relay_phase3_punch_to_peer(peer_addr: SocketAddr) -> ResultType<Stream> {
+
+/// Host-side Phase 3 punch: called when the host receives PunchPeerAddr
+/// through the relay connection. Uses the same optimizations as
+/// relay_upgrade_task (burst + connect/accept race + keep-alive).
+pub async fn relay_phase3_punch_to_peer(peer_addr: std::net::SocketAddr) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -2867,61 +2921,58 @@ pub async fn relay_phase3_punch_to_peer(peer_addr: SocketAddr) -> ResultType<Str
 
     for _round in 0..5 {
         if started.elapsed() >= MAX_TIME {
-            bail!("Phase3 punch timed out after {:?}", started.elapsed());
+            bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
-        // Send a burst of empty packets first to establish our NAT mapping
-        // and (hopefully) reach the peer's NAT before we send KCP.
-        for _ in 0..10 {
-            if started.elapsed() >= MAX_TIME {
-                bail!("Phase3 punch timed out");
-            }
+
+        // Empty packet burst: 50 packets at 5ms spacing
+        for _ in 0..50 {
             socket.send(&[]).await.ok();
-            hbb_common::tokio::time::sleep(Duration::from_millis(20)).await;
+            hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // Race KCP connect vs KCP accept — whoever wins first we use.
-        // Each side runs this same code; if both connect (no listener) or
-        // both accept (no initiator) it would deadlock. Running both
-        // simultaneously works around this.
+
+        // Race KCP connect vs accept
         let socket_for_accept = socket.clone();
-        let mut connect_fut = Box::pin(KcpStream::connect(socket.clone(), Duration::from_secs(15)));
+        let mut connect_fut = Box::pin(
+            KcpStream::connect(socket.clone(), Duration::from_secs(5)));
         let mut accept_fut = Box::pin(async move {
-            KcpStream::accept(
-                socket_for_accept,
-                Duration::from_secs(15),
-                None,
-            )
-            .await
+            KcpStream::accept(socket_for_accept, Duration::from_secs(5), None).await
         });
-        tokio::select! {
+        let result = tokio::select! {
             res = &mut connect_fut => {
                 match res {
                     Ok((_kcp, stream)) => {
-                        log::info!("Phase3 punch succeeded via KCP connect after {:?}", started.elapsed());
-                        return Ok(stream);
+                        log::info!("Phase3(Host) succeeded via connect after {:?}", started.elapsed());
+                        Some(stream)
                     }
-                    Err(e) => log::debug!("Phase3 KCP connect failed: {:?}", e),
+                    Err(_) => None,
                 }
             }
             res = &mut accept_fut => {
                 match res {
                     Ok((_kcp, stream)) => {
-                        log::info!("Phase3 punch succeeded via KCP accept after {:?}", started.elapsed());
-                        return Ok(stream);
+                        log::info!("Phase3(Host) succeeded via accept after {:?}", started.elapsed());
+                        Some(stream)
                     }
-                    Err(e) => log::debug!("Phase3 KCP accept failed: {:?}", e),
+                    Err(_) => None,
                 }
             }
+        };
+        if let Some(stream) = result {
+            return Ok(stream);
         }
-        let remaining = MAX_TIME.saturating_sub(started.elapsed());
-        let delay = std::cmp::min(remaining, Duration::from_secs(2));
-        if delay.is_zero() {
-            bail!("Phase3 punch timed out");
-        }
-        hbb_common::tokio::time::sleep(delay).await;
-    }
-    bail!("Phase3 punch finished without success");
-}
 
+        // Keep-alive during gap
+        let gap_start = std::time::Instant::now();
+        while gap_start.elapsed() < Duration::from_millis(500) {
+            if started.elapsed() >= MAX_TIME {
+                bail!("Phase3(Host) punch timed out");
+            }
+            socket.send(&[]).await.ok();
+            hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    bail!("Phase3(Host) punch finished without success");
+}
 
 /// Detect NAT type by sending two STUN binding requests from the same socket
 /// to the same STUN server, but to two different destination ports (or two servers).
