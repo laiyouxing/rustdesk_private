@@ -2839,23 +2839,33 @@ pub async fn relay_upgrade_task(
     }
 
     // ReSTUN: periodically refresh NAT mapping (every ~25s, just under
-    // typical 30s NAT timeout).  Uses a cancel channel so it stops when
-    // relay_upgrade_task finishes (avoids leaked tasks on reconnect).
+    // typical 30s NAT timeout).  Uses a **dedicated** UDP socket so it is
+    // NOT affected by socket.connect() calls in the punch loop below
+    // (the punch loop uses socket.connect() which changes the remote
+    // endpoint, causing recv_from to filter out STUN responses).
     let last_stun = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let restun_targets: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let (restun_stop_tx, mut restun_stop_rx) = oneshot::channel::<()>();
     {
-        let socket = socket.clone();
         let restun_targets = restun_targets.clone();
         let last_stun = last_stun.clone();
         tokio::spawn(async move {
+            // Bind a separate UDP socket for ReSTUN to avoid interference
+            // from the main punch socket (which gets connect()-ed).
+            let restun_socket = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => Arc::new(s),
+                Err(_) => {
+                    log::warn!("ReSTUN: failed to create socket, skipping");
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     _ = &mut restun_stop_rx => break,
                     _ = hbb_common::tokio::time::sleep(Duration::from_secs(25)) => {},
                 }
-                match stun_query_with_socket(&socket).await {
+                match stun_query_with_socket(&restun_socket).await {
                     Ok((new_addr, srv)) => {
                         log::info!("RelayUpgrade ReSTUN: mapped {} (via {})", new_addr, srv);
                         if let Ok(mut t) = restun_targets.lock() {
