@@ -135,6 +135,7 @@ impl<T: InvokeUiSession> Remote<T> {
             sent_close_reason: false,
             punch_stream: None,
             punch_notify: None,
+            punch_peer_addrs: None,
         }
     }
 

@@ -2467,7 +2467,8 @@ fn get_stun_servers_v4() -> Vec<String> {
 
 pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
     use hbb_common::futures::future::{select_ok, FutureExt};
-    let tests = get_stun_servers_v4()
+    let servers = get_stun_servers_v4();
+    let tests = servers
         .iter()
         .map(|stun| stun_ipv4_test(stun).boxed())
         .collect::<Vec<_>>();
