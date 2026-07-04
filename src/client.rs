@@ -739,39 +739,43 @@ impl Client {
                     .boxed(),
                 );
             }
-        } else {
-            {
-                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-                connect_futures.push(
-                    async move {
-                        let conn = fut.await?;
-                        Ok((conn, None, "TCP"))
-                    }
-                    .boxed(),
-                );
-            }
-            {
-                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-                connect_futures.push(
-                    async move {
-                        hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
-                        let conn = fut.await?;
-                        Ok((conn, None, "TCP+1"))
-                    }
-                    .boxed(),
-                );
-            }
-            {
-                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-                connect_futures.push(
-                    async move {
-                        hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
-                        let conn = fut.await?;
-                        Ok((conn, None, "TCP+2"))
-                    }
-                    .boxed(),
-                );
-            }
+        }
+        // Always add public TCP punching attempts so that if all local
+        // addresses fail (e.g. firewall blocks direct LAN), the punch
+        // still has a chance through NAT.  Previously these were gated
+        // behind `else`, meaning a misdetected LAN would skip public
+        // punching entirely and jump straight to relay.
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP"))
+                }
+                .boxed(),
+            );
+        }
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP+1"))
+                }
+                .boxed(),
+            );
+        }
+        {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            connect_futures.push(
+                async move {
+                    hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
+                    let conn = fut.await?;
+                    Ok((conn, None, "TCP+2"))
+                }
+                .boxed(),
+            );
         }
         if let Some(udp_socket_nat) = udp_socket_nat {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
