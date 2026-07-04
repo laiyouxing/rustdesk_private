@@ -684,7 +684,14 @@ async fn test_nat_type_() -> ResultType<bool> {
         Config::set_nat_type(t as _);
         log::info!("Tested nat type: {:?} in {:?}", t, start.elapsed());
         // Discover public address via STUN for NAT status display in UI
-        if let Ok((addr, _srv)) = stun_ipv4_test(STUNS_V4[0]).await {
+        if let Ok((addr, _srv)) = {
+            let servers = get_stun_servers_v4();
+            if let Some(first) = servers.first() {
+                stun_ipv4_test(first).await
+            } else {
+                stun_ipv4_test(STUNS_V4_DEFAULT[0]).await
+            }
+        } {
             if let Ok(mut public) = PUBLIC_ADDR.lock() {
                 *public = addr.to_string();
             }
@@ -2431,7 +2438,7 @@ async fn stun_ipv4_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
     })
 }
 
-static STUNS_V4: [&str; 3] = [
+static STUNS_V4_DEFAULT: [&str; 3] = [
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
     "stun.nextcloud.com:3478",
@@ -2443,11 +2450,26 @@ static STUNS_V6: [&str; 3] = [
     "stun.nextcloud.com:3478",
 ];
 
+/// Returns the list of STUN servers to use for IPv4.
+/// Checks `custom-stun-server` config option first (comma-separated),
+/// falls back to built-in defaults if empty.
+fn get_stun_servers_v4() -> Vec<String> {
+    let custom = Config::get_option("custom-stun-server");
+    if custom.is_empty() {
+        return STUNS_V4_DEFAULT.iter().map(|s| s.to_string()).collect();
+    }
+    custom
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
     use hbb_common::futures::future::{select_ok, FutureExt};
-    let tests = STUNS_V4
+    let tests = get_stun_servers_v4()
         .iter()
-        .map(|&stun| stun_ipv4_test(stun).boxed())
+        .map(|stun| stun_ipv4_test(stun).boxed())
         .collect::<Vec<_>>();
 
     match select_ok(tests).await {
@@ -2693,10 +2715,11 @@ pub async fn stun_query_with_socket(
 
     // Race all STUN servers concurrently, collect first 2 successful results
     let work = async {
-        let futs = STUNS_V4
+        let servers = get_stun_servers_v4();
+        let futs = servers
             .iter()
-            .map(|&stun| {
-                tokio::time::timeout(TOTAL_TIMEOUT, try_one(socket, stun)).boxed()
+            .map(|stun| {
+                tokio::time::timeout(TOTAL_TIMEOUT, try_one(socket, stun.as_str())).boxed()
             })
             .collect::<Vec<_>>();
         let mut results = Vec::new();
@@ -3036,8 +3059,9 @@ pub async fn detect_symmetric_nat() -> ResultType<bool> {
     let socket = Arc::new(socket);
 
     // Resolve the first STUN server.
-    let stun_str = match STUNS_V4.first() {
-        Some(s) => *s,
+    let servers_v4 = get_stun_servers_v4();
+    let stun_str = match servers_v4.first() {
+        Some(s) => s.clone(),
         None => return Ok(false),
     };
     let base_addr: SocketAddr = match stun_str.to_socket_addrs()?.find(|x| x.is_ipv4()) {
@@ -3106,8 +3130,9 @@ pub async fn detect_symmetric_nat() -> ResultType<bool> {
     // To force a different mapping on symmetric NATs, we need a DIFFERENT
     // destination. Try a second STUN server, then fallback to a fake port.
     let mut target2 = base_addr;
-    if STUNS_V4.len() >= 2 {
-        if let Some(s2) = STUNS_V4.get(1) {
+    let servers_v4 = get_stun_servers_v4();
+    if servers_v4.len() >= 2 {
+        if let Some(s2) = servers_v4.get(1) {
             if let Some(a2) = s2.to_socket_addrs()?.find(|x| x.is_ipv4()) {
                 target2 = a2;
             }
