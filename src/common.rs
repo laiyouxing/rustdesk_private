@@ -2839,18 +2839,22 @@ pub async fn relay_upgrade_task(
     }
 
     // ReSTUN: periodically refresh NAT mapping (every ~25s, just under
-    // typical 30s NAT timeout).  Updates targets with any new addresses
-    // discovered on different ports (helps with symmetric NAT).
+    // typical 30s NAT timeout).  Uses a cancel channel so it stops when
+    // relay_upgrade_task finishes (avoids leaked tasks on reconnect).
     let last_stun = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let restun_targets: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (restun_stop_tx, mut restun_stop_rx) = oneshot::channel::<()>();
     {
         let socket = socket.clone();
         let restun_targets = restun_targets.clone();
         let last_stun = last_stun.clone();
         tokio::spawn(async move {
             loop {
-                hbb_common::tokio::time::sleep(Duration::from_secs(25)).await;
+                tokio::select! {
+                    _ = &mut restun_stop_rx => break,
+                    _ = hbb_common::tokio::time::sleep(Duration::from_secs(25)) => {},
+                }
                 match stun_query_with_socket(&socket).await {
                     Ok((new_addr, srv)) => {
                         log::info!("RelayUpgrade ReSTUN: mapped {} (via {})", new_addr, srv);
@@ -2906,9 +2910,8 @@ pub async fn relay_upgrade_task(
                 continue;
             }
 
-            // Send a burst of empty packets (increased 10→50, tighter 5ms spacing)
-            // to reliably punch through NAT and establish the mapping before KCP.
-            for _ in 0..50 {
+            // Send a burst of empty packets to establish NAT mapping before KCP.
+            for _ in 0..20 {
                 if started.elapsed() >= TOTAL_BUDGET {
                     return false;
                 }
@@ -2921,9 +2924,9 @@ pub async fn relay_upgrade_task(
             // If both call accept, no one initiates → deadlock.
             // Racing both eliminates this deadlock entirely.
             let socket_for_accept = socket.clone();
-            let mut connect_fut = Box::pin(KcpStream::connect(socket.clone(), Duration::from_secs(5)));
+            let mut connect_fut = Box::pin(KcpStream::connect(socket.clone(), Duration::from_secs(3)));
             let mut accept_fut = Box::pin(async move {
-                KcpStream::accept(socket_for_accept, Duration::from_secs(5), None)
+                KcpStream::accept(socket_for_accept, Duration::from_secs(3), None)
                     .await
             });
             let punched = tokio::select! {
@@ -2958,6 +2961,7 @@ pub async fn relay_upgrade_task(
             };
             if punched {
                 log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
+                drop(restun_stop_tx);
                 return true;
             }
         }
@@ -2985,6 +2989,7 @@ pub async fn relay_upgrade_task(
         }
     }
     log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
+    drop(restun_stop_tx);
     false
 }
 
@@ -3010,8 +3015,8 @@ pub async fn relay_phase3_punch_to_peer(
             bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
 
-        // Empty packet burst: 50 packets at 5ms spacing
-        for _ in 0..50 {
+        // Empty packet burst: 20 packets at 5ms spacing
+        for _ in 0..20 {
             socket.send(&[]).await.ok();
             hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -3019,9 +3024,9 @@ pub async fn relay_phase3_punch_to_peer(
         // Race KCP connect vs accept
         let socket_for_accept = socket.clone();
         let mut connect_fut = Box::pin(
-            KcpStream::connect(socket.clone(), Duration::from_secs(5)));
+            KcpStream::connect(socket.clone(), Duration::from_secs(3)));
         let mut accept_fut = Box::pin(async move {
-            KcpStream::accept(socket_for_accept, Duration::from_secs(5), None).await
+            KcpStream::accept(socket_for_accept, Duration::from_secs(3), None).await
         });
         let result = tokio::select! {
             res = &mut connect_fut => {
