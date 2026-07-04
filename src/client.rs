@@ -495,6 +495,7 @@ impl Client {
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             local_addrs: local_addrs.into_iter().collect(),
+            custom_tag: crate::CUSTOM_TAG.as_bytes().to_vec().into(),
             ..Default::default()
         });
         for i in 1..=3 {

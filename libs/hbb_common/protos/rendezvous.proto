@@ -29,6 +29,7 @@ message PunchHoleRequest {
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
   repeated bytes local_addrs = 11;
+  bytes custom_tag = 12;
 }
 
 message ControlPermissions {
@@ -59,6 +60,7 @@ message PunchHole {
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
   ControlPermissions control_permissions = 8;
+  bytes custom_tag = 9;
 }
 
 message TestNatRequest {
