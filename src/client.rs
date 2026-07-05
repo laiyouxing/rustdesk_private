@@ -411,7 +411,7 @@ impl Client {
         let mut socket = socket?;
         let my_addr = socket.local_addr();
         let mut signed_id_pk = Vec::new();
-        let mut relay_server = "".to_owned();
+        let relay_server = match rendezvous_server.rfind(':') { Some(pos) => format!("{}:{}", &rendezvous_server[..pos], RELAY_PORT), None => crate::check_port(rendezvous_server.clone(), RELAY_PORT), };
         let mut peer_addr = Config::get_any_listen_addr(true);
         let mut peer_addrs: Vec<SocketAddr> = Vec::new();
         let mut peer_nat_type = NatType::UNKNOWN_NAT;
