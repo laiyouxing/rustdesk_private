@@ -456,6 +456,17 @@ impl Client {
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
+        // Enumerate local non-loopback IPv4 addresses for VPN/LAN detection
+        let local_port = socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+        let mut local_addrs: Vec<Vec<u8>> = Vec::new();
+        for interface in default_net::get_interfaces() {
+            for ipv4 in &interface.ipv4 {
+                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
+                    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), local_port);
+                    local_addrs.push(AddrMangle::encode(addr).into());
+                }
+            }
+        }
         let mut msg_out = RendezvousMessage::new();
         // Send PunchHoleRequest to hbbs to obtain relay_server from response.
         // This is the same mechanism as original code — hbbs returns a PunchHole
@@ -468,6 +479,7 @@ impl Client {
             conn_type: conn_type.into(),
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
+            local_addrs: local_addrs.into(),
             ..Default::default()
         });
         if socket.send(&msg_out).await.is_ok() {
