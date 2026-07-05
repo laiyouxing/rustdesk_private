@@ -484,189 +484,27 @@ impl Client {
                 }
             }
         }
-        msg_out.set_punch_hole_request(PunchHoleRequest {
-            id: peer.to_owned(),
-            token: token.to_owned(),
-            nat_type: nat_type.into(),
-            licence_key: key.to_owned(),
-            conn_type: conn_type.into(),
-            version: crate::VERSION.to_owned(),
-            udp_port: udp_nat_port as _,
-            force_relay: interface.is_force_relay(),
-            socket_addr_v6: ipv6.1.unwrap_or_default(),
-            local_addrs: local_addrs.into_iter().collect(),
-            custom_tag: crate::CUSTOM_TAG.as_bytes().to_vec().into(),
-            ..Default::default()
-        });
-        for i in 1..=3 {
-            log::info!(
-                "#{} {} punch attempt with {}, id: {}",
-                i,
-                punch_type,
-                my_addr,
-                peer
-            );
-            socket.send(&msg_out).await?;
-            // below timeout should not bigger than hbbs's connection timeout.
-            if let Some(msg_in) =
-                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 3000)).await
-            {
-                match msg_in.union {
-                    Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
-                        if ph.socket_addr.is_empty() {
-                            if !ph.other_failure.is_empty() {
-                                bail!(ph.other_failure);
-                            }
-                            match ph.failure.enum_value() {
-                                Ok(punch_hole_response::Failure::ID_NOT_EXIST) => {
-                                    bail!("ID does not exist");
-                                }
-                                Ok(punch_hole_response::Failure::OFFLINE) => {
-                                    bail!("Remote desktop is offline");
-                                }
-                                Ok(punch_hole_response::Failure::LICENSE_MISMATCH) => {
-                                    bail!("Key mismatch");
-                                }
-                                Ok(punch_hole_response::Failure::LICENSE_OVERUSE) => {
-                                    bail!("Key overuse");
-                                }
-                                _ => bail!("other punch hole failure"),
-                            }
-                        } else {
-                            peer_nat_type = ph.nat_type();
-                            is_local = ph.is_local();
-                            signed_id_pk = ph.pk.into();
-                            relay_server = ph.relay_server;
-                            peer_addr = AddrMangle::decode(&ph.socket_addr);
-                            peer_addrs.clear();
-                            for addr_bytes in &ph.socket_addrs {
-                                let a = AddrMangle::decode(addr_bytes);
-                                if a.port() > 0 {
-                                    peer_addrs.push(a);
-                                }
-                            }
-                            feedback = ph.feedback;
-                            let s = udp.0.take();
-                            if ph.is_udp && s.is_some() {
-                                if let Some(s) = s {
-                                    allow_err!(s.connect(peer_addr).await);
-                                    udp.0 = Some(s);
-                                }
-                            }
-                            let s = ipv6.0.take();
-                            if !ph.socket_addr_v6.is_empty() && s.is_some() {
-                                let addr = AddrMangle::decode(&ph.socket_addr_v6);
-                                if addr.port() > 0 {
-                                    if let Some(s) = s {
-                                        allow_err!(s.connect(addr).await);
-                                        ipv6.0 = Some(s);
-                                    }
-                                }
-                            }
-                            log::info!("{} Hole Punched {} = {}", punch_type, peer, peer_addr);
-                            break;
-                        }
-                    }
-                    Some(rendezvous_message::Union::RelayResponse(rr)) => {
-                        log::info!(
-                            "relay requested from peer, time used: {:?}, relay_server: {}",
-                            start.elapsed(),
-                            rr.relay_server
-                        );
-                        // [Fix] assign relay_server from RelayResponse so it can be
-                        // displayed in the UI (io_loop uses it for set_connection_type)
-                        relay_server = rr.relay_server.clone();
-                        start = Instant::now();
-                        let mut connect_futures = Vec::new();
-                        if let Some(s) = ipv6.0 {
-                            let addr = AddrMangle::decode(&rr.socket_addr_v6);
-                            if addr.port() > 0 {
-                                if s.connect(addr).await.is_ok() {
-                                    connect_futures
-                                        .push(udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).boxed());
-                                }
-                            }
-                        }
-                        signed_id_pk = rr.pk().into();
-                        let fut = Self::create_relay(
-                            &peer,
-                            rr.uuid,
-                            rr.relay_server,
-                            &key,
-                            conn_type,
-                            my_addr.is_ipv4(),
-                        );
-                        connect_futures.push(
-                            async move {
-                                let conn = fut.await?;
-                                Ok((conn, None, if use_ws() { "WebSocket" } else { "Relay" }))
-                            }
-                            .boxed(),
-                        );
-                        // Run all connection attempts concurrently, return the first successful one
-                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
-                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-
-                            Err(e) => (Err(e), None, ""),
-                        };
-                        let mut conn = conn?;
-                        feedback = rr.feedback;
-                        log::info!("{:?} used to establish {typ} connection", start.elapsed());
-                        let pk =
-                            Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
-                        return Ok((
-                            (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
-                            false,
-                        ));
-                    }
-                    _ => {
-                        log::error!("Unexpected protobuf msg received: {:?}", msg_in);
-                    }
-                }
-            }
-        }
-        drop(socket);
-        if peer_addr.port() == 0 {
-            bail!("Failed to connect via rendezvous server");
-        }
-        let time_used = start.elapsed().as_millis() as u64;
-        log::info!(
-            "{} ms used to {} punch hole, relay_server: {}, {}",
-            time_used,
-            punch_type,
-            relay_server,
-            if is_local {
-                "is_local: true".to_owned()
-            } else {
-                format!("nat_type: {:?}", peer_nat_type)
-            }
-        );
-        Ok((
-            Self::connect(
-                my_addr,
-                peer_addr,
-                peer_addrs.clone(),
-                &peer,
-                signed_id_pk,
-                &relay_server,
-                &rendezvous_server,
-                time_used,
-                peer_nat_type,
-                my_nat_type,
-                is_local,
-                &key,
-                &token,
-                conn_type,
-                interface,
-                udp.0,
-                ipv6.0,
-                punch_type,
-            )
-            .await?,
-            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
-            true,
-        ))
+        // Skip direct punch, go directly to relay.
+        // Phase3/ReSTUN will attempt to upgrade to direct connection later.
+        let secure = !key.is_empty() && !token.is_empty();
+        let relay_conn = Self::request_relay(
+            peer,
+            relay_server.clone(),
+            &rendezvous_server,
+            secure,
+            key,
+            token,
+            conn_type,
+        )
+        .await?;
+        let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
+        let mut relay_conn = relay_conn;
+        let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut relay_conn).await?;
+        return Ok((
+            (relay_conn, false, pk, None, relay_type),
+            (String::new(), rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+            false,
+        ));
     }
 
     /// Connect to the peer.
