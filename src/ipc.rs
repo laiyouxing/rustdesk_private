@@ -260,6 +260,10 @@ pub enum Data {
     Config((String, Option<String>)),
     Options(Option<HashMap<String, String>>),
     NatType(Option<i32>),
+    PunchStatus {
+        status: String,
+        info: String,
+    },
     ConfirmedKey(Option<(Vec<u8>, Vec<u8>)>),
     RawMessage(Vec<u8>),
     Socks(Option<config::Socks5Server>),

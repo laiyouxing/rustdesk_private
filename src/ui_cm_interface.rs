@@ -614,6 +614,9 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 Data::FileTransferLog((action, log)) => {
                                     self.cm.ui_handler.file_transfer_log(&action, &log);
                                 }
+                                Data::PunchStatus { status, info } => {
+                                    self.cm.ui_handler.set_punch_status(self.conn_id, status, info);
+                                }
                                 #[cfg(target_os = "windows")]
                                 Data::ClipboardFile(_clip) => {
                                     let is_stopping_allowed = _clip.is_beginning_message();

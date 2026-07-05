@@ -597,6 +597,7 @@ impl Connection {
         // because the host also needs to exchange its public address.
         {
             let phase3_tx = phase3_out_tx;
+            let tx_to_cm = conn.tx_to_cm.clone();
             tokio::spawn(async move {
                 // 1. STUN to discover our public IPv4 address
                 if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
@@ -604,6 +605,15 @@ impl Connection {
                     match crate::common::stun_query_with_socket(&socket).await {
                         Ok((stun_addr, _)) => {
                             log::info!("Phase3(Host): our public address via STUN: {}", stun_addr);
+                            let nat = if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
+                                "symmetric_nat"
+                            } else {
+                                "cone_nat"
+                            };
+                            let _ = tx_to_cm.send(ipc::Data::PunchStatus {
+                                status: nat.to_owned(),
+                                info: stun_addr.to_string(),
+                            });
                             if phase3_tx.send(stun_addr).await.is_err() {
                                 log::info!("Phase3(Host): failed to send own address");
                             }
@@ -618,6 +628,10 @@ impl Connection {
                     // Ensure test_ipv6 has been called to populate the cache
                     crate::test_ipv6().await;
                     if let Some(ipv6_addr) = crate::common::get_cached_ipv6_addr() {
+                        let _ = tx_to_cm.send(ipc::Data::PunchStatus {
+                            status: "cone_nat".to_owned(),
+                            info: ipv6_addr.to_string(),
+                        });
                         let _ = phase3_tx.send(ipv6_addr).await;
                         log::info!("Phase3(Host): sent IPv6 address to peer: {}", ipv6_addr);
                     }
