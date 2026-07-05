@@ -313,6 +313,7 @@ impl RendezvousMediator {
                 let peer_addr_bytes = ph.socket_addr.clone();
                 let provided_relay_server = ph.relay_server.clone();
                 let relay_server = self.get_relay_server(provided_relay_server);
+                let punch_nat_type = ph.nat_type;
                 tokio::spawn(async move {
                     if let Ok(mut socket) = hbb_common::socket_client::connect_tcp(
                         host.clone(), CONNECT_TIMEOUT
@@ -324,8 +325,7 @@ impl RendezvousMediator {
                                 socket_addr: peer_addr_bytes,
                                 id: Config::get_id(),
                                 relay_server,
-                                nat_type: NatType::from_i32(crate::get_nat_type(0).await)
-                                    .unwrap_or(NatType::UNKNOWN_NAT).into(),
+                                nat_type: punch_nat_type,
                                 version: crate::VERSION.to_owned(),
                                 ..Default::default()
                             });

@@ -502,8 +502,8 @@ impl Client {
                                 _ => bail!("other punch hole failure"),
                             }
                         } else {
-                            relay_server = ph.relay_server;
                             peer_nat_type = ph.nat_type();
+                            relay_server = ph.relay_server;
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
