@@ -473,6 +473,14 @@ impl Client {
         if socket.send(&msg_out).await.is_ok() {
             if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(3000)).await {
                 match msg_in.union {
+                    Some(rendezvous_message::Union::PunchHole(ph)) => {
+                        // Non-LAN path: hbbs returns PunchHole with relay_server
+                        relay_server = ph.relay_server;
+                        peer_nat_type = ph.nat_type();
+                        peer_addr = AddrMangle::decode(&ph.socket_addr);
+                        log::info!("Got PunchHole from hbbs: relay_server={}, peer_addr={}",
+                            relay_server, peer_addr);
+                    }
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
                         if ph.socket_addr.is_empty() {
                             if !ph.other_failure.is_empty() {
