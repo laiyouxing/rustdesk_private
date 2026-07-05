@@ -598,13 +598,12 @@ impl Connection {
         {
             let phase3_tx = phase3_out_tx;
             tokio::spawn(async move {
-                // 1. STUN to discover our public address
+                // 1. STUN to discover our public IPv4 address
                 if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                     let socket = Arc::new(socket);
                     match crate::common::stun_query_with_socket(&socket).await {
                         Ok((stun_addr, _)) => {
                             log::info!("Phase3(Host): our public address via STUN: {}", stun_addr);
-                            // 2. Send address to io_loop which will forward it to peer via relay
                             if phase3_tx.send(stun_addr).await.is_err() {
                                 log::info!("Phase3(Host): failed to send own address");
                             }
@@ -612,6 +611,15 @@ impl Connection {
                         Err(e) => {
                             log::info!("Phase3(Host): STUN failed: {:?}", e);
                         }
+                    }
+                }
+                // 2. Also send IPv6 address if available (for dual-stack peers)
+                if crate::get_ipv6_punch_enabled() {
+                    // Ensure test_ipv6 has been called to populate the cache
+                    crate::test_ipv6().await;
+                    if let Some(ipv6_addr) = crate::common::get_cached_ipv6_addr() {
+                        let _ = phase3_tx.send(ipv6_addr).await;
+                        log::info!("Phase3(Host): sent IPv6 address to peer: {}", ipv6_addr);
                     }
                 }
             });

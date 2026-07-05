@@ -474,7 +474,7 @@ impl Client {
         let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut relay_conn).await?;
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (String::new(), rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
             false,
         ));
     }

@@ -2868,28 +2868,35 @@ pub async fn relay_upgrade_task(
     // Brief initial wait for relay to stabilize (reduced from 2s→0.5s)
     hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Create ONE persistent socket for all rounds.
-    let socket = {
+    // Create persistent sockets for all rounds.
+    let socket_v4 = {
         let bind_addr = if punch_port > 0 {
             SocketAddr::from(([0u8; 4], punch_port))
         } else {
             SocketAddr::from(([0u8; 4], 0))
         };
         match UdpSocket::bind(bind_addr).await {
-            Ok(s) => Arc::new(s),
-            Err(_) if punch_port > 0 => match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(s) => Arc::new(s),
-                Err(_) => {
-                    log::info!("RelayUpgrade: failed to create socket, giving up");
-                    return false;
-                }
-            },
-            Err(_) => {
-                log::info!("RelayUpgrade: failed to create socket, giving up");
-                return false;
-            }
+            Ok(s) => Some(Arc::new(s)),
+            Err(_) if punch_port > 0 => UdpSocket::bind("0.0.0.0:0").await.ok().map(Arc::new),
+            Err(_) => None,
         }
     };
+    let socket_v4 = match socket_v4 {
+        Some(s) => s,
+        None => {
+            log::info!("RelayUpgrade: failed to create IPv4 socket, giving up");
+            return false;
+        }
+    };
+    let socket = socket_v4.clone();
+    // Also create IPv6 socket for dual-stack punching (best-effort)
+    let socket_v6 = UdpSocket::bind(SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16)))
+        .await
+        .ok()
+        .map(Arc::new);
+    if socket_v6.is_some() {
+        log::info!("RelayUpgrade: created IPv6 socket for dual-stack punching");
+    }
 
     // Multi-STUN: query multiple times to detect port increment pattern
     // for Symmetric NAT (NAT3/NAT4) port prediction.
@@ -2942,12 +2949,9 @@ pub async fn relay_upgrade_task(
     }
     // Also send IPv6 address if available (for dual-stack peers)
     if crate::get_ipv6_punch_enabled() {
-        if let Some((_socket, ipv6_bytes)) = crate::get_ipv6_socket().await {
-            if !ipv6_bytes.is_empty() {
-                let ipv6_addr: std::net::SocketAddr = hbb_common::AddrMangle::decode(&ipv6_bytes);
-                let _ = phase3_out_tx.try_send(ipv6_addr);
-                log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
-            }
+        if let Some(ipv6_addr) = get_cached_ipv6_addr() {
+            let _ = phase3_out_tx.try_send(ipv6_addr);
+            log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
         }
     }
     for _round in 0..10 {
@@ -2986,11 +2990,19 @@ pub async fn relay_upgrade_task(
                     addr, PORT_SCAN_RANGE as u32 * 2, PORT_SCAN_RANGE);
             }
         }
-        // Try each target address with the SAME socket
+        // Try each target address, picking the right socket for its address family
         for &target in &targets {
             if started.elapsed() >= TOTAL_BUDGET {
                 return false;
             }
+            let socket = if target.is_ipv6() {
+                match socket_v6.as_ref() {
+                    Some(s) => s.clone(),
+                    None => continue, // no IPv6 socket available, skip IPv6 targets
+                }
+            } else {
+                socket_v4.clone()
+            };
             if socket.connect(target).await.is_err() {
                 continue;
             }
@@ -3102,7 +3114,12 @@ pub async fn relay_phase3_punch_to_peer(
 ) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let bind_addr = if peer_addr.is_ipv6() {
+        SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16)) // [::]:0
+    } else {
+        SocketAddr::from(([0u8; 4], 0u16)) // 0.0.0.0:0
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
     let socket = Arc::new(socket);
 
     const MAX_TIME: Duration = Duration::from_secs(30);
@@ -3327,6 +3344,12 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
         }
     }
     None
+}
+
+/// Returns the cached public IPv6 address without creating a new socket.
+/// The address was previously discovered by test_ipv6() (via local binding or STUN).
+pub fn get_cached_ipv6_addr() -> Option<SocketAddr> {
+    PUBLIC_IPV6_ADDR.lock().unwrap().0
 }
 
 // The color is the same to `str2color()` in flutter.
