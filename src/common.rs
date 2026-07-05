@@ -2991,55 +2991,6 @@ pub async fn relay_upgrade_task(
         }
     }
 
-    // ReSTUN: periodically refresh NAT mapping (every ~25s, just under
-    // typical 30s NAT timeout).  Uses a **dedicated** UDP socket so it is
-    // NOT affected by socket.connect() calls in the punch loop below
-    // (the punch loop uses socket.connect() which changes the remote
-    // endpoint, causing recv_from to filter out STUN responses).
-    let last_stun = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-    let (restun_stop_tx, mut restun_stop_rx) = oneshot::channel::<()>();
-    {
-        let last_stun = last_stun.clone();
-        let phase3_out_tx = phase3_out_tx.clone(); // Clone for ReSTUN to send new addresses to peer
-        tokio::spawn(async move {
-            // Bind a separate UDP socket for ReSTUN to avoid interference
-            // from the main punch socket (which gets connect()-ed).
-            let restun_socket = match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(s) => Arc::new(s),
-                Err(_) => {
-                    log::warn!("ReSTUN: failed to create socket, skipping");
-                    return;
-                }
-            };
-            loop {
-                tokio::select! {
-                    _ = &mut restun_stop_rx => break,
-                    _ = hbb_common::tokio::time::sleep(Duration::from_secs(25)) => {},
-                }
-                match stun_query_with_socket(&restun_socket).await {
-                    Ok((new_addr, srv)) => {
-                        log::info!("RelayUpgrade ReSTUN: mapped {} (via {})", new_addr, srv);
-                        // Send new address to peer through Phase3 relay, so the peer
-                        // can update its targets with the new NAT mapping.
-                        let _ = phase3_out_tx.try_send(new_addr);
-                        if let Ok(mut public) = PUBLIC_ADDR.lock() {
-                            *public = new_addr.to_string();
-                        }
-                        *last_stun.lock().unwrap() = std::time::Instant::now();
-                    }
-                    Err(e) => {
-                        log::debug!("ReSTUN failed: {:?}", e);
-                    }
-                }
-            }
-        });
-    }
-    // Note: ReSTUN-discovered addresses are forwarded to the peer via Phase3 relay.
-    // The peer will add them to its own targets and try to connect.
-    // On our side, we don't add them to local targets because the ReSTUN socket is
-    // different from the main punch socket - using its address locally would connect
-    // to ourselves (main socket → our own ReSTUN port → fails).
-
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
@@ -3136,7 +3087,6 @@ pub async fn relay_upgrade_task(
             };
             if punched {
                 log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
-                drop(restun_stop_tx);
                 return true;
             }
         }
@@ -3180,7 +3130,6 @@ pub async fn relay_upgrade_task(
         }
     }
     log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
-    drop(restun_stop_tx);
     false
 }
 
