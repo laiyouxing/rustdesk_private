@@ -2822,22 +2822,53 @@ pub async fn relay_upgrade_task(
         }
     };
 
-    // Do STUN ONCE per socket to discover the NAT-mapped address.
+    // Multi-STUN: query multiple times to detect port increment pattern
+    // for Symmetric NAT (NAT3/NAT4) port prediction.
     let mut targets = peer_addrs.clone();
     let mut our_addr: Option<std::net::SocketAddr> = None;
-    match stun_query_with_socket(&socket).await {
-        Ok((stun_addr, stun_srv)) => {
-            log::info!("RelayUpgrade STUN: mapped {} (via {})", stun_addr, stun_srv);
-            our_addr = Some(stun_addr);
-            if !targets.contains(&stun_addr) {
-                targets.push(stun_addr);
+    let mut stun_predicted_port: Option<u16> = None;
+    let mut stun_delta: i32 = 0;
+    let mut stun_ports: Vec<u16> = Vec::new();
+
+    for _ in 0..5 {
+        match stun_query_with_socket(&socket).await {
+            Ok((addr, _)) => {
+                let port = addr.port();
+                if our_addr.is_none() {
+                    our_addr = Some(addr);
+                    log::info!("RelayUpgrade STUN: mapped {} (port {})", addr, port);
+                    if !targets.contains(&addr) {
+                        targets.push(addr);
+                    }
+                    if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                        *public = addr.to_string();
+                    }
+                }
+                stun_ports.push(port);
+                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            if let Ok(mut public) = PUBLIC_ADDR.lock() {
-                *public = stun_addr.to_string();
-            }
+            Err(_) => break,
         }
-        Err(e) => {
-            log::info!("RelayUpgrade STUN failed: {:?}", e);
+    }
+
+    // Calculate port delta from the STUN sequence
+    if stun_ports.len() >= 3 {
+        let mut deltas: Vec<i32> = Vec::new();
+        for i in 1..stun_ports.len() {
+            deltas.push(stun_ports[i] as i32 - stun_ports[i - 1] as i32);
+        }
+        if !deltas.is_empty() {
+            stun_delta = deltas.iter().sum::<i32>() / deltas.len() as i32;
+            if stun_delta != 0 && stun_delta.abs() <= 10 {
+                let last = stun_ports[stun_ports.len() - 1];
+                stun_predicted_port = Some((last as i32 + stun_delta) as u16);
+                log::info!(
+                    "RelayUpgrade: STUN delta={}, predicted next port={} (from {:?})",
+                    stun_delta,
+                    stun_predicted_port.unwrap(),
+                    stun_ports
+                );
+            }
         }
     }
 
@@ -2845,6 +2876,33 @@ pub async fn relay_upgrade_task(
     if let Some(addr) = our_addr {
         let _ = phase3_out_tx.try_send(addr);
         log::info!("Phase3: sent our address to relay loop: {}", addr);
+    }
+    // Add predicted port to targets for direct try (narrow scan)
+    if let Some(predicted) = stun_predicted_port {
+        if let Some(base) = our_addr {
+            let mut predicted_addr = base;
+            predicted_addr.set_port(predicted);
+            if !targets.contains(&predicted_addr) {
+                targets.push(predicted_addr);
+            }
+            // Narrow scan around predicted port (use delta's abs, max 3)
+            let scan_max = std::cmp::min(3u32, stun_delta.unsigned_abs());
+            for offset in 1..=scan_max {
+                let ports = [
+                    predicted.wrapping_add(offset),
+                    predicted.wrapping_sub(offset),
+                ];
+                for &p in &ports {
+                    if p > 0 {
+                        let mut scan_addr = base;
+                        scan_addr.set_port(p);
+                        if !targets.contains(&scan_addr) {
+                            targets.push(scan_addr);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ReSTUN: periodically refresh NAT mapping (every ~25s, just under
