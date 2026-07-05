@@ -503,11 +503,12 @@ impl Client {
                             }
                         } else {
                             peer_nat_type = ph.nat_type();
-                            relay_server = ph.relay_server;
                             is_local = ph.is_local();
-                            signed_id_pk = ph.pk.into();
-                            peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
+                            peer_addr = AddrMangle::decode(&ph.socket_addr);
+                            // Moves must come after all borrows
+                            signed_id_pk = ph.pk.into();
+                            relay_server = ph.relay_server;
                             log::info!("Got PunchHoleResponse from hbbs: relay_server={}, is_local={}, peer_addr={}",
                                 relay_server, is_local, peer_addr);
 
