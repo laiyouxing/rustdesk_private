@@ -2789,6 +2789,11 @@ pub async fn relay_upgrade_task(
     }
 
     const TOTAL_BUDGET: Duration = Duration::from_secs(30);
+    // Port scan range for Symmetric NAT blind scanning.
+    // Symmetric NAT assigns a different port for each destination.
+    // The port typically increments by 1-5 per connection.
+    // Scanning ±10 ports covers most real-world cases.
+    const PORT_SCAN_RANGE: u16 = 10;
     let started = std::time::Instant::now();
 
     // Brief initial wait for relay to stabilize (reduced from 2s→0.5s)
@@ -2903,6 +2908,27 @@ pub async fn relay_upgrade_task(
                     targets.push(addr);
                     log::info!("Phase3: added peer address {} to targets", addr);
                 }
+                // For Symmetric NAT, add port range for blind scanning.
+                // The peer's NAT may map a different port for our connection vs STUN.
+                // Try a range around the reported port to cover this delta.
+                let base_port = addr.port();
+                for offset in 1..=PORT_SCAN_RANGE {
+                    let ports = [
+                        base_port.wrapping_add(offset),
+                        base_port.wrapping_sub(offset),
+                    ];
+                    for &p in &ports {
+                        if p > 0 && p != base_port {
+                            let mut scan_addr = addr;
+                            scan_addr.set_port(p);
+                            if !targets.contains(&scan_addr) {
+                                targets.push(scan_addr);
+                            }
+                        }
+                    }
+                }
+                log::info!("Phase3: expanded {} with {} port scan targets (range ±{})",
+                    addr, PORT_SCAN_RANGE as u32 * 2, PORT_SCAN_RANGE);
             }
         }
         // Check for ReSTUN-discovered addresses (NAT re-mapping)
@@ -2998,6 +3024,22 @@ pub async fn relay_upgrade_task(
                 if !targets.contains(&addr) {
                     targets.push(addr);
                     log::info!("Phase3: added peer address {} to targets (during gap)", addr);
+                }
+                let base_port = addr.port();
+                for offset in 1..=PORT_SCAN_RANGE {
+                    let ports = [
+                        base_port.wrapping_add(offset),
+                        base_port.wrapping_sub(offset),
+                    ];
+                    for &p in &ports {
+                        if p > 0 && p != base_port {
+                            let mut scan_addr = addr;
+                            scan_addr.set_port(p);
+                            if !targets.contains(&scan_addr) {
+                                targets.push(scan_addr);
+                            }
+                        }
+                    }
                 }
             }
         }
