@@ -196,6 +196,8 @@ pub trait InvokeUiCM: Send + Clone + 'static + Sized {
     fn update_voice_call_state(&self, client: &Client);
 
     fn file_transfer_log(&self, action: &str, log: &str);
+
+    fn set_punch_status(&self, id: i32, status: String, info: String);
 }
 
 impl<T: InvokeUiCM> Deref for ConnectionManager<T> {

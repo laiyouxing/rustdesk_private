@@ -73,6 +73,10 @@ impl InvokeUiCM for SciterHandler {
     }
 
     fn file_transfer_log(&self, _action: &str, _log: &str) {}
+
+    fn set_punch_status(&self, id: i32, status: String, info: String) {
+        self.call("setPunchStatus", &make_args!(id, status, info));
+    }
 }
 
 impl SciterHandler {

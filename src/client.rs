@@ -457,7 +457,7 @@ impl Client {
         stop_udp_tx.map(|tx| tx.send(()));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
         // Enumerate local non-loopback IPv4 addresses for VPN/LAN detection
-        let local_port = socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+        let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let mut local_addrs: Vec<Vec<u8>> = Vec::new();
         for interface in default_net::get_interfaces() {
             for ipv4 in &interface.ipv4 {
@@ -479,7 +479,7 @@ impl Client {
             conn_type: conn_type.into(),
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
-            local_addrs: local_addrs.into(),
+            local_addrs: local_addrs.into_iter().map(|v| v.into()).collect(),
             ..Default::default()
         });
         if socket.send(&msg_out).await.is_ok() {
