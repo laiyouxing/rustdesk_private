@@ -323,7 +323,13 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = punch_done.notified() => {
-                            if !punch_success.load(std::sync::atomic::Ordering::SeqCst) {
+                            if punch_success.load(std::sync::atomic::Ordering::SeqCst) {
+                                let mut guard = punch_stream.lock().await;
+                                if let Some(new_stream) = guard.take() {
+                                    log::info!("RelayUpgrade: punch succeeded, replacing relay stream");
+                                    peer = new_stream;
+                                }
+                            } else {
                                 log::info!("RelayUpgrade: punch failed, staying on relay");
                                 self.handler.set_punch_status("failed", "");
                             }
