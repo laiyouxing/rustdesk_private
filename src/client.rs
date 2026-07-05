@@ -411,7 +411,7 @@ impl Client {
         let mut socket = socket?;
         let my_addr = socket.local_addr();
         let mut signed_id_pk = Vec::new();
-        let relay_server = match rendezvous_server.rfind(':') { Some(pos) => format!("{}:{}", &rendezvous_server[..pos], RELAY_PORT), None => crate::check_port(rendezvous_server.clone(), RELAY_PORT), };
+        let mut relay_server = "".to_owned();
         let mut peer_addr = Config::get_any_listen_addr(true);
         let mut peer_addrs: Vec<SocketAddr> = Vec::new();
         let mut peer_nat_type = NatType::UNKNOWN_NAT;
@@ -456,7 +456,28 @@ impl Client {
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
-        // Skip direct punch, go directly to relay.
+        let mut msg_out = RendezvousMessage::new();
+        // Send PunchHoleRequest to hbbs to obtain relay_server from response.
+        // This is the same mechanism as original code — hbbs returns a PunchHole
+        // message containing the assigned relay server address.
+        let _ = msg_out.set_punch_hole_request(PunchHoleRequest {
+            id: peer.to_owned(),
+            token: token.to_owned(),
+            nat_type: nat_type.into(),
+            licence_key: key.to_owned(),
+            conn_type: conn_type.into(),
+            udp_port: udp_nat_port as _,
+            force_relay: interface.is_force_relay(),
+            ..Default::default()
+        });
+        if socket.send(&msg_out).await.is_ok() {
+            if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(3000)).await {
+                if let Some(rendezvous_message::Union::PunchHole(ph)) = msg_in.union {
+                    relay_server = ph.relay_server;
+                    log::info!("Got relay server from hbbs: {}", relay_server);
+                }
+            }
+        }
         // Phase3/ReSTUN will attempt to upgrade to direct connection later.
         let secure = !key.is_empty() && !token.is_empty();
         let relay_conn = Self::request_relay(
