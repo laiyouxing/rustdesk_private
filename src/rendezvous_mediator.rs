@@ -305,12 +305,12 @@ impl RendezvousMediator {
                     log::info!("keep_alive: {}ms", self.keep_alive);
                 }
             }
-            Some(rendezvous_message::Union::PunchHole(ph)) => {
-                let rz = self.clone();
-                let server = server.clone();
-                tokio::spawn(async move {
-                    allow_err!(rz.handle_punch_hole(ph, server).await);
-                });
+            Some(rendezvous_message::Union::PunchHole(_ph)) => {
+                // PunchHole is no longer used — the controller now connects directly
+                // via relay (request_relay) and post-relay Phase3 upgrade handles
+                // the direct connection. The old PunchHole path (pre-connect punch
+                // + handle_punch_hole) has been removed from the controller side.
+                log::debug!("Ignored PunchHole (all connections go through relay first)");
             }
             Some(rendezvous_message::Union::RequestRelay(rr)) => {
                 let rz = self.clone();
