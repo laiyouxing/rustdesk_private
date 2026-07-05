@@ -915,7 +915,6 @@ impl Connection {
                     let mut misc = Misc::new();
                     let mut ppa = PunchPeerAddr::new();
                     ppa.addr = phase3_my_addr.to_string().into();
-                    ppa.udp_port = phase3_my_addr.port() as u32;
                     misc.set_punch_peer_addr(ppa);
                     let mut msg = Message::new();
                     msg.set_misc(misc);
