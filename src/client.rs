@@ -473,40 +473,52 @@ impl Client {
         if socket.send(&msg_out).await.is_ok() {
             if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(3000)).await {
                 match msg_in.union {
-                    Some(rendezvous_message::Union::PunchHole(ph)) => {
-                        relay_server = ph.relay_server;
-                        peer_nat_type = ph.nat_type();
-                        is_local = ph.is_local();
-                        signed_id_pk = ph.pk.into();
-                        peer_addr = AddrMangle::decode(&ph.socket_addr);
-                        feedback = ph.feedback;
-                        log::info!("Got PunchHole from hbbs: relay_server={}, is_local={}, peer_addr={}",
-                            relay_server, is_local, peer_addr);
-                    }
-                    _ => {}
-                }
-            }
-            // If same_intranet, also read PunchHoleResponse with host's LAN addresses
-            if is_local {
-                for _ in 0..5 {
-                    if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(500)).await {
-                        match msg_in.union {
-                            Some(rendezvous_message::Union::PunchHoleResponse(phr)) if phr.is_local() => {
-                                let lan_addrs: Vec<SocketAddr> = phr.socket_addrs
+                    Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
+                        if ph.socket_addr.is_empty() {
+                            if !ph.other_failure.is_empty() {
+                                bail!(ph.other_failure);
+                            }
+                            match ph.failure.enum_value() {
+                                Ok(punch_hole_response::Failure::ID_NOT_EXIST) => {
+                                    bail!("ID does not exist");
+                                }
+                                Ok(punch_hole_response::Failure::OFFLINE) => {
+                                    bail!("Remote desktop is offline");
+                                }
+                                Ok(punch_hole_response::Failure::LICENSE_MISMATCH) => {
+                                    bail!("Key mismatch");
+                                }
+                                Ok(punch_hole_response::Failure::LICENSE_OVERUSE) => {
+                                    bail!("Key overuse");
+                                }
+                                _ => bail!("other punch hole failure"),
+                            }
+                        } else {
+                            relay_server = ph.relay_server;
+                            peer_nat_type = ph.nat_type();
+                            is_local = ph.is_local();
+                            signed_id_pk = ph.pk.into();
+                            peer_addr = AddrMangle::decode(&ph.socket_addr);
+                            feedback = ph.feedback;
+                            log::info!("Got PunchHoleResponse from hbbs: relay_server={}, is_local={}, peer_addr={}",
+                                relay_server, is_local, peer_addr);
+
+                            // If same_intranet, try host's LAN addresses first
+                            if is_local {
+                                let lan_addrs: Vec<SocketAddr> = ph.socket_addrs
                                     .iter()
                                     .filter_map(|b| {
                                         let addr = AddrMangle::decode(b);
                                         if addr.port() > 0 { Some(addr) } else { None }
                                     })
                                     .collect();
-                                log::info!("Got host LAN addresses: {:?}", lan_addrs);
-                                // Try each LAN address, use the first that connects
+                                log::info!("Host LAN addresses: {:?}", lan_addrs);
                                 for &lan_addr in &lan_addrs {
-                                    if let Ok(lan_stream) = hbb_common::socket_client::connect_tcp(
+                                    if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
                                         lan_addr, 3000
                                     ).await {
                                         log::info!("LAN direct connection to {} succeeded!", lan_addr);
-                                        let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut lan_stream).await?;
+                                        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut lan_stream).await?;
                                         return Ok((
                                             (lan_stream, true, pk, None, "LAN"),
                                             (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
@@ -515,13 +527,10 @@ impl Client {
                                     }
                                 }
                                 log::info!("All LAN addresses failed, falling back to relay");
-                                break;
                             }
-                            _ => break,
                         }
-                    } else {
-                        break;
                     }
+                    _ => {}
                 }
             }
         }
