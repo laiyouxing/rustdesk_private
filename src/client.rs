@@ -455,15 +455,6 @@ impl Client {
         }
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
-        let _ipv6 = if crate::get_ipv6_punch_enabled() {
-            if let Some((socket, addr)) = crate::get_ipv6_socket().await {
-                (Some(socket), Some(addr))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
         // Skip direct punch, go directly to relay.
         // Phase3/ReSTUN will attempt to upgrade to direct connection later.

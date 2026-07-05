@@ -2940,6 +2940,16 @@ pub async fn relay_upgrade_task(
         let _ = phase3_out_tx.try_send(addr);
         log::info!("Phase3: sent our address to relay loop: {}", addr);
     }
+    // Also send IPv6 address if available (for dual-stack peers)
+    if crate::get_ipv6_punch_enabled() {
+        if let Some((_socket, ipv6_bytes)) = crate::get_ipv6_socket().await {
+            if !ipv6_bytes.is_empty() {
+                let ipv6_addr: std::net::SocketAddr = hbb_common::AddrMangle::decode(&ipv6_bytes);
+                let _ = phase3_out_tx.try_send(ipv6_addr);
+                log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
+            }
+        }
+    }
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
