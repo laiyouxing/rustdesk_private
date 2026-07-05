@@ -3061,57 +3061,76 @@ pub async fn relay_phase3_punch_to_peer(
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let socket = Arc::new(socket);
-    socket.connect(peer_addr).await?;
 
     const MAX_TIME: Duration = Duration::from_secs(30);
+    const SCAN_RANGE: u16 = 10;
     let started = std::time::Instant::now();
 
-    for _round in 0..5 {
+    for round in 0..5 {
         if started.elapsed() >= MAX_TIME {
             bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
 
-        // Empty packet burst: 20 packets at 5ms spacing
-        for _ in 0..20 {
-            socket.send(&[]).await.ok();
-            hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        // Race KCP connect vs accept
-        let socket_for_accept = socket.clone();
-        let mut connect_fut = Box::pin(
-            KcpStream::connect(socket.clone(), Duration::from_secs(3)));
-        let mut accept_fut = Box::pin(async move {
-            KcpStream::accept(socket_for_accept, Duration::from_secs(3), None).await
-        });
-        let result = tokio::select! {
-            res = &mut connect_fut => {
-                match res {
-                    Ok((kcp, stream)) => {
-                        if let Ok(mut h) = kcp_handle.lock() {
-                            *h = Some(kcp);
-                        }
-                        log::info!("Phase3(Host) succeeded via connect after {:?}", started.elapsed());
-                        Some(stream)
-                    }
-                    Err(_) => None,
-                }
-            }
-            res = &mut accept_fut => {
-                match res {
-                    Ok((kcp, stream)) => {
-                        if let Ok(mut h) = kcp_handle.lock() {
-                            *h = Some(kcp);
-                        }
-                        log::info!("Phase3(Host) succeeded via accept after {:?}", started.elapsed());
-                        Some(stream)
-                    }
-                    Err(_) => None,
-                }
-            }
+        // For Symmetric NAT, try different port offsets in each round
+        let port_offsets: &[i16] = if round == 0 {
+            &[0]
+        } else {
+            &[0, 1, -1, 2, -2, 3, -3, 5, -5, SCAN_RANGE as i16, -(SCAN_RANGE as i16)]
         };
-        if let Some(stream) = result {
-            return Ok(stream);
+
+        for &offset in port_offsets {
+            if started.elapsed() >= MAX_TIME {
+                bail!("Phase3(Host) punch timed out");
+            }
+            let mut target = peer_addr;
+            let new_port = (target.port() as i32 + offset as i32) as u16;
+            if new_port == 0 { continue; }
+            target.set_port(new_port);
+
+            if socket.connect(target).await.is_err() { continue; }
+
+            // Empty packet burst: 20 packets at 5ms spacing
+            for _ in 0..20 {
+                socket.send(&[]).await.ok();
+                hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            // Race KCP connect vs accept
+            let socket_for_accept = socket.clone();
+            let mut connect_fut = Box::pin(
+                KcpStream::connect(socket.clone(), Duration::from_secs(3)));
+            let mut accept_fut = Box::pin(async move {
+                KcpStream::accept(socket_for_accept, Duration::from_secs(3), None).await
+            });
+            let result = tokio::select! {
+                res = &mut connect_fut => {
+                    match res {
+                        Ok((kcp, stream)) => {
+                            if let Ok(mut h) = kcp_handle.lock() {
+                                *h = Some(kcp);
+                            }
+                            log::info!("Phase3(Host) succeeded via connect after {:?}", started.elapsed());
+                            Some(stream)
+                        }
+                        Err(_) => None,
+                    }
+                }
+                res = &mut accept_fut => {
+                    match res {
+                        Ok((kcp, stream)) => {
+                            if let Ok(mut h) = kcp_handle.lock() {
+                                *h = Some(kcp);
+                            }
+                            log::info!("Phase3(Host) succeeded via accept after {:?}", started.elapsed());
+                            Some(stream)
+                        }
+                        Err(_) => None,
+                    }
+                }
+            };
+            if let Some(stream) = result {
+                return Ok(stream);
+            }
         }
 
         // Keep-alive during gap
