@@ -483,10 +483,10 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ always() && !failure() && inputs.include-ios && inputs.upload-artifact }}
+    if: ${{ inputs.include-ios && inputs.upload-artifact }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
-    needs: [generate-bridge, build-for-windows-flutter]
+    needs: [generate-bridge]
     strategy:
       fail-fast: false
       matrix:
@@ -603,10 +603,10 @@ jobs:
 
 
   build-for-macOS:
-    if: ${{ always() && !failure() && inputs.include-macos }}
+    if: ${{ inputs.include-macos }}
     name: ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
-    needs: [generate-bridge, build-for-windows-flutter]
+    needs: [generate-bridge]
     strategy:
       fail-fast: false
       matrix:
@@ -865,8 +865,8 @@ jobs:
           files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
 
   build-rustdesk-android:
-    if: ${{ always() && !failure() && inputs.include-android }}
-    needs: [generate-bridge, build-for-windows-flutter]
+    if: ${{ inputs.include-android }}
+    needs: [generate-bridge]
     name: build rustdesk android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     strategy:
@@ -1342,8 +1342,8 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
-    if: ${{ always() && !failure() && inputs.include-linux }}
-    needs: [generate-bridge, build-for-windows-flutter]
+    if: ${{ inputs.include-linux }}
+    needs: [generate-bridge]
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
     strategy:
