@@ -486,6 +486,44 @@ impl Client {
                     _ => {}
                 }
             }
+            // If same_intranet, also read PunchHoleResponse with host's LAN addresses
+            if is_local {
+                for _ in 0..5 {
+                    if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(500)).await {
+                        match msg_in.union {
+                            Some(rendezvous_message::Union::PunchHoleResponse(phr)) if phr.is_local() => {
+                                let lan_addrs: Vec<SocketAddr> = phr.socket_addrs
+                                    .iter()
+                                    .filter_map(|b| {
+                                        let addr = AddrMangle::decode(b);
+                                        if addr.port() > 0 { Some(addr) } else { None }
+                                    })
+                                    .collect();
+                                log::info!("Got host LAN addresses: {:?}", lan_addrs);
+                                // Try each LAN address, use the first that connects
+                                for &lan_addr in &lan_addrs {
+                                    if let Ok(lan_stream) = hbb_common::socket_client::connect_tcp(
+                                        lan_addr, 3000
+                                    ).await {
+                                        log::info!("LAN direct connection to {} succeeded!", lan_addr);
+                                        let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut lan_stream).await?;
+                                        return Ok((
+                                            (lan_stream, true, pk, None, "LAN"),
+                                            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+                                            false,
+                                        ));
+                                    }
+                                }
+                                log::info!("All LAN addresses failed, falling back to relay");
+                                break;
+                            }
+                            _ => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
         // Phase3/ReSTUN will attempt to upgrade to direct connection later.
         let secure = !key.is_empty() && !token.is_empty();
