@@ -460,12 +460,12 @@ impl Client {
         // Phase3/ReSTUN will attempt to upgrade to direct connection later.
         let secure = !key.is_empty() && !token.is_empty();
         let relay_conn = Self::request_relay(
-            peer,
+            &peer,
             relay_server.clone(),
             &rendezvous_server,
             secure,
-            key,
-            token,
+            &key,
+            &token,
             conn_type,
         )
         .await?;
