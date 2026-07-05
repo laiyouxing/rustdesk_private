@@ -472,9 +472,18 @@ impl Client {
         });
         if socket.send(&msg_out).await.is_ok() {
             if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(3000)).await {
-                if let Some(rendezvous_message::Union::PunchHole(ph)) = msg_in.union {
-                    relay_server = ph.relay_server;
-                    log::info!("Got relay server from hbbs: {}", relay_server);
+                match msg_in.union {
+                    Some(rendezvous_message::Union::PunchHole(ph)) => {
+                        relay_server = ph.relay_server;
+                        peer_nat_type = ph.nat_type();
+                        is_local = ph.is_local();
+                        signed_id_pk = ph.pk.into();
+                        peer_addr = AddrMangle::decode(&ph.socket_addr);
+                        feedback = ph.feedback;
+                        log::info!("Got PunchHole from hbbs: relay_server={}, is_local={}, peer_addr={}",
+                            relay_server, is_local, peer_addr);
+                    }
+                    _ => {}
                 }
             }
         }
