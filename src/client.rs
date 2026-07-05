@@ -455,8 +455,7 @@ impl Client {
         }
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
-        let mut msg_out = RendezvousMessage::new();
-        let mut ipv6 = if crate::get_ipv6_punch_enabled() {
+        let _ipv6 = if crate::get_ipv6_punch_enabled() {
             if let Some((socket, addr)) = crate::get_ipv6_socket().await {
                 (Some(socket), Some(addr))
             } else {
@@ -466,24 +465,6 @@ impl Client {
             (None, None)
         };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
-        let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
-        // Enumerate all non-loopback IPv4 addresses so hbbs can detect LAN
-        // correctly even when the client connects via VPN (different public IP
-        // but same private subnet).  We also include the TCP socket's own
-        // local address (my_addr) as a fallback.
-        let mut local_addrs: Vec<bytes::Bytes> = Vec::new();
-        local_addrs.push(hbb_common::AddrMangle::encode(my_addr).into());
-        for interface in default_net::get_interfaces() {
-            for ipv4 in &interface.ipv4 {
-                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
-                    let addr = SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), my_addr.port());
-                    let encoded = hbb_common::AddrMangle::encode(addr);
-                    if !local_addrs.iter().any(|b| b.as_ref() == encoded.as_slice()) {
-                        local_addrs.push(encoded.into());
-                    }
-                }
-            }
-        }
         // Skip direct punch, go directly to relay.
         // Phase3/ReSTUN will attempt to upgrade to direct connection later.
         let secure = !key.is_empty() && !token.is_empty();
