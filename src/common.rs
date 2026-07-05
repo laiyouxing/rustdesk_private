@@ -2915,9 +2915,6 @@ pub async fn relay_upgrade_task(
                     our_addr = Some(addr);
                     log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
                         i + 1, addr, addr.port(), srv);
-                    if !targets.contains(&addr) {
-                        targets.push(addr);
-                    }
                     if let Ok(mut public) = PUBLIC_ADDR.lock() {
                         *public = addr.to_string();
                     }
@@ -3000,12 +2997,10 @@ pub async fn relay_upgrade_task(
     // (the punch loop uses socket.connect() which changes the remote
     // endpoint, causing recv_from to filter out STUN responses).
     let last_stun = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-    let restun_targets: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
     let (restun_stop_tx, mut restun_stop_rx) = oneshot::channel::<()>();
     {
-        let restun_targets = restun_targets.clone();
         let last_stun = last_stun.clone();
+        let phase3_out_tx = phase3_out_tx.clone(); // Clone for ReSTUN to send new addresses to peer
         tokio::spawn(async move {
             // Bind a separate UDP socket for ReSTUN to avoid interference
             // from the main punch socket (which gets connect()-ed).
@@ -3024,11 +3019,9 @@ pub async fn relay_upgrade_task(
                 match stun_query_with_socket(&restun_socket).await {
                     Ok((new_addr, srv)) => {
                         log::info!("RelayUpgrade ReSTUN: mapped {} (via {})", new_addr, srv);
-                        if let Ok(mut t) = restun_targets.lock() {
-                            if !t.contains(&new_addr) {
-                                t.push(new_addr);
-                            }
-                        }
+                        // Send new address to peer through Phase3 relay, so the peer
+                        // can update its targets with the new NAT mapping.
+                        let _ = phase3_out_tx.try_send(new_addr);
                         if let Ok(mut public) = PUBLIC_ADDR.lock() {
                             *public = new_addr.to_string();
                         }
@@ -3041,6 +3034,11 @@ pub async fn relay_upgrade_task(
             }
         });
     }
+    // Note: ReSTUN-discovered addresses are forwarded to the peer via Phase3 relay.
+    // The peer will add them to its own targets and try to connect.
+    // On our side, we don't add them to local targets because the ReSTUN socket is
+    // different from the main punch socket - using its address locally would connect
+    // to ourselves (main socket → our own ReSTUN port → fails).
 
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
@@ -3078,16 +3076,6 @@ pub async fn relay_upgrade_task(
                     addr, PORT_SCAN_RANGE as u32 * 2, PORT_SCAN_RANGE);
             }
         }
-        // Check for ReSTUN-discovered addresses (NAT re-mapping)
-        if let Ok(mut rst) = restun_targets.lock() {
-            for addr in rst.drain(..) {
-                if !targets.contains(&addr) {
-                    targets.push(addr);
-                    log::info!("ReSTUN: added new address {} to targets", addr);
-                }
-            }
-        }
-
         // Try each target address with the SAME socket
         for &target in &targets {
             if started.elapsed() >= TOTAL_BUDGET {
