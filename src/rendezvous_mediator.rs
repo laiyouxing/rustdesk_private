@@ -305,12 +305,35 @@ impl RendezvousMediator {
                     log::info!("keep_alive: {}ms", self.keep_alive);
                 }
             }
-            Some(rendezvous_message::Union::PunchHole(_ph)) => {
-                // PunchHole is no longer used — the controller now connects directly
-                // via relay (request_relay) and post-relay Phase3 upgrade handles
-                // the direct connection. The old PunchHole path (pre-connect punch
-                // + handle_punch_hole) has been removed from the controller side.
-                log::debug!("Ignored PunchHole (all connections go through relay first)");
+            Some(rendezvous_message::Union::PunchHole(ph)) => {
+                // Send PunchHoleSent to hbbs so it can forward PunchHoleResponse
+                // back to the controller (A) with relay_server info.
+                // We do NOT do actual hole punching here — Phase3 upgrade handles it.
+                let host = self.host.clone();
+                let peer_addr_bytes = ph.socket_addr.clone();
+                let provided_relay_server = ph.relay_server.clone();
+                let relay_server = self.get_relay_server(provided_relay_server);
+                tokio::spawn(async move {
+                    if let Ok(mut socket) = hbb_common::socket_client::connect_tcp(
+                        host.clone(), CONNECT_TIMEOUT
+                    ).await {
+                        let key = crate::get_key(true).await;
+                        if crate::secure_tcp(&mut socket, &key).await.is_ok() {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_punch_hole_sent(PunchHoleSent {
+                                socket_addr: peer_addr_bytes,
+                                id: Config::get_id(),
+                                relay_server,
+                                nat_type: crate::get_nat_type(0).into(),
+                                version: crate::VERSION.to_owned(),
+                                ..Default::default()
+                            });
+                            if socket.send(&msg_out).await.is_ok() {
+                                log::info!("Sent PunchHoleSent to hbbs for relay_server assignment");
+                            }
+                        }
+                    }
+                });
             }
             Some(rendezvous_message::Union::RequestRelay(rr)) => {
                 let rz = self.clone();
