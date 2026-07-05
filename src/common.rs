@@ -2723,6 +2723,7 @@ pub async fn stun_query_with_socket(
     }
 
     // Race all STUN servers concurrently, collect first 2 successful results
+    // (same logic as try_one above, accessible outside the closure)
     let work = async {
         let servers = get_stun_servers_v4();
         let futs = servers
@@ -2757,6 +2758,74 @@ pub async fn stun_query_with_socket(
         .await
         .map_err(|_| anyhow!("STUN total timeout"))?
 }
+
+/// Query a single specific STUN server (not race all servers).
+/// Used for multi-STUN port prediction where all queries must target
+/// the same server to get consistent delta on Symmetric NAT.
+pub async fn stun_query_single_server(
+    socket: &UdpSocket,
+    stun: &str,
+) -> ResultType<(SocketAddr, String)> {
+    use hbb_common::rand::{self, Rng};
+
+    let stun_addr = stun
+        .to_socket_addrs()?
+        .filter(|x| x.is_ipv4())
+        .next()
+        .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
+
+    let mut req = vec![0u8; 20];
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill(&mut tx_id);
+    req[8..20].copy_from_slice(&tx_id);
+
+    socket.send_to(&req, stun_addr).await?;
+
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .map_err(|_| anyhow!("STUN recv timeout from {}", stun))??;
+    if n < 20 {
+        bail!("STUN response too short");
+    }
+    let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
+    if resp_type != 0x0101 {
+        bail!("Not a STUN Binding Response");
+    }
+    if &buf[8..20] != &tx_id {
+        bail!("STUN transaction ID mismatch from {}", stun);
+    }
+    let mut pos = 20;
+    while pos + 4 <= n {
+        let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+        if pos + 4 + attr_len > n {
+            break;
+        }
+        if attr_type == 0x0020 && attr_len >= 8 {
+            let xor_port = u16::from_be_bytes([buf[pos + 6], buf[pos + 7]]);
+            let port = xor_port ^ 0x2112;
+            let mut ip_bytes = [0u8; 4];
+            for i in 0..4 {
+                ip_bytes[i] = buf[pos + 8 + i] ^ buf[4 + i];
+            }
+            let ip = std::net::Ipv4Addr::new(
+                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+            );
+            return Ok((SocketAddr::from((ip, port)), stun.to_string()));
+        }
+        pos += 4 + attr_len;
+        if attr_len % 4 != 0 {
+            pos += 4 - (attr_len % 4);
+        }
+    }
+    bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
+}
+
+
+
 
 
 
@@ -2829,25 +2898,45 @@ pub async fn relay_upgrade_task(
     let mut stun_predicted_port: Option<u16> = None;
     let mut stun_delta: i32 = 0;
     let mut stun_ports: Vec<u16> = Vec::new();
+    let mut selected_server: Option<String> = None;
 
-    for _ in 0..5 {
-        match stun_query_with_socket(&socket).await {
-            Ok((addr, _)) => {
-                let port = addr.port();
+    for i in 0..5 {
+        let result = if let Some(ref server) = selected_server {
+            // Queries 2-5: use the SAME server for consistent delta on Symmetric NAT
+            stun_query_single_server(&socket, server).await
+        } else {
+            // Query 1: race all servers, pick the best
+            stun_query_with_socket(&socket).await
+        };
+        match result {
+            Ok((addr, srv)) => {
                 if our_addr.is_none() {
+                    selected_server = Some(srv.clone());
                     our_addr = Some(addr);
-                    log::info!("RelayUpgrade STUN: mapped {} (port {})", addr, port);
+                    log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
+                        i + 1, addr, addr.port(), srv);
                     if !targets.contains(&addr) {
                         targets.push(addr);
                     }
                     if let Ok(mut public) = PUBLIC_ADDR.lock() {
                         *public = addr.to_string();
                     }
+                } else {
+                    log::info!("RelayUpgrade STUN #{}: port {} via {}",
+                        i + 1, addr.port(), srv);
                 }
-                stun_ports.push(port);
+                stun_ports.push(addr.port());
                 hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Err(_) => break,
+            Err(e) => {
+                if our_addr.is_none() {
+                    log::info!("RelayUpgrade STUN #{} failed: {:?}", i + 1, e);
+                    break;
+                } else {
+                    log::info!("RelayUpgrade STUN #{} failed, stopping prediction: {:?}", i + 1, e);
+                    break;
+                }
+            }
         }
     }
 
