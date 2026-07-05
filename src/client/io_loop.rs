@@ -2058,6 +2058,29 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 }
                             }
+                            // Also spawn an independent punch task for addresses arriving
+                            // after relay_upgrade_task finishes reading from the queue.
+                            if let (Some(stream), Some(notify)) = (
+                                self.punch_stream.as_ref().cloned(),
+                                self.punch_notify.as_ref().cloned(),
+                            ) {
+                                let kcp_handle = Arc::new(
+                                    std::sync::Mutex::new(None));
+                                tokio::spawn(async move {
+                                    match crate::common::relay_phase3_punch_to_peer(
+                                        peer_addr, kcp_handle).await
+                                    {
+                                        Ok(s) => {
+                                            let mut guard = stream.lock().await;
+                                            *guard = Some(s);
+                                            notify.notify_one();
+                                        }
+                                        Err(e) => {
+                                            log::debug!("Phase3(Controller) punch failed: {}", e);
+                                        }
+                                    }
+                                });
+                            }
                         }
                     }
                     _ => {}
