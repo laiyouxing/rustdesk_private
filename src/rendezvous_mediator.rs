@@ -324,7 +324,8 @@ impl RendezvousMediator {
                                 socket_addr: peer_addr_bytes,
                                 id: Config::get_id(),
                                 relay_server,
-                                nat_type: crate::get_nat_type(0).into(),
+                                nat_type: NatType::from_i32(crate::get_nat_type(0).await)
+                                    .unwrap_or(NatType::UNKNOWN_NAT).into(),
                                 version: crate::VERSION.to_owned(),
                                 ..Default::default()
                             });

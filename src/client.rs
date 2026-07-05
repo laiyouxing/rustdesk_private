@@ -476,7 +476,7 @@ impl Client {
                     Some(rendezvous_message::Union::PunchHole(ph)) => {
                         // Non-LAN path: hbbs returns PunchHole with relay_server
                         relay_server = ph.relay_server;
-                        peer_nat_type = ph.nat_type;
+                        peer_nat_type = ph.nat_type.enum_value().unwrap_or(NatType::UNKNOWN_NAT);
                         peer_addr = AddrMangle::decode(&ph.socket_addr);
                         log::info!("Got PunchHole from hbbs: relay_server={}, peer_addr={}",
                             relay_server, peer_addr);
