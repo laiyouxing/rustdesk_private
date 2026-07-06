@@ -135,17 +135,15 @@ fn check_update(manually: bool) -> ResultType<()> {
     if update_url.is_empty() {
         log::debug!("No update available.");
     } else {
-        let (download_url, version) = if crate::is_custom_client()
+        let version = crate::common::SOFTWARE_UPDATE_VERSION
+            .lock()
+            .unwrap()
+            .clone();
+        let download_url = if crate::is_custom_client()
             || !update_url.contains("releases/tag")
         {
-            // Custom build or non-GitHub URL: use the download URL and version as-is
-            (
-                update_url.clone(),
-                crate::common::SOFTWARE_UPDATE_VERSION
-                    .lock()
-                    .unwrap()
-                    .clone(),
-            )
+            // Custom build or non-GitHub URL: use the download URL as-is
+            update_url.clone()
         } else {
             // Original GitHub release flow: construct download URL
             let dl_url = update_url.replace("tag", "download");
@@ -161,7 +159,7 @@ fn check_update(manually: bool) -> ResultType<()> {
             } else {
                 format!("{}/rustdesk-{}-x86-sciter.exe", dl_url, ver)
             };
-            (dl_url, ver)
+            dl_url
         };
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url(&download_url);
@@ -303,6 +301,11 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
 }
 
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
-    let filename = url.split('/').last()?;
-    Some(std::env::temp_dir().join(filename))
+    let filename = url.split('/').filter(|s| !s.is_empty()).last()?;
+    if filename.is_empty() || !filename.contains('.') {
+        // Fallback: use a generic name when the URL has no recognizable filename
+        Some(std::env::temp_dir().join("rustdesk_update.exe"))
+    } else {
+        Some(std::env::temp_dir().join(filename))
+    }
 }
