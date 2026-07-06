@@ -2843,6 +2843,7 @@ pub async fn relay_upgrade_task(
     punch_port: u16,
     phase3_out_tx: mpsc::Sender<std::net::SocketAddr>,
     phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
+    phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
 ) -> bool {
     use crate::kcp_stream::KcpStream;
 
@@ -3081,49 +3082,56 @@ pub async fn relay_upgrade_task(
             }
         }
 
-        // If KCP failed this round, try TCP simultaneous open on peer targets.
-        // TCP hole punching can succeed where UDP/KCP fails because NATs
-        // typically have more permissive behavior for TCP SYN packets.
+        // If KCP failed this round, try TCP simultaneous open on the peer's
+        // dedicated TCP listener port (exchanged via PunchPeerAddr). This is
+        // far more reliable than trying TCP on KCP/UDP ports.
         if let Some(ref listener) = tcp_listener {
-            for &target in &targets {
-                if started.elapsed() >= TOTAL_BUDGET {
-                    break;
-                }
-                if target.is_ipv6() { continue; }
-                // TCP simultaneous open: race connect vs accept on the same port.
-                // The peer is also connecting to our port while listening on theirs.
-                let addr = target;
-                let listener_clone = listener;
-                let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
-                    res = listener_clone.accept() => {
-                        match res {
-                            Ok((stream, _)) => {
-                                log::info!("RelayUpgrade TCP: accept from {}", addr);
-                                Some(stream)
+            let tcp_targets: Vec<std::net::SocketAddr> = if let Ok(addrs) = phase3_tcp_rx.lock() {
+                addrs.clone()
+            } else { Vec::new() };
+            for &tcp_target in &tcp_targets {
+                if started.elapsed() >= TOTAL_BUDGET { break; }
+                if tcp_target.is_ipv6() { continue; }
+                // Also try ±5 around the TCP port as the peer's NAT may have
+                // remapped the TCP port by a small delta.
+                let ports = [0, 1, -1, 2, -2, 5, -5];
+                for &port_offset in &ports {
+                    if started.elapsed() >= TOTAL_BUDGET { break; }
+                    let mut target = tcp_target;
+                    target.set_port(tcp_target.port().wrapping_add_signed(port_offset));
+                    if target.port() == 0 { continue; }
+                    let listener_clone = listener;
+                    let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
+                        res = listener_clone.accept() => {
+                            match res {
+                                Ok((stream, _)) => {
+                                    log::info!("RelayUpgrade TCP: accept from {}", target);
+                                    Some(stream)
+                                }
+                                Err(_) => None,
                             }
-                            Err(_) => None,
                         }
-                    }
-                    res = tokio::time::timeout(Duration::from_secs(3),
-                        tokio::net::TcpStream::connect(addr)) => {
-                        match res {
-                            Ok(Ok(stream)) => {
-                                stream.set_nodelay(true).ok();
-                                log::info!("RelayUpgrade TCP: connect to {} succeeded!", addr);
-                                Some(stream)
+                        res = tokio::time::timeout(Duration::from_secs(2),
+                            tokio::net::TcpStream::connect(target)) => {
+                            match res {
+                                Ok(Ok(stream)) => {
+                                    stream.set_nodelay(true).ok();
+                                    log::info!("RelayUpgrade TCP: connect to {} succeeded!", target);
+                                    Some(stream)
+                                }
+                                _ => None,
                             }
-                            _ => None,
                         }
+                    };
+                    if let Some(stream) = tcp_res {
+                        stream.set_nodelay(true).ok();
+                        let mut guard = direct_stream.lock().await;
+                        *guard = Some(Stream::from(stream, target));
+                        notify.notify_one();
+                        log::info!("RelayUpgrade: TCP simultaneous open succeeded to {} after {:?}",
+                            target, started.elapsed());
+                        return true;
                     }
-                };
-                if let Some(stream) = tcp_res {
-                    stream.set_nodelay(true).ok();
-                    let mut guard = direct_stream.lock().await;
-                    *guard = Some(Stream::from(stream, addr));
-                    notify.notify_one();
-                    log::info!("RelayUpgrade: TCP simultaneous open succeeded to {} after {:?}",
-                        addr, started.elapsed());
-                    return true;
                 }
             }
         }

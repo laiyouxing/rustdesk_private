@@ -84,6 +84,8 @@ pub struct Remote<T: InvokeUiSession> {
     punch_notify: Option<Arc<Notify>>,
     // Phase 3: shared vec for relay_upgrade_task to pick up peer addresses
     punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Phase 3 TCP: separate vec for peer TCP listener addresses (TCP simultaneous open)
+    punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
 }
 
 #[derive(Default)]
@@ -136,6 +138,7 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_stream: None,
             punch_notify: None,
             punch_peer_addrs: None,
+            punch_tcp_addrs: None,
         }
     }
 
@@ -204,10 +207,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 // into relay_upgrade_task's target list (same socket, no duplicate)
                 let phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
+                // Separate channel for peer TCP listener addresses (TCP simultaneous open).
+                // Identified by port: after KCP+IPv6 are received, the next different-port
+                // address from the same peer IP is the TCP listener address.
+                let phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
                 // Store for handle_msg_from_peer to access
                 self.punch_stream = Some(punch_stream.clone());
                 self.punch_notify = Some(punch_notify.clone());
                 self.punch_peer_addrs = Some(phase3_peer_rx.clone());
+                self.punch_tcp_addrs = Some(phase3_tcp_rx.clone());
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
                     let n = punch_notify.clone();
                     let d = punch_done.clone();
@@ -218,13 +227,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         p2p_addrs.push(peer_addr);
                     }
                     let phase3_peer = phase3_peer_rx.clone();
+                    let phase3_tcp = phase3_tcp_rx.clone();
                     let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
                         Arc::new(std::sync::Mutex::new(None));
                     self.handler.set_punch_status("trying", "");
                     tokio::spawn(async move {
                         let ok = relay_upgrade_task(
                             p2p_addrs, n, s, kcp_handle, udp_nat_port,
-                            phase3_out_tx, phase3_peer,
+                            phase3_out_tx, phase3_peer, phase3_tcp,
                         ).await;
                         succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                         d.notify_one();
@@ -2052,14 +2062,34 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::PunchPeerAddr(ppa)) => {
                         // Phase 3: Received peer's public address through relay.
-                        // Push it into relay_upgrade_task's target list so it
-                        // uses the same socket (no duplicate STUN / port mismatch).
+                        // Route to appropriate channel:
+                        // - KCP/UDP addresses → punch_peer_addrs (for port-scan + KCP punch)
+                        // - TCP listener addresses → punch_tcp_addrs (for TCP simultaneous open)
+                        // Heuristic: if we already have addresses from this peer IP in
+                        // punch_peer_addrs, the new address with a different port is TCP.
                         if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
                             log::info!("Phase3: received peer address: {}", peer_addr);
-                            if let Some(ref punch_peer) = self.punch_peer_addrs {
-                                if let Ok(mut addrs) = punch_peer.lock() {
-                                    if !addrs.contains(&peer_addr) {
-                                        addrs.push(peer_addr);
+                            let is_tcp = self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
+                                ppa_ref.lock().map(|addrs| {
+                                    addrs.iter().any(|a| a.ip() == peer_addr.ip() && a.port() != peer_addr.port())
+                                }).unwrap_or(false)
+                            });
+                            if is_tcp {
+                                if let Some(ref punch_tcp) = self.punch_tcp_addrs {
+                                    if let Ok(mut addrs) = punch_tcp.lock() {
+                                        if !addrs.contains(&peer_addr) {
+                                            addrs.push(peer_addr);
+                                            log::info!("Phase3: added TCP peer address: {}", peer_addr);
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(ref punch_peer) = self.punch_peer_addrs {
+                                    if let Ok(mut addrs) = punch_peer.lock() {
+                                        if !addrs.contains(&peer_addr) {
+                                            addrs.push(peer_addr);
+                                            log::info!("Phase3: added KCP peer address: {}", peer_addr);
+                                        }
                                     }
                                 }
                             }

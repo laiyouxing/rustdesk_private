@@ -599,6 +599,12 @@ impl Connection {
             let phase3_tx = phase3_out_tx;
             let tx_to_cm = conn.tx_to_cm.clone();
             tokio::spawn(async move {
+                // 0. Create TCP listener for TCP simultaneous open before STUN
+                // so we can exchange the TCP port alongside the STUN address.
+                let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+                let tcp_port = tcp_listener.as_ref()
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.port());
                 // 1. STUN to discover our public IPv4 address
                 if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                     let socket = Arc::new(socket);
@@ -617,6 +623,13 @@ impl Connection {
                             if phase3_tx.send(stun_addr).await.is_err() {
                                 log::info!("Phase3(Host): failed to send own address");
                             }
+                            // Send TCP listener address for TCP simultaneous open
+                            if let Some(tcp_port_val) = tcp_port {
+                                let tcp_addr = std::net::SocketAddr::new(
+                                    stun_addr.ip(), tcp_port_val);
+                                let _ = phase3_tx.send(tcp_addr).await;
+                                log::info!("Phase3(Host): sent TCP listener address: {}", tcp_addr);
+                            }
                         }
                         Err(e) => {
                             log::info!("Phase3(Host): STUN failed: {:?}", e);
@@ -625,7 +638,6 @@ impl Connection {
                 }
                 // 2. Also send IPv6 address if available (for dual-stack peers)
                 if crate::get_ipv6_punch_enabled() {
-                    // Ensure test_ipv6 has been called to populate the cache
                     crate::test_ipv6().await;
                     if let Some(ipv6_addr) = crate::common::get_cached_ipv6_addr() {
                         let _ = tx_to_cm.send(ipc::Data::PunchStatus {
