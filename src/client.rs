@@ -533,7 +533,8 @@ impl Client {
                                         if addr.port() > 0 { Some(addr) } else { None }
                                     })
                                     .collect();
-                                log::info!("Host LAN addresses: {:?}", lan_addrs);
+                                log::info!("Host LAN addresses received ({}/{} valid): {:?}",
+                                    lan_addrs.len(), ph.socket_addrs.len(), lan_addrs);
                                 for &lan_addr in &lan_addrs {
                                     if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
                                         lan_addr, 3000

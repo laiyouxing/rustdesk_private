@@ -587,6 +587,9 @@ impl RendezvousMediator {
                 format!("{}:{}", socket.local_addr().ip(), port).parse()?;
             local_addrs.push(AddrMangle::encode(addr).into());
         }
+        log::info!("HandleIntranet: enumerating {} local address(es): {:?}",
+            local_addrs.len(),
+            local_addrs.iter().map(|b| AddrMangle::decode(b)).collect::<Vec<_>>());
         let mut msg_out = Message::new();
         msg_out.set_local_addr(LocalAddr {
             id: Config::get_id(),
