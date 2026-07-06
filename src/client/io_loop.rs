@@ -78,7 +78,7 @@ pub struct Remote<T: InvokeUiSession> {
     video_threads: HashMap<usize, VideoThread>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
-    sent_close_reason: bool,
+    pub sent_close_reason: bool,
     // Relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
     punch_notify: Option<Arc<Notify>>,
