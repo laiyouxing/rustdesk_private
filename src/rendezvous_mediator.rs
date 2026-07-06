@@ -74,6 +74,18 @@ impl RendezvousMediator {
             crate::updater::start_auto_update();
         }
         check_zombie();
+        // Ensure the Windows service (rustdesk.exe --service) is running on startup.
+        // This handles update scenarios where the old version stops the service
+        // but the new version needs it running for background connections.
+        #[cfg(target_os = "windows")]
+        if crate::platform::is_installed() && !crate::platform::is_self_service_running() {
+            log::info!("Service not running on startup, starting it now...");
+            std::process::Command::new("sc")
+                .arg("start")
+                .arg(crate::get_app_name())
+                .spawn()
+                .ok();
+        }
         let server = new_server();
         if config::option2bool("stop-service", &Config::get_option("stop-service")) {
             crate::test_rendezvous_server();
