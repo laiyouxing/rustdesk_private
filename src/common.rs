@@ -998,11 +998,11 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_not_cached = tls_type.is_none();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, false);
+    let client = create_http_client_async(tls_type, true);
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(_) if is_tls_not_cached => {
-            let client = create_http_client_async(TlsType::NativeTls, false);
+            let client = create_http_client_async(TlsType::NativeTls, true);
             client.get(&url).send().await?
         }
         Err(e) => return Err(e.into()),
