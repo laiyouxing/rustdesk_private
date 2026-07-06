@@ -1154,6 +1154,12 @@ fn get_api_server_(api: String, custom: String) -> String {
     if !api.is_empty() {
         return api.to_owned();
     }
+    // If API_SERVER_DEFAULT was customized at build time (not the original default),
+    // use it before falling back to custom-rendezvous-server derivation.
+    let default_api = config::API_SERVER_DEFAULT;
+    if default_api != "https://admin.rustdesk.com" {
+        return default_api.to_owned();
+    }
     let s0 = get_custom_rendezvous_server(custom);
     if !s0.is_empty() {
         let s = crate::increase_port(&s0, -2);
@@ -1163,7 +1169,7 @@ fn get_api_server_(api: String, custom: String) -> String {
             return format!("http://{}", s);
         }
     }
-    config::API_SERVER_DEFAULT.to_owned()
+    default_api.to_owned()
 }
 
 #[inline]
