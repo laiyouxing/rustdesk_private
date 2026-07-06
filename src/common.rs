@@ -3389,6 +3389,73 @@ pub fn get_control_permission(
     }
 }
 
+/// Enumerate all non-loopback, non-unspecified IPv4 addresses from ALL network
+/// interfaces, including virtual adapters (Tailscale/WireGuard VPN, L2 bridges)
+/// that `default_net::get_interfaces()` may skip on Windows.
+/// Falls back to `default_net` on non-Windows platforms.
+#[cfg(windows)]
+pub fn get_all_ipv4_addrs() -> Vec<std::net::Ipv4Addr> {
+    use windows::Win32::NetworkManagement::IpHelper::*;
+    use windows::Win32::NetworkManagement::Ndis::*;
+    use windows::Win32::Networking::WinSock::*;
+    use std::net::Ipv4Addr;
+
+    let mut addrs = Vec::new();
+    let family = AF_UNSPEC.0 as u32;
+    let flags = GAA_FLAG_INCLUDE_ALL_INTERFACES
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    unsafe {
+        let mut buf_size: u32 = 0;
+        let ret = GetAdaptersAddresses(family, flags, None, None, &mut buf_size);
+        if ret != ERROR_BUFFER_OVERFLOW && ret != 0 {
+            return addrs;
+        }
+        let mut buf = vec![0u8; buf_size as usize];
+        let ptr = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        if GetAdaptersAddresses(family, flags, None, Some(ptr), &mut buf_size) != 0 {
+            return addrs;
+        }
+        let mut cur = ptr;
+        while !cur.is_null() {
+            let adapter = &*cur;
+            if adapter.OperStatus == IfOperStatusUp {
+                let mut unicast = adapter.FirstUnicastAddress;
+                while !unicast.is_null() {
+                    let ua = &*unicast;
+                    let sa = ua.Address.lpSockaddr;
+                    if !sa.is_null() && (*sa).sa_family == AF_INET {
+                        let addr_in = &*(sa as *const SOCKADDR_IN);
+                        let ip = Ipv4Addr::from(addr_in.sin_addr.S_un.S_addr.to_ne_bytes());
+                        if !ip.is_loopback() && !ip.is_unspecified() && !addrs.contains(&ip) {
+                            addrs.push(ip);
+                        }
+                    }
+                    unicast = ua.Next;
+                }
+            }
+            cur = adapter.Next;
+        }
+    }
+    addrs
+}
+
+#[cfg(not(windows))]
+pub fn get_all_ipv4_addrs() -> Vec<std::net::Ipv4Addr> {
+    let mut addrs = Vec::new();
+    for interface in default_net::get_interfaces() {
+        for ipv4 in &interface.ipv4 {
+            if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() && !addrs.contains(&ipv4.addr) {
+                addrs.push(ipv4.addr);
+            }
+        }
+    }
+    addrs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

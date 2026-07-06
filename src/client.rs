@@ -409,7 +409,8 @@ impl Client {
         }
         log::info!("rendezvous server: {}", rendezvous_server);
         let mut socket = socket?;
-        let my_addr = socket.local_addr();
+        let _my_addr = socket.local_addr();
+
         let mut signed_id_pk = Vec::new();
         let mut relay_server = "".to_owned();
         let mut peer_addr = Config::get_any_listen_addr(true);
@@ -456,30 +457,14 @@ impl Client {
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
-        // Enumerate local non-loopback IPv4 addresses for VPN/LAN detection.
-        // Also include the TCP socket's local address to cover virtual adapters
-        // that default_net::get_interfaces() might skip (e.g. Tailscale/Wintun).
+        // Enumerate ALL local non-loopback IPv4 addresses using native OS API
+        // to capture virtual adapters (Tailscale/WireGuard VPN, L2 bridges)
+        // that default_net::get_interfaces() may skip on Windows.
         let local_port = socket.local_addr().port();
         let mut local_addrs: Vec<Vec<u8>> = Vec::new();
-        for interface in default_net::get_interfaces() {
-            for ipv4 in &interface.ipv4 {
-                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
-                    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), local_port);
-                    local_addrs.push(AddrMangle::encode(addr).into());
-                }
-            }
-        }
-        // Always include the socket's local IP address to ensure virtual adapters
-        // (Tailscale/WireGuard VPN, L2 bridges) are detectable by hbbs.
-        if let Ok(SocketAddr::V4(v4)) = my_addr {
-            let ip = *v4.ip();
-            if !ip.is_loopback() && !ip.is_unspecified() {
-                let addr = SocketAddr::new(IpAddr::V4(ip), local_port);
-                let bytes = AddrMangle::encode(addr).into();
-                if !local_addrs.contains(&bytes) {
-                    local_addrs.push(bytes);
-                }
-            }
+        for ip in crate::common::get_all_ipv4_addrs() {
+            let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), local_port);
+            local_addrs.push(AddrMangle::encode(addr).into());
         }
         let mut msg_out = RendezvousMessage::new();
         // Send PunchHoleRequest to hbbs to obtain relay_server from response.

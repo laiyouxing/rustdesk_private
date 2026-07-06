@@ -578,26 +578,12 @@ impl RendezvousMediator {
         let port = listen_addr.port();
         // Then connect to hbbs to send LocalAddr message.
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
-        // enumerate all non-loopback IPv4 addresses for multi-network support
+        // enumerate ALL non-loopback IPv4 addresses using native OS API
+        // to capture virtual adapters (Tailscale/WireGuard VPN, L2 bridges).
         let mut local_addrs: Vec<Vec<u8>> = Vec::new();
-        for interface in default_net::get_interfaces() {
-            for ipv4 in &interface.ipv4 {
-                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
-                    let addr = SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), port);
-                    local_addrs.push(AddrMangle::encode(addr).into());
-                }
-            }
-        }
-        // Always include the TCP socket's local address to cover virtual adapters.
-        if let Ok(SocketAddr::V4(v4)) = socket.local_addr() {
-            let ip = *v4.ip();
-            if !ip.is_loopback() && !ip.is_unspecified() {
-                let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-                let bytes = AddrMangle::encode(addr).into();
-                if !local_addrs.contains(&bytes) {
-                    local_addrs.push(bytes);
-                }
-            }
+        for ip in crate::common::get_all_ipv4_addrs() {
+            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+            local_addrs.push(AddrMangle::encode(addr).into());
         }
         if local_addrs.is_empty() {
             // fallback to listener's local address
