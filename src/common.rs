@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, RwLock},
     task::Poll,
 };

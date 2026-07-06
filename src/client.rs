@@ -456,7 +456,9 @@ impl Client {
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
-        // Enumerate local non-loopback IPv4 addresses for VPN/LAN detection
+        // Enumerate local non-loopback IPv4 addresses for VPN/LAN detection.
+        // Also include the TCP socket's local address to cover virtual adapters
+        // that default_net::get_interfaces() might skip (e.g. Tailscale/Wintun).
         let local_port = socket.local_addr().port();
         let mut local_addrs: Vec<Vec<u8>> = Vec::new();
         for interface in default_net::get_interfaces() {
@@ -464,6 +466,18 @@ impl Client {
                 if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
                     let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), local_port);
                     local_addrs.push(AddrMangle::encode(addr).into());
+                }
+            }
+        }
+        // Always include the socket's local IP address to ensure virtual adapters
+        // (Tailscale/WireGuard VPN, L2 bridges) are detectable by hbbs.
+        if let Ok(SocketAddr::V4(v4)) = my_addr {
+            let ip = *v4.ip();
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                let addr = SocketAddr::new(IpAddr::V4(ip), local_port);
+                let bytes = AddrMangle::encode(addr).into();
+                if !local_addrs.contains(&bytes) {
+                    local_addrs.push(bytes);
                 }
             }
         }

@@ -588,6 +588,17 @@ impl RendezvousMediator {
                 }
             }
         }
+        // Always include the TCP socket's local address to cover virtual adapters.
+        if let Ok(SocketAddr::V4(v4)) = socket.local_addr() {
+            let ip = *v4.ip();
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+                let bytes = AddrMangle::encode(addr).into();
+                if !local_addrs.contains(&bytes) {
+                    local_addrs.push(bytes);
+                }
+            }
+        }
         if local_addrs.is_empty() {
             // fallback to listener's local address
             local_addrs.push(AddrMangle::encode(listen_addr).into());
