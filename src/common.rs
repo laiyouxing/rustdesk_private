@@ -3103,23 +3103,16 @@ pub async fn relay_upgrade_task(
                     let listener_clone = listener;
                     let ws_url = format!("ws://{}:{}", target.ip(), target.port());
                     let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
-                        // Accept: try TCP, then attempt WS upgrade (fallback to raw TCP)
-                        res = async {
-                            let (tcp, addr) = listener_clone.accept().await.ok()?;
-                            match tokio_tungstenite::accept_async(
-                                tcp.try_clone().ok()?).await {
-                                Ok(_ws) => {
-                                    log::info!("RelayUpgrade WS: accept from {}", addr);
-                                    // WS upgrade succeeded - use the cloned TCP stream
-                                    tokio::net::TcpStream::connect(addr).await.ok()
+                        // Accept raw TCP connection from peer
+                        res = listener_clone.accept() => {
+                            match res {
+                                Ok((stream, _)) => {
+                                    log::info!("RelayUpgrade TCP: accept from {}", target);
+                                    Some(stream)
                                 }
-                                Err(_) => {
-                                    // Not a WS connection, use raw TCP directly
-                                    log::info!("RelayUpgrade TCP: accept from {}", addr);
-                                    Some(tcp)
-                                }
+                                Err(_) => None,
                             }
-                        } => { res }
+                        }
                         // Connect to peer via raw TCP
                         res = tokio::time::timeout(Duration::from_secs(2),
                             tokio::net::TcpStream::connect(target)) => {
@@ -3132,13 +3125,12 @@ pub async fn relay_upgrade_task(
                                 _ => None,
                             }
                         }
-                        // Connect to peer via WebSocket (bypasses some firewalls)
+                        // Connect to peer via WebSocket (bypasses firewalls that block raw TCP)
                         res = tokio::time::timeout(Duration::from_secs(2),
                             tokio_tungstenite::connect_async(&ws_url)) => {
                             match res {
                                 Ok(Ok((_ws, _))) => {
                                     log::info!("RelayUpgrade WS: connect to {} succeeded!", target);
-                                    // WS upgrade established the connection; reconnect raw TCP
                                     tokio::net::TcpStream::connect(target).await.ok()
                                 }
                                 _ => None,
@@ -3303,20 +3295,15 @@ pub async fn relay_phase3_punch_to_peer(
 
                 let ws_url = format!("ws://{}:{}", tcp_target.ip(), tcp_target.port());
                 let result: Option<tokio::net::TcpStream> = tokio::select! {
-                    res = async {
-                        let (tcp, addr) = listener.accept().await.ok()?;
-                        match tokio_tungstenite::accept_async(
-                            tcp.try_clone().ok()?).await {
-                            Ok(_ws) => {
-                                log::info!("Phase3(Host) WS: accept from {}", addr);
-                                tokio::net::TcpStream::connect(addr).await.ok()
+                    res = listener.accept() => {
+                        match res {
+                            Ok((stream, _)) => {
+                                log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
+                                Some(stream)
                             }
-                            Err(_) => {
-                                log::info!("Phase3(Host) TCP: accept from {}", addr);
-                                Some(tcp)
-                            }
+                            Err(_) => None,
                         }
-                    } => { res }
+                    }
                     res = tokio::time::timeout(Duration::from_secs(3),
                         tokio::net::TcpStream::connect(tcp_target)) => {
                         match res {
