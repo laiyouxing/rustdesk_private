@@ -3095,15 +3095,25 @@ pub async fn relay_upgrade_task(
                 let addr = target;
                 let listener_clone = listener;
                 let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
-                    Ok(Ok((stream, _))) = async { listener_clone.accept().await } => {
-                        log::info!("RelayUpgrade TCP: accept from {}", addr);
-                        Some(stream)
+                    res = listener_clone.accept() => {
+                        match res {
+                            Ok((stream, _)) => {
+                                log::info!("RelayUpgrade TCP: accept from {}", addr);
+                                Some(stream)
+                            }
+                            Err(_) => None,
+                        }
                     }
-                    Ok(stream) = async {
-                        tokio::time::timeout(Duration::from_secs(3),
-                            tokio::net::TcpStream::connect(addr)).await
-                    } => {
-                        stream.ok().map(|s| { s.set_nodelay(true).ok(); s })
+                    res = tokio::time::timeout(Duration::from_secs(3),
+                        tokio::net::TcpStream::connect(addr)) => {
+                        match res {
+                            Ok(Ok(stream)) => {
+                                stream.set_nodelay(true).ok();
+                                log::info!("RelayUpgrade TCP: connect to {} succeeded!", addr);
+                                Some(stream)
+                            }
+                            _ => None,
+                        }
                     }
                 };
                 if let Some(stream) = tcp_res {
@@ -3262,22 +3272,28 @@ pub async fn relay_phase3_punch_to_peer(
                 tcp_target.set_port(new_port);
 
                 let result: Option<tokio::net::TcpStream> = tokio::select! {
-                    Ok(Ok((stream, _))) = async { listener.accept().await } => {
-                        log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
-                        Some(stream)
+                    res = listener.accept() => {
+                        match res {
+                            Ok((stream, _)) => {
+                                log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
+                                Some(stream)
+                            }
+                            Err(_) => None,
+                        }
                     }
-                    Ok(stream) = async {
-                        tokio::time::timeout(Duration::from_secs(3),
-                            tokio::net::TcpStream::connect(tcp_target)).await
-                    } => {
-                        stream.ok().map(|s| { s.set_nodelay(true).ok(); s })
+                    res = tokio::time::timeout(Duration::from_secs(3),
+                        tokio::net::TcpStream::connect(tcp_target)) => {
+                        match res {
+                            Ok(Ok(stream)) => {
+                                stream.set_nodelay(true).ok();
+                                log::info!("Phase3(Host) TCP: connect to {} succeeded!", tcp_target);
+                                Some(stream)
+                            }
+                            _ => None,
+                        }
                     }
                 };
                 if let Some(stream) = result {
-                    let kcp = KcpStream::from_stream(stream.try_clone()?, tcp_target, true);
-                    if let Ok(mut h) = kcp_handle.lock() {
-                        *h = Some(kcp);
-                    }
                     log::info!("Phase3(Host) TCP simultaneous open succeeded to {}!", tcp_target);
                     return Ok(Stream::from(stream, tcp_target));
                 }
