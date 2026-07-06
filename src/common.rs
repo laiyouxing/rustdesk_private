@@ -965,10 +965,9 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    if !crate::is_custom_client() {
-        return;
-    }
     // Custom build: check API server for new version
+    // Note: we skip the is_custom_client check here because even the standard
+    // RustDesk build should be able to check for updates from the custom API server
     std::thread::spawn(|| {
         if let Err(e) = check_custom_update() {
             log::error!("Custom update check failed: {}", e);
