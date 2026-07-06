@@ -3085,6 +3085,8 @@ pub async fn relay_upgrade_task(
         // If KCP failed this round, try TCP simultaneous open on the peer's
         // dedicated TCP listener port (exchanged via PunchPeerAddr). This is
         // far more reliable than trying TCP on KCP/UDP ports.
+        // Also try WebSocket (WS/WSS) connect as some firewalls allow HTTP
+        // upgrade traffic while blocking raw TCP on non-standard ports.
         if let Some(ref listener) = tcp_listener {
             let tcp_targets: Vec<std::net::SocketAddr> = if let Ok(addrs) = phase3_tcp_rx.lock() {
                 addrs.clone()
@@ -3092,8 +3094,6 @@ pub async fn relay_upgrade_task(
             for &tcp_target in &tcp_targets {
                 if started.elapsed() >= TOTAL_BUDGET { break; }
                 if tcp_target.is_ipv6() { continue; }
-                // Also try ±5 around the TCP port as the peer's NAT may have
-                // remapped the TCP port by a small delta.
                 let ports = [0, 1, -1, 2, -2, 5, -5];
                 for &port_offset in &ports {
                     if started.elapsed() >= TOTAL_BUDGET { break; }
@@ -3101,7 +3101,10 @@ pub async fn relay_upgrade_task(
                     target.set_port(tcp_target.port().wrapping_add_signed(port_offset));
                     if target.port() == 0 { continue; }
                     let listener_clone = listener;
+                    // Prepare WSS URL for connect attempt
+                    let ws_url = format!("ws://{}:{}", target.ip(), target.port());
                     let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
+                        // Branch 1: Accept raw TCP connection (peer connected to us)
                         res = listener_clone.accept() => {
                             match res {
                                 Ok((stream, _)) => {
@@ -3111,6 +3114,7 @@ pub async fn relay_upgrade_task(
                                 Err(_) => None,
                             }
                         }
+                        // Branch 2: Connect to peer via raw TCP
                         res = tokio::time::timeout(Duration::from_secs(2),
                             tokio::net::TcpStream::connect(target)) => {
                             match res {
@@ -3122,13 +3126,32 @@ pub async fn relay_upgrade_task(
                                 _ => None,
                             }
                         }
+                        // Branch 3: Accept WebSocket connection (peer connected via WS)
+                        res = async {
+                            let (tcp, addr) = listener_clone.accept().await.ok()?;
+                            tokio_tungstenite::accept_async(tcp).await
+                                .map(|_| { log::info!("RelayUpgrade WS: accept from {}", addr); })
+                                .ok()?;
+                            Some(tcp)
+                        } => { res }
+                        // Branch 4: Connect to peer via WebSocket
+                        res = tokio::time::timeout(Duration::from_secs(2),
+                            tokio_tungstenite::connect_async(&ws_url)) => {
+                            match res {
+                                Ok(Ok((_ws, _))) => {
+                                    log::info!("RelayUpgrade WS: connect to {} succeeded!", target);
+                                    tokio::net::TcpStream::connect(target).await.ok()
+                                }
+                                _ => None,
+                            }
+                        }
                     };
                     if let Some(stream) = tcp_res {
                         stream.set_nodelay(true).ok();
                         let mut guard = direct_stream.lock().await;
                         *guard = Some(Stream::from(stream, target));
                         notify.notify_one();
-                        log::info!("RelayUpgrade: TCP simultaneous open succeeded to {} after {:?}",
+                        log::info!("RelayUpgrade: punch succeeded via TCP/WS to {} after {:?}",
                             target, started.elapsed());
                         return true;
                     }
@@ -3279,6 +3302,7 @@ pub async fn relay_phase3_punch_to_peer(
                 if new_port == 0 { continue; }
                 tcp_target.set_port(new_port);
 
+                let ws_url = format!("ws://{}:{}", tcp_target.ip(), tcp_target.port());
                 let result: Option<tokio::net::TcpStream> = tokio::select! {
                     res = listener.accept() => {
                         match res {
@@ -3300,9 +3324,25 @@ pub async fn relay_phase3_punch_to_peer(
                             _ => None,
                         }
                     }
+                    res = async {
+                        let (tcp, addr) = listener.accept().await.ok()?;
+                        tokio_tungstenite::accept_async(tcp).await
+                            .map(|_| log::info!("Phase3(Host) WS: accept from {}", addr)).ok()?;
+                        Some(tcp)
+                    } => { res }
+                    res = tokio::time::timeout(Duration::from_secs(3),
+                        tokio_tungstenite::connect_async(&ws_url)) => {
+                        match res {
+                            Ok(Ok((_ws, _))) => {
+                                log::info!("Phase3(Host) WS: connect to {} succeeded!", tcp_target);
+                                tokio::net::TcpStream::connect(tcp_target).await.ok()
+                            }
+                            _ => None,
+                        }
+                    }
                 };
                 if let Some(stream) = result {
-                    log::info!("Phase3(Host) TCP simultaneous open succeeded to {}!", tcp_target);
+                    log::info!("Phase3(Host) TCP/WS simultaneous open succeeded to {}!", tcp_target);
                     return Ok(Stream::from(stream, tcp_target));
                 }
             }
