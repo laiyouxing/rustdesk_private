@@ -2861,9 +2861,22 @@ pub async fn relay_upgrade_task(
     // Port scan range for Symmetric NAT blind scanning.
     // Symmetric NAT assigns a different port for each destination.
     // The port typically increments by 1-5 per connection.
-    // Scanning ±10 ports covers most real-world cases.
-    const PORT_SCAN_RANGE: u16 = 10;
+    // Scanning ±50 ports covers most real-world cases.
+    // Also try ±100 for extreme cases where delta is larger.
+    const PORT_SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
+
+    // Create TCP listener for TCP simultaneous open.
+    // TCP simultaneous open works where UDP hole punching fails
+    // because NATs treat TCP and UDP differently - TCP SYN packets
+    // often create more reliable NAT mappings than UDP datagrams.
+    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+    let tcp_listener_port = tcp_listener.as_ref()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port());
+    if tcp_listener.is_some() {
+        log::info!("RelayUpgrade: created TCP listener for simultaneous open");
+    }
 
     // Brief initial wait for relay to stabilize (reduced from 2s→0.5s)
     hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2954,6 +2967,15 @@ pub async fn relay_upgrade_task(
             log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
         }
     }
+    // Send TCP listener address for TCP simultaneous open fallback.
+    if let Some(tcp_port) = tcp_listener_port {
+        let tcp_addr = std::net::SocketAddr::new(
+            our_addr.map(|a| a.ip()).unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()),
+            tcp_port,
+        );
+        let _ = phase3_out_tx.try_send(tcp_addr);
+        log::info!("Phase3: sent TCP listener address: {}", tcp_addr);
+    }
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
@@ -2990,7 +3012,7 @@ pub async fn relay_upgrade_task(
                     addr, PORT_SCAN_RANGE as u32 * 2, PORT_SCAN_RANGE);
             }
         }
-        // Try each target address, picking the right socket for its address family
+        // Try each target address with KCP (UDP) hole punching.
         for &target in &targets {
             if started.elapsed() >= TOTAL_BUDGET {
                 return false;
@@ -2998,7 +3020,7 @@ pub async fn relay_upgrade_task(
             let socket = if target.is_ipv6() {
                 match socket_v6.as_ref() {
                     Some(s) => s.clone(),
-                    None => continue, // no IPv6 socket available, skip IPv6 targets
+                    None => continue,
                 }
             } else {
                 socket_v4.clone()
@@ -3007,7 +3029,7 @@ pub async fn relay_upgrade_task(
                 continue;
             }
 
-            // Send a burst of empty packets to establish NAT mapping before KCP.
+            // Empty packet burst: 20 packets at 5ms spacing
             for _ in 0..20 {
                 if started.elapsed() >= TOTAL_BUDGET {
                     return false;
@@ -3016,15 +3038,12 @@ pub async fn relay_upgrade_task(
                 hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
             }
 
-            // Race KCP connect vs KCP accept simultaneously.
-            // If both sides call connect, no one is listening → deadlock.
-            // If both call accept, no one initiates → deadlock.
-            // Racing both eliminates this deadlock entirely.
+            // Race KCP connect vs accept
             let socket_for_accept = socket.clone();
-            let mut connect_fut = Box::pin(KcpStream::connect(socket.clone(), Duration::from_secs(3)));
+            let mut connect_fut = Box::pin(
+                KcpStream::connect(socket.clone(), Duration::from_secs(3)));
             let mut accept_fut = Box::pin(async move {
-                KcpStream::accept(socket_for_accept, Duration::from_secs(3), None)
-                    .await
+                KcpStream::accept(socket_for_accept, Duration::from_secs(3), None).await
             });
             let punched = tokio::select! {
                 res = &mut connect_fut => {
@@ -3057,8 +3076,45 @@ pub async fn relay_upgrade_task(
                 }
             };
             if punched {
-                log::info!("RelayUpgrade: punch succeeded after {:?}", started.elapsed());
+                log::info!("RelayUpgrade: KCP punch succeeded after {:?}", started.elapsed());
                 return true;
+            }
+        }
+
+        // If KCP failed this round, try TCP simultaneous open on peer targets.
+        // TCP hole punching can succeed where UDP/KCP fails because NATs
+        // typically have more permissive behavior for TCP SYN packets.
+        if let Some(ref listener) = tcp_listener {
+            for &target in &targets {
+                if started.elapsed() >= TOTAL_BUDGET {
+                    break;
+                }
+                if target.is_ipv6() { continue; }
+                // TCP simultaneous open: race connect vs accept on the same port.
+                // The peer is also connecting to our port while listening on theirs.
+                let addr = target;
+                let listener_clone = listener;
+                let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
+                    Ok(Ok((stream, _))) = async { listener_clone.accept().await } => {
+                        log::info!("RelayUpgrade TCP: accept from {}", addr);
+                        Some(stream)
+                    }
+                    Ok(stream) = async {
+                        tokio::time::timeout(Duration::from_secs(3),
+                            tokio::net::TcpStream::connect(addr)).await
+                    } => {
+                        stream.ok().map(|s| { s.set_nodelay(true).ok(); s })
+                    }
+                };
+                if let Some(stream) = tcp_res {
+                    stream.set_nodelay(true).ok();
+                    let mut guard = direct_stream.lock().await;
+                    *guard = Some(Stream::from(stream, addr));
+                    notify.notify_one();
+                    log::info!("RelayUpgrade: TCP simultaneous open succeeded to {} after {:?}",
+                        addr, started.elapsed());
+                    return true;
+                }
             }
         }
 
@@ -3115,15 +3171,18 @@ pub async fn relay_phase3_punch_to_peer(
     use crate::kcp_stream::KcpStream;
 
     let bind_addr = if peer_addr.is_ipv6() {
-        SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16)) // [::]:0
+        SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16))
     } else {
-        SocketAddr::from(([0u8; 4], 0u16)) // 0.0.0.0:0
+        SocketAddr::from(([0u8; 4], 0u16))
     };
     let socket = UdpSocket::bind(bind_addr).await?;
     let socket = Arc::new(socket);
 
+    // Create TCP listener for TCP simultaneous open fallback.
+    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+
     const MAX_TIME: Duration = Duration::from_secs(30);
-    const SCAN_RANGE: u16 = 10;
+    const SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
 
     for round in 0..5 {
@@ -3131,11 +3190,10 @@ pub async fn relay_phase3_punch_to_peer(
             bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
 
-        // For Symmetric NAT, try different port offsets in each round
         let port_offsets: &[i16] = if round == 0 {
             &[0]
         } else {
-            &[0, 1, -1, 2, -2, 3, -3, 5, -5, SCAN_RANGE as i16, -(SCAN_RANGE as i16)]
+            &[0, 1, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20, SCAN_RANGE as i16, -(SCAN_RANGE as i16)]
         };
 
         for &offset in port_offsets {
@@ -3149,13 +3207,11 @@ pub async fn relay_phase3_punch_to_peer(
 
             if socket.connect(target).await.is_err() { continue; }
 
-            // Empty packet burst: 20 packets at 5ms spacing
             for _ in 0..20 {
                 socket.send(&[]).await.ok();
                 hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
             }
 
-            // Race KCP connect vs accept
             let socket_for_accept = socket.clone();
             let mut connect_fut = Box::pin(
                 KcpStream::connect(socket.clone(), Duration::from_secs(3)));
@@ -3169,7 +3225,7 @@ pub async fn relay_phase3_punch_to_peer(
                             if let Ok(mut h) = kcp_handle.lock() {
                                 *h = Some(kcp);
                             }
-                            log::info!("Phase3(Host) succeeded via connect after {:?}", started.elapsed());
+                            log::info!("Phase3(Host) KCP succeeded via connect after {:?}", started.elapsed());
                             Some(stream)
                         }
                         Err(_) => None,
@@ -3181,7 +3237,7 @@ pub async fn relay_phase3_punch_to_peer(
                             if let Ok(mut h) = kcp_handle.lock() {
                                 *h = Some(kcp);
                             }
-                            log::info!("Phase3(Host) succeeded via accept after {:?}", started.elapsed());
+                            log::info!("Phase3(Host) KCP succeeded via accept after {:?}", started.elapsed());
                             Some(stream)
                         }
                         Err(_) => None,
@@ -3193,16 +3249,42 @@ pub async fn relay_phase3_punch_to_peer(
             }
         }
 
-        // Keep-alive during gap
-        let gap_start = std::time::Instant::now();
-        while gap_start.elapsed() < Duration::from_millis(500) {
-            if started.elapsed() >= MAX_TIME {
-                bail!("Phase3(Host) punch timed out");
+        // After KCP rounds, try TCP simultaneous open on remaining budget.
+        if let Some(ref listener) = tcp_listener {
+            if started.elapsed() >= MAX_TIME { break; }
+            let port_offsets: &[i16] = if round == 0 { &[0] }
+                else { &[0, 1, -1, 2, -2, 5, -5, 10, -10, SCAN_RANGE as i16, -(SCAN_RANGE as i16)] };
+            for &offset in port_offsets {
+                if started.elapsed() >= MAX_TIME { break; }
+                let mut tcp_target = peer_addr;
+                let new_port = (tcp_target.port() as i32 + offset as i32) as u16;
+                if new_port == 0 { continue; }
+                tcp_target.set_port(new_port);
+
+                let result: Option<tokio::net::TcpStream> = tokio::select! {
+                    Ok(Ok((stream, _))) = async { listener.accept().await } => {
+                        log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
+                        Some(stream)
+                    }
+                    Ok(stream) = async {
+                        tokio::time::timeout(Duration::from_secs(3),
+                            tokio::net::TcpStream::connect(tcp_target)).await
+                    } => {
+                        stream.ok().map(|s| { s.set_nodelay(true).ok(); s })
+                    }
+                };
+                if let Some(stream) = result {
+                    let kcp = KcpStream::from_stream(stream.try_clone()?, tcp_target, true);
+                    if let Ok(mut h) = kcp_handle.lock() {
+                        *h = Some(kcp);
+                    }
+                    log::info!("Phase3(Host) TCP simultaneous open succeeded to {}!", tcp_target);
+                    return Ok(Stream::from(stream, tcp_target));
+                }
             }
-            socket.send(&[]).await.ok();
-            hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
     bail!("Phase3(Host) punch finished without success");
 }
 
