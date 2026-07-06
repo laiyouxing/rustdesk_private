@@ -3480,18 +3480,14 @@ fn get_create_service(exe: &str) -> String {
     if config::is_outgoing_only() {
         return "".to_string();
     }
-    let stop = Config::get_option("stop-service") == "Y";
-    if stop {
-        format!("
+    // Always create/start the service on install, regardless of stop-service flag.
+    // The stop-service flag is only relevant during uninstall, not reinstall/update.
+    format!("
 if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
-", app_name = crate::get_app_name())
-    } else {
-        format!("
 sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
 sc start {app_name}
 ",
     app_name = crate::get_app_name())
-    }
 }
 
 fn run_after_run_cmds(silent: bool) {
