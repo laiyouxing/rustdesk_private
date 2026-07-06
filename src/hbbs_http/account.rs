@@ -348,20 +348,10 @@ impl OidcSession {
     }
 
     fn get_result_(&self) -> AuthResult {
-        let url = self.code_url.as_ref().map(|x| {
-            let mut s = x.url.to_string();
-            // Fix OAuth redirect_uri: server may return 127.0.0.1:21114 when
-            // the actual API server is a different address. Override it.
-            if let Some(api) = std::option_env!("API_SERVER") {
-                let api_host = api.replace("https://", "").replace("http://", "");
-                s = s.replace("127.0.0.1:21114", &api_host);
-            }
-            s
-        });
         AuthResult {
             state_msg: self.state_msg.to_string(),
             failed_msg: self.failed_msg.clone(),
-            url,
+            url: self.code_url.as_ref().map(|x| x.url.to_string()),
             auth_body: self.auth_body.clone(),
         }
     }
