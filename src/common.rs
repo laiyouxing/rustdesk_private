@@ -3101,20 +3101,26 @@ pub async fn relay_upgrade_task(
                     target.set_port(tcp_target.port().wrapping_add_signed(port_offset));
                     if target.port() == 0 { continue; }
                     let listener_clone = listener;
-                    // Prepare WSS URL for connect attempt
                     let ws_url = format!("ws://{}:{}", target.ip(), target.port());
                     let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
-                        // Branch 1: Accept raw TCP connection (peer connected to us)
-                        res = listener_clone.accept() => {
-                            match res {
-                                Ok((stream, _)) => {
-                                    log::info!("RelayUpgrade TCP: accept from {}", target);
-                                    Some(stream)
+                        // Accept: try TCP, then attempt WS upgrade (fallback to raw TCP)
+                        res = async {
+                            let (tcp, addr) = listener_clone.accept().await.ok()?;
+                            match tokio_tungstenite::accept_async(
+                                tcp.try_clone().ok()?).await {
+                                Ok(_ws) => {
+                                    log::info!("RelayUpgrade WS: accept from {}", addr);
+                                    // WS upgrade succeeded - use the cloned TCP stream
+                                    tokio::net::TcpStream::connect(addr).await.ok()
                                 }
-                                Err(_) => None,
+                                Err(_) => {
+                                    // Not a WS connection, use raw TCP directly
+                                    log::info!("RelayUpgrade TCP: accept from {}", addr);
+                                    Some(tcp)
+                                }
                             }
-                        }
-                        // Branch 2: Connect to peer via raw TCP
+                        } => { res }
+                        // Connect to peer via raw TCP
                         res = tokio::time::timeout(Duration::from_secs(2),
                             tokio::net::TcpStream::connect(target)) => {
                             match res {
@@ -3126,20 +3132,13 @@ pub async fn relay_upgrade_task(
                                 _ => None,
                             }
                         }
-                        // Branch 3: Accept WebSocket connection (peer connected via WS)
-                        res = async {
-                            let (tcp, addr) = listener_clone.accept().await.ok()?;
-                            tokio_tungstenite::accept_async(tcp).await
-                                .map(|_| { log::info!("RelayUpgrade WS: accept from {}", addr); })
-                                .ok()?;
-                            Some(tcp)
-                        } => { res }
-                        // Branch 4: Connect to peer via WebSocket
+                        // Connect to peer via WebSocket (bypasses some firewalls)
                         res = tokio::time::timeout(Duration::from_secs(2),
                             tokio_tungstenite::connect_async(&ws_url)) => {
                             match res {
                                 Ok(Ok((_ws, _))) => {
                                     log::info!("RelayUpgrade WS: connect to {} succeeded!", target);
+                                    // WS upgrade established the connection; reconnect raw TCP
                                     tokio::net::TcpStream::connect(target).await.ok()
                                 }
                                 _ => None,
@@ -3304,15 +3303,20 @@ pub async fn relay_phase3_punch_to_peer(
 
                 let ws_url = format!("ws://{}:{}", tcp_target.ip(), tcp_target.port());
                 let result: Option<tokio::net::TcpStream> = tokio::select! {
-                    res = listener.accept() => {
-                        match res {
-                            Ok((stream, _)) => {
-                                log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
-                                Some(stream)
+                    res = async {
+                        let (tcp, addr) = listener.accept().await.ok()?;
+                        match tokio_tungstenite::accept_async(
+                            tcp.try_clone().ok()?).await {
+                            Ok(_ws) => {
+                                log::info!("Phase3(Host) WS: accept from {}", addr);
+                                tokio::net::TcpStream::connect(addr).await.ok()
                             }
-                            Err(_) => None,
+                            Err(_) => {
+                                log::info!("Phase3(Host) TCP: accept from {}", addr);
+                                Some(tcp)
+                            }
                         }
-                    }
+                    } => { res }
                     res = tokio::time::timeout(Duration::from_secs(3),
                         tokio::net::TcpStream::connect(tcp_target)) => {
                         match res {
@@ -3324,12 +3328,6 @@ pub async fn relay_phase3_punch_to_peer(
                             _ => None,
                         }
                     }
-                    res = async {
-                        let (tcp, addr) = listener.accept().await.ok()?;
-                        tokio_tungstenite::accept_async(tcp).await
-                            .map(|_| log::info!("Phase3(Host) WS: accept from {}", addr)).ok()?;
-                        Some(tcp)
-                    } => { res }
                     res = tokio::time::timeout(Duration::from_secs(3),
                         tokio_tungstenite::connect_async(&ws_url)) => {
                         match res {
