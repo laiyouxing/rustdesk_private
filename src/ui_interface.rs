@@ -749,7 +749,15 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
-    (*SOFTWARE_UPDATE_URL
+    let v = crate::common::SOFTWARE_UPDATE_VERSION
+        .lock()
+        .unwrap()
+        .clone();
+    if !v.is_empty() {
+        return v;
+    }
+    // Fallback: extract from URL (for original GitHub flow)
+    (*crate::common::SOFTWARE_UPDATE_URL
         .lock()
         .unwrap()
         .rsplit('/')

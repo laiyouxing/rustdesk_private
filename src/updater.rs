@@ -135,18 +135,33 @@ fn check_update(manually: bool) -> ResultType<()> {
     if update_url.is_empty() {
         log::debug!("No update available.");
     } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
-        #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
-            format!(
-                "{}/rustdesk-{}-x86_64.{}",
-                download_url,
-                version,
-                if update_msi { "msi" } else { "exe" }
+        let (download_url, version) = if crate::is_custom_client()
+            || !update_url.contains("releases/tag")
+        {
+            // Custom build or non-GitHub URL: use the download URL and version as-is
+            (
+                update_url.clone(),
+                crate::common::SOFTWARE_UPDATE_VERSION
+                    .lock()
+                    .unwrap()
+                    .clone(),
             )
         } else {
-            format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
+            // Original GitHub release flow: construct download URL
+            let dl_url = update_url.replace("tag", "download");
+            let ver = dl_url.split('/').last().unwrap_or_default();
+            #[cfg(target_os = "windows")]
+            let dl_url = if cfg!(feature = "flutter") {
+                format!(
+                    "{}/rustdesk-{}-x86_64.{}",
+                    dl_url,
+                    ver,
+                    if update_msi { "msi" } else { "exe" }
+                )
+            } else {
+                format!("{}/rustdesk-{}-x86-sciter.exe", dl_url, ver)
+            };
+            (dl_url, ver)
         };
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url(&download_url);
