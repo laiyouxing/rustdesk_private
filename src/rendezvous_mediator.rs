@@ -21,6 +21,7 @@ use hbb_common::{
     rendezvous_proto::*,
     sleep,
     socket_client::{self, connect_tcp, is_ipv4, new_direct_udp_for, new_udp_for},
+    timeout,
     tokio::{self, select, sync::Mutex, time::interval},
     udp::FramedSocket,
     AddrMangle, IntoTargetAddr, ResultType, Stream, TargetAddr,
@@ -569,8 +570,14 @@ impl RendezvousMediator {
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&fla.socket_addr);
         log::debug!("Handle intranet from {:?}", peer_addr);
+        // Create TCP listener FIRST to avoid TIME_WAIT race with hbbs connection port.
+        let listener = hbb_common::tcp::new_listener(
+            SocketAddr::from(([0u8; 4], 0u16)), false
+        ).await?;
+        let listen_addr = listener.local_addr()?;
+        let port = listen_addr.port();
+        // Then connect to hbbs to send LocalAddr message.
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
-        let port = socket.local_addr().port();
         // enumerate all non-loopback IPv4 addresses for multi-network support
         let mut local_addrs: Vec<Vec<u8>> = Vec::new();
         for interface in default_net::get_interfaces() {
@@ -582,13 +589,11 @@ impl RendezvousMediator {
             }
         }
         if local_addrs.is_empty() {
-            // fallback to TCP socket's local address
-            let addr: SocketAddr =
-                format!("{}:{}", socket.local_addr().ip(), port).parse()?;
-            local_addrs.push(AddrMangle::encode(addr).into());
+            // fallback to listener's local address
+            local_addrs.push(AddrMangle::encode(listen_addr).into());
         }
-        log::info!("HandleIntranet: enumerating {} local address(es): {:?}",
-            local_addrs.len(),
+        log::info!("HandleIntranet: listener_port={} enumerating {} local address(es): {:?}",
+            port, local_addrs.len(),
             local_addrs.iter().map(|b| AddrMangle::decode(b)).collect::<Vec<_>>());
         let mut msg_out = Message::new();
         msg_out.set_local_addr(LocalAddr {
@@ -602,14 +607,21 @@ impl RendezvousMediator {
         });
         let bytes = msg_out.write_to_bytes()?;
         socket.send_raw(bytes).await?;
-        crate::accept_connection(
-            server.clone(),
-            socket,
-            peer_addr,
-            true,
-            fla.control_permissions.into_option(),
-        )
-        .await;
+        drop(socket);
+        // Accept connection from A on the pre-created listener.
+        if let Ok((stream, addr)) = timeout(CONNECT_TIMEOUT, listener.accept()).await? {
+            stream.set_nodelay(true).ok();
+            let stream_addr = stream.local_addr()?;
+            crate::server::create_tcp_connection(
+                server,
+                Stream::from(stream, stream_addr),
+                addr,
+                true,
+                fla.control_permissions.into_option(),
+                false,
+            )
+            .await?;
+        }
         Ok(())
     }
 
