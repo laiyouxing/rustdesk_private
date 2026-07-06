@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::{ops::Deref, sync::Arc};
 
 lazy_static::lazy_static! {
-    pub static ref HIDE_CM: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    pub static ref HIDE_CM: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
 }
 
 #[derive(Clone, Default)]
