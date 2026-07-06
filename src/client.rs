@@ -548,7 +548,23 @@ impl Client {
                                         ));
                                     }
                                 }
-                                log::info!("All LAN addresses failed, falling back to relay");
+                                log::info!("All LAN addresses failed, trying direct port {}",
+                                    RENDEZVOUS_PORT + 2);
+                                // Use the original peer address's IP with the direct access port
+                                let direct_port = (RENDEZVOUS_PORT + 2) as u16;
+                                let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
+                                if let Ok(mut direct_stream) = hbb_common::socket_client::connect_tcp(
+                                    direct_addr, 3000
+                                ).await {
+                                    log::info!("Direct port connection to {} succeeded!", direct_addr);
+                                    let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut direct_stream).await?;
+                                    return Ok((
+                                        (direct_stream, true, pk, None, "LAN"),
+                                        (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+                                        false,
+                                    ));
+                                }
+                                log::info!("Direct port failed, falling back to relay");
                             }
                         }
                     }
