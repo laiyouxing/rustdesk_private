@@ -1065,7 +1065,10 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
                         if std::fs::write(&file_path, &bytes).is_ok() {
                             log::info!("Force update: downloaded to {:?}", file_path);
                             if let Some(path_str) = file_path.to_str() {
+                                #[cfg(not(target_os = "linux"))]
                                 let _ = crate::platform::update_to(path_str);
+                                #[cfg(target_os = "linux")]
+                                log::info!("Force update: download complete at {}, please install manually", path_str);
                             }
                         }
                     }
