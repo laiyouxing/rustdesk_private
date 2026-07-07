@@ -3025,17 +3025,7 @@ pub async fn relay_upgrade_task(
         if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
             for addr in peer_addrs.drain(..) {
                 let base_port = addr.port();
-                // Helper to add a target if not already present
-                let mut add_target = |p: u16| {
-                    if p > 0 && p != base_port {
-                        let mut scan_addr = addr;
-                        scan_addr.set_port(p);
-                        if !targets.contains(&scan_addr) {
-                            targets.push(scan_addr);
-                        }
-                    }
-                };
-                // 1) Exact peer port
+                // 1) Exact peer port (before closure to avoid borrow conflict)
                 if !targets.contains(&addr) {
                     targets.push(addr);
                     log::info!("Phase3: added peer address {} to targets", addr);
@@ -3043,14 +3033,27 @@ pub async fn relay_upgrade_task(
                 // 2) Predicted port: base_port + our_delta (symmetric NAT heuristic)
                 if our_delta != 0 {
                     let predicted = base_port.wrapping_add(our_delta as u16);
-                    add_target(predicted);
+                    if predicted > 0 && predicted != base_port {
+                        let mut scan_addr = addr;
+                        scan_addr.set_port(predicted);
+                        if !targets.contains(&scan_addr) {
+                            targets.push(scan_addr);
+                        }
+                    }
                     log::info!("Phase3: predicted port {} (base {} + delta {})",
                         predicted, base_port, our_delta);
                 }
                 // 3) Narrow scan range around base port
                 for offset in 1..=PREDICTED_SCAN_RANGE {
-                    add_target(base_port.wrapping_add(offset));
-                    add_target(base_port.wrapping_sub(offset));
+                    for &p in &[base_port.wrapping_add(offset), base_port.wrapping_sub(offset)] {
+                        if p > 0 && p != base_port {
+                            let mut scan_addr = addr;
+                            scan_addr.set_port(p);
+                            if !targets.contains(&scan_addr) {
+                                targets.push(scan_addr);
+                            }
+                        }
+                    }
                 }
                 log::info!("Phase3: predicted scan for {}: {} targets (range ±{}, delta {})",
                     addr, targets.len(), PREDICTED_SCAN_RANGE, our_delta);
