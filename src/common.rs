@@ -2986,7 +2986,7 @@ pub async fn relay_upgrade_task(
         }).or_else(|| alt_servers.first());
         match alt_server {
             Some(srv) => {
-                if let Ok(alt) = srv.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
+                if let Some(alt) = srv.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
                     let _ = socket.connect(alt).await;
                     socket.send(&[]).await.ok();
                     if let Ok((alt_addr, _)) = stun_query_single_server(&socket, srv).await {
@@ -3270,7 +3270,7 @@ pub async fn relay_phase3_punch_to_peer(
                 let base_port = base_addr.port() as i16;
                 // Try a different server to measure delta
                 let alt = servers_v4.get(1).unwrap_or(&servers_v4[0]);
-                if let Ok(alt_addr) = alt.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
+                if let Some(alt_addr) = alt.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
                     let _ = socket.connect(alt_addr).await;
                     socket.send(&[]).await.ok();
                     if let Ok((alt_addr, _)) = stun_query_single_server(&socket, alt).await {
