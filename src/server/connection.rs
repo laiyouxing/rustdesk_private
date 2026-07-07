@@ -946,6 +946,8 @@ impl Connection {
                         if let Some(enc) = saved_key {
                             conn.stream.set_encrypt(enc);
                             log::info!("Phase3(Host): encryption key transferred to new stream");
+                        } else {
+                            log::warn!("Phase3(Host): no encryption key from old stream!");
                         }
                     }
                 },

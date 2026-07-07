@@ -329,6 +329,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if let Some(enc) = saved_key {
                                     peer.set_encrypt(enc);
                                     log::info!("Phase3: encryption key transferred to new stream");
+                                } else {
+                                    log::warn!("Phase3: no encryption key from old stream!");
                                 }
                                 self.handler.update_direct(Some(true));
                                 self.handler.set_connection_type(
@@ -347,6 +349,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                     if let Some(enc) = saved_key {
                                         peer.set_encrypt(enc);
                                         log::info!("Phase3: encryption key transferred to new stream");
+                                    } else {
+                                        log::warn!("Phase3: no encryption key from old stream!");
                                     }
                                 }
                             } else {
