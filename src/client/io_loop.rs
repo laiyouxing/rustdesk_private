@@ -221,26 +221,31 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.punch_peer_addrs = Some(phase3_peer_rx.clone());
                 self.punch_tcp_addrs = Some(phase3_tcp_rx.clone());
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
-                    let n = punch_notify.clone();
-                    let d = punch_done.clone();
-                    let s = punch_stream.clone();
-                    let succ = punch_success.clone();
-                    let mut p2p_addrs = peer_addrs.clone();
-                    if !p2p_addrs.contains(&peer_addr) {
-                        p2p_addrs.push(peer_addr);
-                    }
-                    let phase3_peer = phase3_peer_rx.clone();
-                    let phase3_tcp = phase3_tcp_rx.clone();
-                    let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
-                        Arc::new(std::sync::Mutex::new(None));
-                    self.handler.set_punch_status("trying", "");
-                    // Cancel any previous Phase3 task to avoid parallel instances
-                    if let Some(old) = self.phase3_handle.take() {
-                        old.abort();
-                        log::info!("Phase3: cancelled previous punch task on reconnection");
-                    }
-                    self.phase3_handle = Some(tokio::spawn(async move {
-                        let ok = relay_upgrade_task(
+                    // Skip Phase3 if it failed on a previous attempt (reconnection path).
+                    // Only app restart or a successful Phase3 will reset this.
+                    if crate::common::should_skip_phase3() {
+                        log::info!("Phase3: skipped (previously failed in this session)");
+                    } else {
+                        let n = punch_notify.clone();
+                        let d = punch_done.clone();
+                        let s = punch_stream.clone();
+                        let succ = punch_success.clone();
+                        let mut p2p_addrs = peer_addrs.clone();
+                        if !p2p_addrs.contains(&peer_addr) {
+                            p2p_addrs.push(peer_addr);
+                        }
+                        let phase3_peer = phase3_peer_rx.clone();
+                        let phase3_tcp = phase3_tcp_rx.clone();
+                        let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                            Arc::new(std::sync::Mutex::new(None));
+                        self.handler.set_punch_status("trying", "");
+                        // Cancel any previous Phase3 task to avoid parallel instances
+                        if let Some(old) = self.phase3_handle.take() {
+                            old.abort();
+                            log::info!("Phase3: cancelled previous punch task on reconnection");
+                        }
+                        self.phase3_handle = Some(tokio::spawn(async move {
+                            let ok = relay_upgrade_task(
                             p2p_addrs, n, s, kcp_handle, udp_nat_port,
                             phase3_out_tx, phase3_peer, phase3_tcp,
                         ).await;
@@ -248,7 +253,8 @@ impl<T: InvokeUiSession> Remote<T> {
                         d.notify_one();
                         ok
                     }));
-                }
+                    } // end else
+                } // end if !direct
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
                     self.handler
                         .set_fingerprint(crate::common::pk_to_fingerprint(pk.unwrap_or_default()));
@@ -349,6 +355,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 } else {
                                     log::warn!("Phase3: no encryption key from old stream!");
                                 }
+                                crate::common::record_phase3_success();
                                 self.handler.update_direct(Some(true));
                                 self.handler.set_connection_type(
                                     peer.is_secured(), true, "UDP", &relay_server
@@ -371,6 +378,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 }
                             } else {
+                                crate::common::record_phase3_failure();
                                 log::info!("RelayUpgrade: punch failed, staying on relay");
                                 self.handler.set_punch_status("failed", "");
                             }

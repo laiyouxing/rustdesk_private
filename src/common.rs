@@ -68,6 +68,37 @@ pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String:
 /// this custom fork (not stock RustDesk).  Set in PunchHoleRequest.custom_tag.
 pub const CUSTOM_TAG: &str = "rustdesk-custom";
 
+/// Timestamp of the last Phase3 punch failure.
+/// Used to skip Phase3 on reconnection if it recently failed.
+static LAST_PHASE3_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Record that Phase3 succeeded, clearing any previous failure record.
+/// On subsequent reconnections, Phase3 will be attempted again.
+pub fn record_phase3_success() {
+    if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
+        guard.take();
+    }
+}
+
+/// Record that Phase3 failed. On subsequent reconnections,
+/// Phase3 will be skipped (stay on relay) to avoid repeated failure.
+/// Reset only on app restart or when Phase3 succeeds again.
+pub fn record_phase3_failure() {
+    if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
+        *guard = Some(std::time::Instant::now());
+    }
+}
+
+/// Returns true if Phase3 should be skipped (failed on a previous attempt).
+pub fn should_skip_phase3() -> bool {
+    if let Ok(guard) = LAST_PHASE3_FAIL_AT.lock() {
+        guard.is_some()
+    } else {
+        false
+    }
+}
+
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
