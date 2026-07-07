@@ -10,9 +10,19 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
 
 jobs:
+  setup-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-ver.outputs.version }}
+    steps:
+      - name: Get version from tag
+        id: get-ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
   run-flutter-tag-build:
+    needs: setup-version
     uses: ./.github/workflows/flutter-build.yml
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: ${{ github.ref_name }}
+      upload-tag: ${{ needs.setup-version.outputs.version }}
