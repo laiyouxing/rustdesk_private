@@ -421,6 +421,7 @@ impl Client {
         let mut feedback = 0;
         let mut candidates_from_b: Vec<String> = Vec::new();
         let mut rtts_from_b: Vec<i32> = Vec::new();
+        let mut relay_test: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async { None });
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -527,6 +528,14 @@ impl Client {
                             log::info!("Got PunchHoleResponse from hbbs: relay_server={}, is_local={}, peer_addr={}",
                                 relay_server, is_local, peer_addr);
 
+                            // Start relay latency testing in background to run in
+                            // parallel with LAN testing. If LAN succeeds, discard result.
+                            let relay_candidates = candidates_from_b.clone();
+                            let relay_rtts = rtts_from_b.clone();
+                            relay_test = tokio::spawn(async move {
+                                pick_best_relay_combined(&relay_candidates, &relay_rtts).await
+                            });
+
                             // If same_intranet, try host's LAN addresses first
                             if is_local {
                                 let lan_addrs: Vec<SocketAddr> = ph.socket_addrs
@@ -575,54 +584,12 @@ impl Client {
                 }
             }
         }
-        // A-side combined relay selection: test latency to B's candidates
-        // and pick the one with minimum A_RTT + B_RTT.
-        if candidates_from_b.len() > 1 && candidates_from_b.len() == rtts_from_b.len() {
-            let mut results = Vec::new();
-            log::info!(
-                "A testing {} relay candidates from B for combined RTT",
-                candidates_from_b.len()
-            );
-            for (i, host) in candidates_from_b.iter().enumerate() {
-                let b_rtt = rtts_from_b[i];
-                let begin = Instant::now();
-                let reachable = hbb_common::socket_client::connect_tcp(host, 2000)
-                    .await
-                    .is_ok();
-                let a_rtt = begin.elapsed().as_millis() as i32;
-                let combined = if reachable {
-                    a_rtt + b_rtt
-                } else {
-                    i32::MAX
-                };
-                log::info!(
-                    "  Candidate {}: host={}, A_RTT={}ms, B_RTT={}ms, combined={}",
-                    i,
-                    host,
-                    a_rtt,
-                    b_rtt,
-                    if combined == i32::MAX {
-                        "unreachable".to_string()
-                    } else {
-                        format!("{}ms", combined)
-                    }
-                );
-                results.push((combined, host.clone()));
-            }
-            // Pick the best candidate that is reachable from both sides
-            results.sort_by(|a, b| a.0.cmp(&b.0));
-            if let Some((combined, best)) = results.first() {
-                if *combined < i32::MAX {
-                    log::info!(
-                        "A selected relay '{}' with combined RTT {}ms (A+B)",
-                        best,
-                        combined
-                    );
-                    relay_server = best.clone();
-                }
-            }
+        // Await the background relay latency test.
+        if let Some(best) = relay_test.await.unwrap_or(None) {
+            log::info!("A selected relay '{}' with best combined RTT (A+B)", best);
+            relay_server = best;
         }
-        // Phase3/ReSTUN will attempt to upgrade to direct connection later.
+        // Phase3/ReSTUN will attempt to upgrade to direct connection later.// Phase3/ReSTUN will attempt to upgrade to direct connection later.
         let secure = !key.is_empty() && !token.is_empty();
         let relay_conn = Self::request_relay(
             &peer,
@@ -4333,4 +4300,53 @@ async fn udp_nat_connect(
             anyhow!(err)
         })?;
     Ok((res.1, Some(res.0), typ))
+}
+
+
+
+/// Test TCP latency to each relay candidate and return the one with
+/// minimum combined (A_RTT + B_RTT). Called in background alongside LAN testing.
+async fn pick_best_relay_combined(candidates: &[String], rtts_from_b: &[i32]) -> Option<String> {
+    if candidates.len() < 2 || candidates.len() != rtts_from_b.len() {
+        return None;
+    }
+    let mut results = Vec::new();
+    log::info!(
+        "A testing {} relay candidates in parallel for combined RTT",
+        candidates.len()
+    );
+    for (i, host) in candidates.iter().enumerate() {
+        let b_rtt = rtts_from_b[i];
+        let begin = std::time::Instant::now();
+        let reachable = hbb_common::socket_client::connect_tcp(host, 2000)
+            .await
+            .is_ok();
+        let a_rtt = begin.elapsed().as_millis() as i32;
+        let combined = if reachable { a_rtt + b_rtt } else { i32::MAX };
+        log::info!(
+            "  Candidate {}: host={}, A_RTT={}ms, B_RTT={}ms, combined={}",
+            i,
+            host,
+            a_rtt,
+            b_rtt,
+            if combined == i32::MAX {
+                "unreachable".to_string()
+            } else {
+                format!("{}ms", combined)
+            }
+        );
+        results.push((combined, host.clone()));
+    }
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some((combined, best)) = results.first() {
+        if *combined < i32::MAX {
+            log::info!(
+                "A selected relay '{}' with combined RTT {}ms (A+B)",
+                best,
+                combined
+            );
+            return Some(best.clone());
+        }
+    }
+    None
 }
