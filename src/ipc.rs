@@ -277,6 +277,9 @@ pub enum Data {
     ClipboardNonFile(Option<(String, Vec<ClipboardNonFile>)>),
     PrivacyModeState((i32, PrivacyModeState, String)),
     TestRendezvousServer,
+    /// Tells the service (SYSTEM) to install an update file without UAC prompt.
+    /// The service runs as SYSTEM so it can launch the installer directly.
+    InstallUpdate(String),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Keyboard(DataKeyboard),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -955,6 +958,20 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .send(&Data::FileTransferEnabledState(Some(enabled)))
                     .await
             );
+        }
+        Data::InstallUpdate(file) => {
+            // Service (SYSTEM) runs the installer directly, no UAC prompt needed
+            log::info!("Service installing update: {}", file);
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new(&file)
+                    .arg("--update")
+                    .spawn();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = crate::platform::update_to(&file);
+            }
         }
         _ => {}
     }

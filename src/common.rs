@@ -1065,7 +1065,15 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
                         if std::fs::write(&file_path, &bytes).is_ok() {
                             log::info!("Force update: downloaded to {:?}", file_path);
                             if let Some(path_str) = file_path.to_str() {
-                                let _ = crate::platform::update_to(path_str);
+                                // Try to install via service IPC first (no UAC prompt on Windows).
+                                // Fallback to direct update if IPC fails.
+                                if let Ok(mut stream) = crate::ipc::connect(2000, "").await {
+                                    let _ = stream.send(&crate::ipc::Data::InstallUpdate(path_str.to_owned())).await;
+                                    log::info!("Force update: sent install command to service");
+                                } else {
+                                    log::info!("Force update: service IPC failed, running directly");
+                                    let _ = crate::platform::update_to(path_str);
+                                }
                             }
                         }
                     }
