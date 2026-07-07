@@ -2229,6 +2229,49 @@ pub fn clear_gnome_shortcuts_inhibitor_permission() -> ResultType<()> {
     }
 }
 
+/// Auto-update on Linux: run the downloaded update file.
+/// Supports .deb, .rpm, and .AppImage formats.
+pub fn update_to(file: &str) -> ResultType<()> {
+    let file_path = std::path::Path::new(file);
+    let extension = file_path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_root = nix::unistd::Uid::current().is_root();
+
+    match extension.as_str() {
+        "deb" => {
+            if is_root {
+                std::process::Command::new("dpkg")
+                    .args(["-i", file])
+                    .status()?;
+                log::info!("Deb package installed via dpkg");
+            } else {
+                log::info!("Force update requires root for .deb, trying pkexec...");
+                let _ = std::process::Command::new("pkexec")
+                    .args(["dpkg", "-i", file])
+                    .status();
+            }
+        }
+        "rpm" => {
+            let cmd = if is_root { "rpm" } else { "pkexec" };
+            std::process::Command::new(cmd)
+                .args(["-Uvh", file])
+                .status()?;
+            log::info!("RPM package installed");
+        }
+        "appimage" => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755))?;
+            log::info!("AppImage downloaded to {}, run it manually", file);
+        }
+        _ => {
+            log::info!("Unknown format '{}', downloaded to {}", extension, file);
+        }
+    }
+    Ok(())
+}
+
 /// Check if GNOME shortcuts inhibitor permission exists.
 pub fn has_gnome_shortcuts_inhibitor_permission() -> bool {
     let app_id = get_shortcuts_inhibitor_app_id();
