@@ -11,7 +11,9 @@ final _isExtracting = false.obs;
 
 void handleUpdate(String releasePageUrl) {
   _isExtracting.value = false;
-  String downloadUrl = releasePageUrl.replaceAll('tag', 'download');
+  String downloadUrl = releasePageUrl.contains('releases/tag')
+      ? releasePageUrl.replaceAll('tag', 'download')
+      : releasePageUrl;
   String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
   final String downloadFile =
       bind.mainGetCommonSync(key: 'download-file-$version');
