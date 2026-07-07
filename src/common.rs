@@ -1050,17 +1050,37 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let json: serde_json::Value = serde_json::from_slice(&bytes)?;
     let latest_version = json["data"]["version"].as_str().unwrap_or("").to_string();
     let download_url = json["data"]["url"].as_str().unwrap_or("").to_string();
+    let force_update = json["data"]["force_update"].as_bool().unwrap_or(false);
     if latest_version.is_empty() || download_url.is_empty() {
         return Ok(());
     }
     if get_version_number(&latest_version) > get_version_number(crate::VERSION) {
-        #[cfg(feature = "flutter")]
-        {
-            let mut m = std::collections::HashMap::new();
-            m.insert("name", "check_software_update_finish");
-            m.insert("url", &download_url);
-            if let Ok(data) = serde_json::to_string(&m) {
-                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+        if force_update {
+            // Force update: auto-download and install without user prompt
+            log::info!("Force update to version {} from {}", latest_version, download_url);
+            if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
+                // Download using the same HTTP client
+                if let Ok(resp) = client.get(&download_url).send().await {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if std::fs::write(&file_path, &bytes).is_ok() {
+                            log::info!("Force update: downloaded to {:?}", file_path);
+                            if let Some(path_str) = file_path.to_str() {
+                                let _ = crate::platform::update_to(path_str);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Normal update: notify Flutter to show dialog
+            #[cfg(feature = "flutter")]
+            {
+                let mut m = std::collections::HashMap::new();
+                m.insert("name", "check_software_update_finish");
+                m.insert("url", &download_url);
+                if let Ok(data) = serde_json::to_string(&m) {
+                    let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+                }
             }
         }
         *SOFTWARE_UPDATE_URL.lock().unwrap() = download_url;
