@@ -2861,12 +2861,7 @@ pub async fn relay_upgrade_task(
     }
 
     const TOTAL_BUDGET: Duration = Duration::from_secs(30);
-    // Port scan range for Symmetric NAT blind scanning.
-    // Symmetric NAT assigns a different port for each destination.
-    // The port typically increments by 1-5 per connection.
-    // Scanning ±50 ports covers most real-world cases.
-    // Also try ±100 for extreme cases where delta is larger.
-    const PORT_SCAN_RANGE: u16 = 50;
+    const PREDICTED_SCAN_RANGE: u16 = 10;
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
@@ -2915,7 +2910,7 @@ pub async fn relay_upgrade_task(
     }
 
     // Multi-STUN: query multiple times to detect port increment pattern
-    // for Symmetric NAT (NAT3/NAT4) port prediction.
+    // for Symmetric NAT port prediction.
     let mut targets = peer_addrs.clone();
     let mut our_addr: Option<std::net::SocketAddr> = None;
     let mut stun_ports: Vec<u16> = Vec::new();
@@ -2979,40 +2974,86 @@ pub async fn relay_upgrade_task(
         let _ = phase3_out_tx.try_send(tcp_addr);
         log::info!("Phase3: sent TCP listener address: {}", tcp_addr);
     }
+
+    // Measure our symmetric NAT delta by querying a different STUN server.
+    // On symmetric NAT, the mapped port changes for each different destination.
+    // This delta helps us predict the peer's port offset.
+    let our_delta: i16 = if stun_ports.len() >= 2 && our_addr.is_some() {
+        let base_port = stun_ports[0] as i16;
+        let alt_servers = get_stun_servers_v4();
+        let alt_server = selected_server.as_ref().and_then(|s| {
+            alt_servers.iter().find(|a| *a != s)
+        }).or_else(|| alt_servers.first());
+        match alt_server {
+            Some(srv) => {
+                if let Ok(alt) = srv.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
+                    let _ = socket.connect(alt).await;
+                    socket.send(&[]).await.ok();
+                    if let Ok((alt_addr, _)) = stun_query_single_server(&socket, srv).await {
+                        let delta = alt_addr.port() as i16 - base_port;
+                        log::info!("RelayUpgrade: symmetric delta measured: {} (port {} vs {})",
+                            delta, base_port, alt_addr.port());
+                        delta
+                    } else {
+                        log::info!("RelayUpgrade: no symmetric delta (alt STUN failed)");
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+    // Restore socket connection to the peer's first target for punching.
+    // We disconnected it during delta measurement. Reconnect is not critical
+    // since we reconnect to each target in the loop below.
+
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return false;
         }
 
-        // Check for peer Phase 3 addresses and add them to targets
+        // Check for peer Phase 3 addresses and add them to targets.
+        // Instead of blind ±50 port scan, use delta-based prediction:
+        //   - exact peer port (most likely for asymmetric NAT)
+        //   - predicted port (peer_port + our_delta, most likely for symmetric)
+        //   - narrow scan range ±PREDICTED_SCAN_RANGE around base port
         if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
             for addr in peer_addrs.drain(..) {
+                let base_port = addr.port();
+                // Helper to add a target if not already present
+                let mut add_target = |p: u16| {
+                    if p > 0 && p != base_port {
+                        let mut scan_addr = addr;
+                        scan_addr.set_port(p);
+                        if !targets.contains(&scan_addr) {
+                            targets.push(scan_addr);
+                        }
+                    }
+                };
+                // 1) Exact peer port
                 if !targets.contains(&addr) {
                     targets.push(addr);
                     log::info!("Phase3: added peer address {} to targets", addr);
                 }
-                // For Symmetric NAT, add port range for blind scanning.
-                // The peer's NAT may map a different port for our connection vs STUN.
-                // Try a range around the reported port to cover this delta.
-                let base_port = addr.port();
-                for offset in 1..=PORT_SCAN_RANGE {
-                    let ports = [
-                        base_port.wrapping_add(offset),
-                        base_port.wrapping_sub(offset),
-                    ];
-                    for &p in &ports {
-                        if p > 0 && p != base_port {
-                            let mut scan_addr = addr;
-                            scan_addr.set_port(p);
-                            if !targets.contains(&scan_addr) {
-                                targets.push(scan_addr);
-                            }
-                        }
-                    }
+                // 2) Predicted port: base_port + our_delta (symmetric NAT heuristic)
+                if our_delta != 0 {
+                    let predicted = base_port.wrapping_add(our_delta as u16);
+                    add_target(predicted);
+                    log::info!("Phase3: predicted port {} (base {} + delta {})",
+                        predicted, base_port, our_delta);
                 }
-                log::info!("Phase3: expanded {} with {} port scan targets (range ±{})",
-                    addr, PORT_SCAN_RANGE as u32 * 2, PORT_SCAN_RANGE);
+                // 3) Narrow scan range around base port
+                for offset in 1..=PREDICTED_SCAN_RANGE {
+                    add_target(base_port.wrapping_add(offset));
+                    add_target(base_port.wrapping_sub(offset));
+                }
+                log::info!("Phase3: predicted scan for {}: {} targets (range ±{}, delta {})",
+                    addr, targets.len(), PREDICTED_SCAN_RANGE, our_delta);
             }
         }
         // Try each target address with KCP (UDP) hole punching.
@@ -3172,7 +3213,7 @@ pub async fn relay_upgrade_task(
                     log::info!("Phase3: added peer address {} to targets (during gap)", addr);
                 }
                 let base_port = addr.port();
-                for offset in 1..=PORT_SCAN_RANGE {
+                for offset in 1..=PREDICTED_SCAN_RANGE {
                     let ports = [
                         base_port.wrapping_add(offset),
                         base_port.wrapping_sub(offset),
@@ -3216,21 +3257,56 @@ pub async fn relay_phase3_punch_to_peer(
     let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
 
     const MAX_TIME: Duration = Duration::from_secs(30);
-    const SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
+
+    // Measure our symmetric NAT delta to predict peer's port offset.
+    let our_delta: i16 = {
+        let servers_v4 = get_stun_servers_v4();
+        if servers_v4.is_empty() {
+            0
+        } else {
+            // STUN to first server to get base port
+            if let Ok((base_addr, _)) = stun_query_single_server(&socket, &servers_v4[0]).await {
+                let base_port = base_addr.port() as i16;
+                // Try a different server to measure delta
+                let alt = servers_v4.get(1).unwrap_or(&servers_v4[0]);
+                if let Ok(alt_addr) = alt.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
+                    let _ = socket.connect(alt_addr).await;
+                    socket.send(&[]).await.ok();
+                    if let Ok((alt_addr, _)) = stun_query_single_server(&socket, alt).await {
+                        let delta = alt_addr.port() as i16 - base_port;
+                        log::info!("Phase3(Host): symmetric delta measured: {} (base {}, alt {})",
+                            delta, base_port, alt_addr.port());
+                        delta
+                    } else { 0 }
+                } else { 0 }
+            } else { 0 }
+        }
+    };
+
+    // Build port offset list: prioritized by likelihood.
+    // - 0: exact match (asymmetric NAT)
+    // - our_delta: prediction for symmetric NAT
+    // - ±1, ±2, ±3: small drift
+    // - ±5, ±10, ±20: larger drift
+    let mut port_offsets: Vec<i16> = vec![0];
+    if our_delta != 0 && !port_offsets.contains(&our_delta) {
+        port_offsets.push(our_delta);
+    }
+    for d in [1i16, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20] {
+        if !port_offsets.contains(&d) {
+            port_offsets.push(d);
+        }
+    }
 
     for round in 0..5 {
         if started.elapsed() >= MAX_TIME {
             bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
 
-        let port_offsets: &[i16] = if round == 0 {
-            &[0]
-        } else {
-            &[0, 1, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20, SCAN_RANGE as i16, -(SCAN_RANGE as i16)]
-        };
+        let offsets: &[i16] = if round == 0 { &port_offsets[..5.min(port_offsets.len())] } else { &port_offsets };
 
-        for &offset in port_offsets {
+        for &offset in offsets {
             if started.elapsed() >= MAX_TIME {
                 bail!("Phase3(Host) punch timed out");
             }
@@ -3286,9 +3362,10 @@ pub async fn relay_phase3_punch_to_peer(
         // After KCP rounds, try TCP simultaneous open on remaining budget.
         if let Some(ref listener) = tcp_listener {
             if started.elapsed() >= MAX_TIME { break; }
-            let port_offsets: &[i16] = if round == 0 { &[0] }
-                else { &[0, 1, -1, 2, -2, 5, -5, 10, -10, SCAN_RANGE as i16, -(SCAN_RANGE as i16)] };
-            for &offset in port_offsets {
+            const TCP_SCAN_MAX: i16 = 20;
+            let tcp_offsets: &[i16] = if round == 0 { &[0] }
+                else { &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX] };
+            for &offset in tcp_offsets {
                 if started.elapsed() >= MAX_TIME { break; }
                 let mut tcp_target = peer_addr;
                 let new_port = (tcp_target.port() as i32 + offset as i32) as u16;
