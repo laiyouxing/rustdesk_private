@@ -1,7 +1,7 @@
 // All update logic is disabled for custom builds.
 #![allow(dead_code)]
 
-use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
+use crate::{common::do_check_software_update, hbbs_http::{create_http_client_with_url, create_http_client, TlsType}};
 use hbb_common::{bail, config, log, ResultType};
 use std::{
     io::Write,
@@ -162,7 +162,12 @@ fn check_update(manually: bool) -> ResultType<()> {
             dl_url
         };
         log::debug!("New version available: {}", &version);
-        let client = create_http_client_with_url(&download_url);
+        // For custom builds, always accept invalid certs to support self-signed HTTPS
+        let client = if crate::is_custom_client() {
+            create_http_client(TlsType::Rustls, true)
+        } else {
+            create_http_client_with_url(&download_url)
+        };
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
