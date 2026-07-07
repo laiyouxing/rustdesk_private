@@ -333,29 +333,38 @@ impl RendezvousMediator {
                 let relay_servers: Vec<String> = ph.relay_servers.to_vec();
                 let punch_nat_type = ph.nat_type;
                 tokio::spawn(async move {
-                    // If hbbs provided relay candidates, pick the one with lowest
-                    // latency from B's perspective; otherwise use the assigned one.
-                    let picked = if relay_servers.len() > 1 {
-                        let best = pick_best_relay(&relay_servers).await;
+                    // If hbbs provided relay candidates, test latency and sort them.
+                    // The sorted list (top 3) is sent back so A can also test and
+                    // compute combined (A + B) RTT for optimal relay selection.
+                    let (picked, candidates, candidate_rtts) = if relay_servers.len() > 1 {
+                        let (sorted_hosts, sorted_rtts) =
+                            sort_relays_by_latency(&relay_servers).await;
+                        let best = sorted_hosts.first().cloned().unwrap_or_default();
                         log::info!(
-                            "B picked relay '{}' from {} candidates (hbbs default was '{}')",
+                            "B tested {} relays, best='{}'({}ms), hbbs default='{}'",
+                            sorted_hosts.len(),
                             best,
-                            relay_servers.len(),
+                            sorted_rtts.first().copied().unwrap_or(0),
                             provided_relay_server,
                         );
-                        best
+                        // Take top 3 for A to also evaluate
+                        let top_n: Vec<String> =
+                            sorted_hosts.into_iter().take(3).collect();
+                        let top_rtts: Vec<i32> =
+                            sorted_rtts.into_iter().take(3).collect();
+                        (best, top_n, top_rtts)
                     } else if relay_servers.len() == 1 {
-                        relay_servers[0].clone()
+                        (relay_servers[0].clone(), vec![], vec![])
                     } else {
-                        provided_relay_server.clone()
+                        (provided_relay_server.clone(), vec![], vec![])
                     };
                     // Local config override takes highest priority
-                    let final_relay = {
+                    let (final_relay, final_candidates, final_rtts) = {
                         let cfg = Config::get_option("relay-server");
                         if cfg.is_empty() {
-                            picked
+                            (picked, candidates, candidate_rtts)
                         } else {
-                            cfg
+                            (cfg, vec![], vec![])
                         }
                     };
                     log::info!("B using relay_server: {}", final_relay);
@@ -371,6 +380,8 @@ impl RendezvousMediator {
                                 relay_server: final_relay,
                                 nat_type: punch_nat_type,
                                 version: crate::VERSION.to_owned(),
+                                relay_servers: final_candidates.into(),
+                                relay_rtts: final_rtts.into(),
                                 ..Default::default()
                             });
                             if socket.send(&msg_out).await.is_ok() {
@@ -1113,16 +1124,21 @@ impl Drop for CheckIfResendPk {
     }
 }
 
-/// Test TCP latency to each relay server and return the one with the lowest RTT.
-async fn pick_best_relay(relay_servers: &[String]) -> String {
+/// Test TCP latency to each relay server and return them sorted by RTT (fastest first).
+/// Returns (sorted_hosts, sorted_rtts_ms). Hosts include port (e.g., "host:21117").
+async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i32>) {
     if relay_servers.is_empty() {
-        return String::new();
+        return (Vec::new(), Vec::new());
     }
     if relay_servers.len() == 1 {
-        return relay_servers[0].clone();
+        let host = if !relay_servers[0].contains(':') {
+            format!("{}:{}", relay_servers[0], RELAY_PORT)
+        } else {
+            relay_servers[0].clone()
+        };
+        return (vec![host], vec![0]);
     }
 
-    type Entry = (String, Duration);
     let mut futs = Vec::new();
     for rs in relay_servers.iter() {
         let host = if !rs.contains(':') {
@@ -1134,9 +1150,9 @@ async fn pick_best_relay(relay_servers: &[String]) -> String {
             let begin = Instant::now();
             match hbb_common::socket_client::connect_tcp(&host, 2000).await {
                 Ok(_) => {
-                    let rtt = begin.elapsed();
-                    log::debug!("Relay {} latency: {:?}", host, rtt);
-                    Some((host, rtt))
+                    let rtt_ms = begin.elapsed().as_millis() as i32;
+                    log::debug!("Relay {} latency: {}ms", host, rtt_ms);
+                    Some((host, rtt_ms))
                 }
                 Err(e) => {
                     log::debug!("Relay {} unreachable: {}", host, e);
@@ -1147,19 +1163,23 @@ async fn pick_best_relay(relay_servers: &[String]) -> String {
     }
 
     let results = join_all(futs).await;
-    let best = results
+    let mut sorted: Vec<_> = results
         .into_iter()
         .filter_map(|r| r.ok().flatten())
-        .min_by(|a: &Entry, b: &Entry| a.1.cmp(&b.1));
+        .collect();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1));
 
-    match best {
-        Some((host, rtt)) => {
-            log::info!("Picked relay {} with RTT {:?}", host, rtt);
-            host
-        }
-        None => {
-            log::warn!("No relay reachable from B, returning first candidate");
+    if sorted.is_empty() {
+        log::warn!("No relay reachable from B, returning first candidate");
+        let host = if !relay_servers[0].contains(':') {
+            format!("{}:{}", relay_servers[0], RELAY_PORT)
+        } else {
             relay_servers[0].clone()
-        }
+        };
+        (vec![host], vec![0])
+    } else {
+        let (hosts, rtts): (Vec<_>, Vec<_>) = sorted.into_iter().unzip();
+        log::info!("Relay latency order: {:?} rtts={:?}", hosts, rtts);
+        (hosts, rtts)
     }
 }

@@ -419,6 +419,8 @@ impl Client {
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
         let mut feedback = 0;
+        let mut candidates_from_b: Vec<String> = Vec::new();
+        let mut rtts_from_b: Vec<i32> = Vec::new();
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -520,6 +522,8 @@ impl Client {
                             // Moves must come after all borrows
                             signed_id_pk = ph.pk.into();
                             relay_server = ph.relay_server;
+                            candidates_from_b = ph.relay_servers.to_vec();
+                            rtts_from_b = ph.relay_rtts.to_vec();
                             log::info!("Got PunchHoleResponse from hbbs: relay_server={}, is_local={}, peer_addr={}",
                                 relay_server, is_local, peer_addr);
 
@@ -568,6 +572,53 @@ impl Client {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+        // A-side combined relay selection: test latency to B's candidates
+        // and pick the one with minimum A_RTT + B_RTT.
+        if candidates_from_b.len() > 1 && candidates_from_b.len() == rtts_from_b.len() {
+            let mut results = Vec::new();
+            log::info!(
+                "A testing {} relay candidates from B for combined RTT",
+                candidates_from_b.len()
+            );
+            for (i, host) in candidates_from_b.iter().enumerate() {
+                let b_rtt = rtts_from_b[i];
+                let begin = Instant::now();
+                let reachable = hbb_common::socket_client::connect_tcp(host, 2000)
+                    .await
+                    .is_ok();
+                let a_rtt = begin.elapsed().as_millis() as i32;
+                let combined = if reachable {
+                    a_rtt + b_rtt
+                } else {
+                    i32::MAX
+                };
+                log::info!(
+                    "  Candidate {}: host={}, A_RTT={}ms, B_RTT={}ms, combined={}",
+                    i,
+                    host,
+                    a_rtt,
+                    b_rtt,
+                    if combined == i32::MAX {
+                        "unreachable".to_string()
+                    } else {
+                        format!("{}ms", combined)
+                    }
+                );
+                results.push((combined, host.clone()));
+            }
+            // Pick the best candidate that is reachable from both sides
+            results.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some((combined, best)) = results.first() {
+                if *combined < i32::MAX {
+                    log::info!(
+                        "A selected relay '{}' with combined RTT {}ms (A+B)",
+                        best,
+                        combined
+                    );
+                    relay_server = best.clone();
                 }
             }
         }
