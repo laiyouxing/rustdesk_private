@@ -13,7 +13,8 @@ use hbb_common::{
     allow_err,
     anyhow::{self, bail},
     config::{
-        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT,
+        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL,
+        RENDEZVOUS_PORT, RELAY_PORT,
     },
     futures::future::join_all,
     log,
@@ -329,9 +330,35 @@ impl RendezvousMediator {
                 let host = self.host.clone();
                 let peer_addr_bytes = ph.socket_addr.clone();
                 let provided_relay_server = ph.relay_server.clone();
-                let relay_server = self.get_relay_server(provided_relay_server);
+                let relay_servers: Vec<String> = ph.relay_servers.to_vec();
                 let punch_nat_type = ph.nat_type;
                 tokio::spawn(async move {
+                    // If hbbs provided relay candidates, pick the one with lowest
+                    // latency from B's perspective; otherwise use the assigned one.
+                    let picked = if relay_servers.len() > 1 {
+                        let best = pick_best_relay(&relay_servers).await;
+                        log::info!(
+                            "B picked relay '{}' from {} candidates (hbbs default was '{}')",
+                            best,
+                            relay_servers.len(),
+                            provided_relay_server,
+                        );
+                        best
+                    } else if relay_servers.len() == 1 {
+                        relay_servers[0].clone()
+                    } else {
+                        provided_relay_server.clone()
+                    };
+                    // Local config override takes highest priority
+                    let final_relay = {
+                        let cfg = Config::get_option("relay-server");
+                        if cfg.is_empty() {
+                            picked
+                        } else {
+                            cfg
+                        }
+                    };
+                    log::info!("B using relay_server: {}", final_relay);
                     if let Ok(mut socket) = hbb_common::socket_client::connect_tcp(
                         host.clone(), CONNECT_TIMEOUT
                     ).await {
@@ -341,7 +368,7 @@ impl RendezvousMediator {
                             msg_out.set_punch_hole_sent(PunchHoleSent {
                                 socket_addr: peer_addr_bytes,
                                 id: Config::get_id(),
-                                relay_server,
+                                relay_server: final_relay,
                                 nat_type: punch_nat_type,
                                 version: crate::VERSION.to_owned(),
                                 ..Default::default()
@@ -1082,6 +1109,57 @@ impl Drop for CheckIfResendPk {
         if SENT_REGISTER_PK.load(Ordering::SeqCst) && Config::get_cached_pk() != self.pk {
             Config::set_key_confirmed(false);
             log::info!("Set key_confirmed to false due to pk changed, will resend register_pk");
+        }
+    }
+}
+
+/// Test TCP latency to each relay server and return the one with the lowest RTT.
+async fn pick_best_relay(relay_servers: &[String]) -> String {
+    if relay_servers.is_empty() {
+        return String::new();
+    }
+    if relay_servers.len() == 1 {
+        return relay_servers[0].clone();
+    }
+
+    type Entry = (String, Duration);
+    let mut futs = Vec::new();
+    for rs in relay_servers.iter() {
+        let host = if !rs.contains(':') {
+            format!("{}:{}", rs, RELAY_PORT)
+        } else {
+            rs.clone()
+        };
+        futs.push(tokio::spawn(async move {
+            let begin = Instant::now();
+            match hbb_common::socket_client::connect_tcp(&host, 2000).await {
+                Ok(_) => {
+                    let rtt = begin.elapsed();
+                    log::debug!("Relay {} latency: {:?}", host, rtt);
+                    Some((host, rtt))
+                }
+                Err(e) => {
+                    log::debug!("Relay {} unreachable: {}", host, e);
+                    None
+                }
+            }
+        }));
+    }
+
+    let results = join_all(futs).await;
+    let best = results
+        .into_iter()
+        .filter_map(|r| r.ok().flatten())
+        .min_by(|a: &Entry, b: &Entry| a.1.cmp(&b.1));
+
+    match best {
+        Some((host, rtt)) => {
+            log::info!("Picked relay {} with RTT {:?}", host, rtt);
+            host
+        }
+        None => {
+            log::warn!("No relay reachable from B, returning first candidate");
+            relay_servers[0].clone()
         }
     }
 }

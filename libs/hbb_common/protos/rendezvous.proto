@@ -61,6 +61,7 @@ message PunchHole {
   bytes socket_addr_v6 = 7;
   ControlPermissions control_permissions = 8;
   bytes custom_tag = 9;
+  repeated string relay_servers = 10;
 }
 
 message TestNatRequest {
@@ -178,6 +179,7 @@ message FetchLocalAddr {
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
   ControlPermissions control_permissions = 4;
+  repeated string relay_servers = 5;
 }
 
 message LocalAddr {
