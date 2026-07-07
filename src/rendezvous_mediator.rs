@@ -1148,7 +1148,7 @@ async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i
         };
         futs.push(tokio::spawn(async move {
             let begin = Instant::now();
-            match hbb_common::socket_client::connect_tcp(&host, 2000).await {
+            match hbb_common::socket_client::connect_tcp(&*host, 2000).await {
                 Ok(_) => {
                     let rtt_ms = begin.elapsed().as_millis() as i32;
                     log::debug!("Relay {} latency: {}ms", host, rtt_ms);
