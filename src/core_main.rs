@@ -206,17 +206,21 @@ pub fn core_main() -> Option<Vec<String>> {
                     return None;
                 }
 
-                let text = match crate::platform::prepare_custom_client_update() {
+                let (text, restart_exe) = match crate::platform::prepare_custom_client_update() {
                     Err(e) => {
                         log::error!("Error preparing custom client update: {}", e);
-                        "Update failed!".to_string()
+                        ("Update failed!".to_string(), None)
                     }
-                    Ok(false) => "Update failed!".to_string(),
+                    Ok(false) => ("Update failed!".to_string(), None),
                     Ok(true) => match platform::update_me(false) {
-                        Ok(_) => "Updated successfully!".to_string(),
+                        Ok(_) => {
+                            // Determine the installed exe path for restart
+                            let exe = platform::get_install_info().3;
+                            ("Updated successfully!".to_string(), Some(exe))
+                        }
                         Err(err) => {
                             log::error!("Failed with error: {err}");
-                            "Update failed!".to_string()
+                            ("Update failed!".to_string(), None)
                         }
                     },
                 };
@@ -227,6 +231,11 @@ pub fn core_main() -> Option<Vec<String>> {
                     .duration(Duration::Short)
                     .show()
                     .ok();
+                // Restart the updated app
+                if let Some(exe) = restart_exe {
+                    log::info!("Restarting updated application: {}", exe);
+                    let _ = std::process::Command::new(&exe).spawn();
+                }
                 return None;
             } else if args[0] == "--after-install" {
                 if let Err(err) = platform::run_after_install() {
