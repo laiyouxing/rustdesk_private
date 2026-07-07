@@ -4318,7 +4318,7 @@ async fn pick_best_relay_combined(candidates: &[String], rtts_from_b: &[i32]) ->
     for (i, host) in candidates.iter().enumerate() {
         let b_rtt = rtts_from_b[i];
         let begin = std::time::Instant::now();
-        let reachable = hbb_common::socket_client::connect_tcp(&*host, 2000)
+        let reachable = hbb_common::socket_client::connect_tcp(host.as_str(), 2000)
             .await
             .is_ok();
         let a_rtt = begin.elapsed().as_millis() as i32;
