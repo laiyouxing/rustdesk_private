@@ -2020,14 +2020,19 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         return;
     }
     let mut remote = Remote::new(handler, receiver, sender);
-    // Auto-reconnect on network fluctuation: retry up to 3 times with 2s delay
-    for retry in 0..3 {
+    // Auto-reconnect with exponential backoff to survive transient outages
+    // such as Windows login/session switch (host process may restart).
+    // Initial: 1s, then 1.5s, 2.3s, 3.4s... capped at 15s, up to 30 attempts.
+    let max_retries: u32 = 30;
+    let mut delay = 1.0f32;
+    for retry in 0..max_retries {
         if retry > 0 {
-            log::info!("Connection lost, auto-reconnect attempt #{}/3", retry + 1);
-            sleep(2.).await;
+            log::info!("Connection lost, auto-reconnect attempt #{}/{} (delay={:.1}s)", retry + 1, max_retries, delay);
+            sleep(delay).await;
+            delay = (delay * 1.5).min(15.0);
         }
         remote.io_loop(&key, &token, round).await;
-        if remote.sent_close_reason || retry == 2 {
+        if remote.sent_close_reason {
             break;
         }
     }
