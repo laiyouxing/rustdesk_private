@@ -292,7 +292,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             if let Some(res) = res {
                                 match res {
                                     Err(err) => {
-                                        self.handler.on_establish_connection_error(err.to_string());
+                                        if received {
+                                            log::info!("Connection lost, reconnecting...");
+                                            self.handler.set_punch_status("reconnecting", "");
+                                        } else {
+                                            self.handler.on_establish_connection_error(err.to_string());
+                                        }
                                         break;
                                     }
                                     Ok(ref bytes) => {
@@ -311,6 +316,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if self.handler.is_restarting_remote_device() {
                                     log::info!("Restart remote device");
                                     self.handler.msgbox("restarting", "Restarting remote device", "remote_restarting_tip", "");
+                                } else if received {
+                                    log::info!("Reset by the peer, reconnecting...");
+                                    self.handler.set_punch_status("reconnecting", "");
                                 } else {
                                     log::info!("Reset by the peer");
                                     self.handler.msgbox("error", "Connection Error", "Reset by the peer", "");
