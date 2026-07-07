@@ -656,6 +656,7 @@ impl<T: InvokeUiSession> Remote<T> {
         if self.sent_close_reason {
             return;
         }
+        crate::common::reset_phase3_state();
         let mut misc = Misc::new();
         misc.set_close_reason(reason.to_owned());
         let mut msg = Message::new();

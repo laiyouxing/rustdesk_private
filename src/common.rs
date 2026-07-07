@@ -99,6 +99,14 @@ pub fn should_skip_phase3() -> bool {
     }
 }
 
+/// Reset Phase3 state so the next connection will try punching again.
+/// Called when the user explicitly closes the connection.
+pub fn reset_phase3_state() {
+    if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
+        guard.take();
+    }
+}
+
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
