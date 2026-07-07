@@ -940,8 +940,13 @@ impl Connection {
                 _ = punch_notify.notified() => {
                     let mut guard = punch_stream.lock().await;
                     if let Some(new_stream) = guard.take() {
+                        let saved_key = conn.stream.take_key();
                         log::info!("Phase3(Host): Relay upgraded to direct connection!");
                         conn.stream = new_stream;
+                        if let Some(enc) = saved_key {
+                            conn.stream.set_encrypt(enc);
+                            log::info!("Phase3(Host): encryption key transferred to new stream");
+                        }
                     }
                 },
                 Some(phase3_my_addr) = phase3_out_rx.recv() => {

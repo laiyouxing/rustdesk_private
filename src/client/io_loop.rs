@@ -324,7 +324,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut guard = punch_stream.lock().await;
                             if let Some(new_peer) = guard.take() {
                                 log::info!("Relay upgraded to direct connection!");
+                                let saved_key = peer.take_key();
                                 peer = new_peer;
+                                if let Some(enc) = saved_key {
+                                    peer.set_encrypt(enc);
+                                    log::info!("Phase3: encryption key transferred to new stream");
+                                }
                                 self.handler.update_direct(Some(true));
                                 self.handler.set_connection_type(
                                     peer.is_secured(), true, "UDP", &relay_server
@@ -337,7 +342,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                 let mut guard = punch_stream.lock().await;
                                 if let Some(new_stream) = guard.take() {
                                     log::info!("RelayUpgrade: punch succeeded, replacing relay stream");
+                                    let saved_key = peer.take_key();
                                     peer = new_stream;
+                                    if let Some(enc) = saved_key {
+                                        peer.set_encrypt(enc);
+                                        log::info!("Phase3: encryption key transferred to new stream");
+                                    }
                                 }
                             } else {
                                 log::info!("RelayUpgrade: punch failed, staying on relay");
