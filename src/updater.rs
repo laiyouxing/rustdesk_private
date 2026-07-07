@@ -1,8 +1,8 @@
 // All update logic is disabled for custom builds.
 #![allow(dead_code)]
 
-use crate::{common::do_check_software_update, hbbs_http::{create_http_client_with_url, create_http_client, TlsType}};
-use hbb_common::{bail, config, log, ResultType};
+use crate::{common::do_check_software_update, hbbs_http::{create_http_client_with_url, create_http_client}};
+use hbb_common::{bail, config, log, tls::TlsType, ResultType};
 use std::{
     io::Write,
     path::PathBuf,
