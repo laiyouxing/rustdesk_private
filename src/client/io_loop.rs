@@ -86,6 +86,8 @@ pub struct Remote<T: InvokeUiSession> {
     punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
     // Phase 3 TCP: separate vec for peer TCP listener addresses (TCP simultaneous open)
     punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Handle to cancel the previous Phase3 task on reconnection
+    phase3_handle: Option<tokio::task::JoinHandle<bool>>,
 }
 
 #[derive(Default)]
@@ -139,6 +141,7 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_notify: None,
             punch_peer_addrs: None,
             punch_tcp_addrs: None,
+            phase3_handle: None,
         }
     }
 
@@ -231,14 +234,20 @@ impl<T: InvokeUiSession> Remote<T> {
                     let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
                         Arc::new(std::sync::Mutex::new(None));
                     self.handler.set_punch_status("trying", "");
-                    tokio::spawn(async move {
+                    // Cancel any previous Phase3 task to avoid parallel instances
+                    if let Some(old) = self.phase3_handle.take() {
+                        old.abort();
+                        log::info!("Phase3: cancelled previous punch task on reconnection");
+                    }
+                    self.phase3_handle = Some(tokio::spawn(async move {
                         let ok = relay_upgrade_task(
                             p2p_addrs, n, s, kcp_handle, udp_nat_port,
                             phase3_out_tx, phase3_peer, phase3_tcp,
                         ).await;
                         succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                         d.notify_one();
-                    });
+                        ok
+                    }));
                 }
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
                     self.handler
