@@ -14,16 +14,21 @@ void handleUpdate(String releasePageUrl) {
   String downloadUrl = releasePageUrl.contains('releases/tag')
       ? releasePageUrl.replaceAll('tag', 'download')
       : releasePageUrl;
-  String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
-  final String downloadFile =
-      bind.mainGetCommonSync(key: 'download-file-$version');
-  if (downloadFile.startsWith('error:')) {
-    final error = downloadFile.replaceFirst('error:', '');
-    msgBox(gFFI.sessionId, 'custom-nocancel-nook-hasclose', 'Error', error,
-        releasePageUrl, gFFI.dialogManager);
-    return;
+
+  // For custom/non-GitHub URLs, skip the download-file query and use the URL directly
+  final bool isCustomUrl = !releasePageUrl.contains('releases/tag');
+  if (!isCustomUrl) {
+    String version = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1);
+    final String downloadFile =
+        bind.mainGetCommonSync(key: 'download-file-$version');
+    if (downloadFile.startsWith('error:')) {
+      final error = downloadFile.replaceFirst('error:', '');
+      msgBox(gFFI.sessionId, 'custom-nocancel-nook-hasclose', 'Error', error,
+          releasePageUrl, gFFI.dialogManager);
+      return;
+    }
+    downloadUrl = '$downloadUrl/$downloadFile';
   }
-  downloadUrl = '$downloadUrl/$downloadFile';
 
   SimpleWrapper downloadId = SimpleWrapper('');
   SimpleWrapper<VoidCallback> onCanceled = SimpleWrapper(() {});
