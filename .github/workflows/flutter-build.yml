@@ -819,7 +819,10 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           for name in rustdesk*??.dmg; do
-              mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
+              # 避免重复追加 arch（如 rustdesk-1.5.8-aarch64.dmg 已含 arch）
+              if [[ "$name" != *"-${{ matrix.job.arch }}.dmg" ]]; then
+                  mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
+              fi
           done
 
       - name: Publish DMG package
