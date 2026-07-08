@@ -1,5 +1,7 @@
 use hbb_common::{bail, log, tokio, ResultType};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use igd_next::aio::tokio::search_gateway;
+use igd_next::PortMappingProtocol;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// UPnP port mapping result
 pub struct UpnpMapping {
@@ -28,9 +30,6 @@ pub fn try_add_port_mapping_with_port(local_port: u16) -> Option<UpnpMapping> {
 }
 
 fn add_mapping(local_port: u16) -> ResultType<u16> {
-    use igd_next::aio::tokio::search_gateway;
-    use igd_next::PortMappingProtocol;
-
     let rt = tokio::runtime::Runtime::new()?;
     let gateway = rt.block_on(async {
         tokio::time::timeout(
@@ -54,7 +53,7 @@ fn add_mapping(local_port: u16) -> ResultType<u16> {
             gateway
                 .add_any_port(
                     PortMappingProtocol::TCP,
-                    local_addr,
+                    SocketAddr::V4(local_addr),
                     0, // lease duration: 0 = permanent
                     "RustDesk Direct Access",
                 )
@@ -82,7 +81,7 @@ pub fn try_remove_mapping(external_port: u16) {
         match search_gateway(Default::default()).await {
             Ok(gateway) => {
                 gateway
-                    .remove_port(igd_next::PortMappingProtocol::TCP, external_port)
+                    .remove_port(PortMappingProtocol::TCP, external_port)
                     .await
                     .ok();
                 true
