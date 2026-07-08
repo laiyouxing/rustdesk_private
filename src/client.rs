@@ -481,6 +481,7 @@ impl Client {
             conn_type: conn_type.into(),
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
+            upnp_port: crate::common::get_upnp_port() as _,
             local_addrs: local_addrs.into_iter().map(|v| v.into()).collect(),
             ..Default::default()
         });

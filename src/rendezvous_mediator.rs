@@ -380,6 +380,7 @@ impl RendezvousMediator {
                                 relay_server: final_relay,
                                 nat_type: punch_nat_type,
                                 version: crate::VERSION.to_owned(),
+                                upnp_port: crate::common::get_upnp_port() as _,
                                 relay_servers: final_candidates.into(),
                                 relay_rtts: final_rtts.into(),
                                 ..Default::default()
@@ -808,6 +809,7 @@ impl RendezvousMediator {
             relay_server,
             nat_type: nat_type.into(),
             version: crate::VERSION.to_owned(),
+            upnp_port: crate::common::get_upnp_port() as _,
             socket_addr_v6,
             ..Default::default()
         };

@@ -88,6 +88,9 @@ pub struct Remote<T: InvokeUiSession> {
     punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
     // Handle to cancel the previous Phase3 task on reconnection
     phase3_handle: Option<tokio::task::JoinHandle<bool>>,
+    // Inactivity timeout: track last user input for auto-disconnect
+    last_input_time: Instant,
+    inactivity_warning_remaining: Option<u32>,
 }
 
 #[derive(Default)]
@@ -142,6 +145,8 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_peer_addrs: None,
             punch_tcp_addrs: None,
             phase3_handle: None,
+            last_input_time: Instant::now(),
+            inactivity_warning_remaining: None,
         }
     }
 
@@ -446,6 +451,28 @@ impl<T: InvokeUiSession> Remote<T> {
                                 codec_format,
                                 ..Default::default()
                             });
+                            // Inactivity timeout check: 30 min idle → 30s countdown → disconnect
+                            const IDLE_TIMEOUT_MIN: u64 = 30;
+                            const COUNTDOWN_SEC: u32 = 30;
+                            let idle_secs = self.last_input_time.elapsed().as_secs();
+                            if idle_secs >= IDLE_TIMEOUT_MIN * 60 {
+                                if let Some(remaining) = self.inactivity_warning_remaining {
+                                    if remaining == 0 {
+                                        log::info!("Inactivity timeout: closing connection");
+                                        self.handler.msgbox("error", "Connection Error",
+                                            "Disconnected due to inactivity", "");
+                                        break;
+                                    }
+                                    let remain = remaining - 1;
+                                    self.inactivity_warning_remaining = Some(remain);
+                                    self.handler.set_punch_status(
+                                        "inactive",
+                                        &format!("{}s后自动断开", remain));
+                                } else {
+                                    self.inactivity_warning_remaining = Some(COUNTDOWN_SEC);
+                                    log::info!("Inactivity timeout warning: {}s countdown", COUNTDOWN_SEC);
+                                }
+                            }
                         }
                     }
                 }
@@ -681,6 +708,18 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.check_clipboard_file_context();
             }
             Data::Message(msg) => {
+                // Track user input for inactivity timeout
+                let is_input = matches!(&msg.union, 
+                    Some(message::Union::KeyEvent(_)) | 
+                    Some(message::Union::MouseEvent(_)));
+                if is_input {
+                    self.last_input_time = Instant::now();
+                    // Dismiss inactivity warning on any input
+                    if self.inactivity_warning_remaining.is_some() {
+                        self.inactivity_warning_remaining = None;
+                        self.handler.set_punch_status("connected", "");
+                    }
+                }
                 match &msg.union {
                     Some(message::Union::Misc(misc)) => match misc.union {
                         Some(misc::Union::RefreshVideo(_)) => {

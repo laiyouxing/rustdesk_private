@@ -169,6 +169,15 @@ impl Drop for SimpleCallOnReturn {
     }
 }
 
+/// UPnP mapping state (set once at startup)
+static UPNP_MAPPING: std::sync::Mutex<Option<crate::upnp::UpnpMapping>> =
+    std::sync::Mutex::new(None);
+
+/// Get the UPnP-mapped external port (0 if not available).
+pub fn get_upnp_port() -> u16 {
+    UPNP_MAPPING.lock().ok().and_then(|g| g.as_ref().map(|m| m.external_port)).unwrap_or(0)
+}
+
 pub fn global_init() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -176,10 +185,28 @@ pub fn global_init() -> bool {
             crate::server::wayland::init();
         }
     }
+    // Initialize UPnP if enabled (non-Android/non-iOS)
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let opt = hbb_common::config::LocalConfig::get_option(
+            hbb_common::config::keys::OPTION_ENABLE_UPNP);
+        if hbb_common::config::option2bool(hbb_common::config::keys::OPTION_ENABLE_UPNP, &opt) {
+            if let Ok(mut guard) = UPNP_MAPPING.lock() {
+                *guard = crate::upnp::try_add_port_mapping();
+            }
+        }
+    }
     true
 }
 
-pub fn global_clean() {}
+pub fn global_clean() {
+    // Remove UPnP mapping on shutdown
+    if let Ok(guard) = UPNP_MAPPING.lock() {
+        if let Some(ref mapping) = *guard {
+            crate::upnp::try_remove_mapping(mapping.external_port);
+        }
+    }
+}
 
 #[inline]
 pub fn set_server_running(b: bool) {
