@@ -1,4 +1,4 @@
-use hbb_common::{log, ResultType};
+use hbb_common::{bail, log, tokio, ResultType};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 /// UPnP port mapping result
@@ -42,7 +42,7 @@ fn add_mapping(local_port: u16) -> ResultType<u16> {
 
     let gateway = match gateway {
         Ok(Ok(g)) => g,
-        _ => anyhow::bail!("no UPnP gateway found"),
+        _ => bail!("no UPnP gateway found"),
     };
 
     let local_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), local_port);
@@ -64,12 +64,12 @@ fn add_mapping(local_port: u16) -> ResultType<u16> {
             Ok(mapped_port) => return Ok(mapped_port),
             Err(e) => {
                 if ext_port == 0 {
-                    anyhow::bail!("UPnP add port mapping failed: {}", e);
+                    bail!("UPnP add port mapping failed: {}", e);
                 }
             }
         }
     }
-    anyhow::bail!("UPnP add port mapping failed");
+    bail!("UPnP add port mapping failed");
 }
 
 /// Remove UPnP port mapping at shutdown.
@@ -79,7 +79,7 @@ pub fn try_remove_mapping(external_port: u16) {
         Err(_) => return,
     };
     let result = rt.block_on(async {
-        match igd_next::aio::tokio::search_gateway(Default::default()).await {
+        match search_gateway(Default::default()).await {
             Ok(gateway) => {
                 gateway
                     .remove_port(igd_next::PortMappingProtocol::TCP, external_port)
