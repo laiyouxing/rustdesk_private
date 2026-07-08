@@ -1,23 +1,23 @@
-use hbb_common::{config::RENDEZVOUS_PORT, log, ResultType};
+use hbb_common::{log, ResultType};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 /// UPnP port mapping result
 pub struct UpnpMapping {
     pub external_port: u16,
-    _local_port: u16,
+    pub local_port: u16,
 }
 
-/// Try to add a UPnP port mapping for the direct connection port.
-/// Returns the external port if successful, or None on failure.
+/// Try to add a UPnP port mapping for the given local port.
+/// The caller must hold a reservation socket on `local_port` to prevent
+/// TOCTOU race (the port should already be bound by a reservation socket).
 /// Runs synchronously at startup (best-effort, failure is silently ignored).
-pub fn try_add_port_mapping() -> Option<UpnpMapping> {
-    let local_port = (RENDEZVOUS_PORT + 2) as u16;
+pub fn try_add_port_mapping_with_port(local_port: u16) -> Option<UpnpMapping> {
     match add_mapping(local_port) {
         Ok(external_port) => {
             log::info!("UPnP: mapped external port {} → local {}", external_port, local_port);
             Some(UpnpMapping {
                 external_port,
-                _local_port: local_port,
+                local_port,
             })
         }
         Err(e) => {

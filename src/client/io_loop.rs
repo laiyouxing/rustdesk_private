@@ -249,9 +249,19 @@ impl<T: InvokeUiSession> Remote<T> {
                             old.abort();
                             log::info!("Phase3: cancelled previous punch task on reconnection");
                         }
+                        // Prefer UPnP local port so UDP socket uses the mapped port
+                        let punch_port = {
+                            let upnp_local = crate::common::get_upnp_local_port();
+                            if upnp_local > 0 {
+                                crate::common::release_upnp_reservation();
+                                upnp_local
+                            } else {
+                                udp_nat_port
+                            }
+                        };
                         self.phase3_handle = Some(tokio::spawn(async move {
                             let ok = relay_upgrade_task(
-                            p2p_addrs, n, s, kcp_handle, udp_nat_port,
+                            p2p_addrs, n, s, kcp_handle, punch_port,
                             phase3_out_tx, phase3_peer, phase3_tcp,
                         ).await;
                         succ.store(ok, std::sync::atomic::Ordering::SeqCst);

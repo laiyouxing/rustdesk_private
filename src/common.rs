@@ -173,9 +173,27 @@ impl Drop for SimpleCallOnReturn {
 static UPNP_MAPPING: std::sync::Mutex<Option<crate::upnp::UpnpMapping>> =
     std::sync::Mutex::new(None);
 
+/// Reservation socket that keeps the UPnP local port occupied until Phase3 uses it.
+/// Prevents TOCTOU race: port is reserved between UPnP discovery and socket creation.
+static UPNP_RESERVATION: std::sync::Mutex<Option<std::net::UdpSocket>> =
+    std::sync::Mutex::new(None);
+
 /// Get the UPnP-mapped external port (0 if not available).
 pub fn get_upnp_port() -> u16 {
     UPNP_MAPPING.lock().ok().and_then(|g| g.as_ref().map(|m| m.external_port)).unwrap_or(0)
+}
+
+/// Get the local port that was bound for UPnP (0 if not available).
+/// Use this as `punch_port` so UDP/TCP sockets use the UPnP-mapped local port.
+pub fn get_upnp_local_port() -> u16 {
+    UPNP_MAPPING.lock().ok().and_then(|g| g.as_ref().map(|m| m.local_port)).unwrap_or(0)
+}
+
+/// Release the UPnP reservation socket so the port can be used by Phase3.
+pub fn release_upnp_reservation() {
+    if let Ok(mut guard) = UPNP_RESERVATION.lock() {
+        guard.take();
+    }
 }
 
 pub fn global_init() -> bool {
@@ -191,8 +209,19 @@ pub fn global_init() -> bool {
         let opt = hbb_common::config::LocalConfig::get_option(
             hbb_common::config::keys::OPTION_ENABLE_UPNP);
         if hbb_common::config::option2bool(hbb_common::config::keys::OPTION_ENABLE_UPNP, &opt) {
-            if let Ok(mut guard) = UPNP_MAPPING.lock() {
-                *guard = crate::upnp::try_add_port_mapping();
+            // Create a reservation socket to hold the port until Phase3 needs it
+            if let Ok(reservation) = std::net::UdpSocket::bind(
+                std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
+            {
+                let local_port = reservation.local_addr().map(|a| a.port()).unwrap_or(0);
+                if local_port > 0 {
+                    if let Ok(mut rguard) = UPNP_RESERVATION.lock() {
+                        *rguard = Some(reservation);
+                    }
+                    if let Ok(mut guard) = UPNP_MAPPING.lock() {
+                        *guard = crate::upnp::try_add_port_mapping_with_port(local_port);
+                    }
+                }
             }
         }
     }
@@ -2959,10 +2988,13 @@ pub async fn relay_upgrade_task(
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
-    // TCP simultaneous open works where UDP hole punching fails
-    // because NATs treat TCP and UDP differently - TCP SYN packets
-    // often create more reliable NAT mappings than UDP datagrams.
-    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+    // Use UPnP local port if available for better NAT traversal.
+    let upnp_local = crate::common::get_upnp_local_port();
+    let tcp_listener = if upnp_local > 0 {
+        tokio::net::TcpListener::bind(format!("0.0.0.0:{}", upnp_local)).await.ok()
+    } else {
+        tokio::net::TcpListener::bind("0.0.0.0:0").await.ok()
+    };
     let tcp_listener_port = tcp_listener.as_ref()
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.port());
@@ -3342,8 +3374,12 @@ pub async fn relay_phase3_punch_to_peer(
 ) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
+    // Use UPnP local port if available so the mapped port is active
+    let upnp_local = crate::common::get_upnp_local_port();
     let bind_addr = if peer_addr.is_ipv6() {
         SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16))
+    } else if upnp_local > 0 {
+        SocketAddr::from(([0u8; 4], upnp_local))
     } else {
         SocketAddr::from(([0u8; 4], 0u16))
     };
@@ -3351,7 +3387,13 @@ pub async fn relay_phase3_punch_to_peer(
     let socket = Arc::new(socket);
 
     // Create TCP listener for TCP simultaneous open fallback.
-    let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+    // Use UPnP local port if available.
+    let upnp_local = crate::common::get_upnp_local_port();
+    let tcp_listener = if upnp_local > 0 {
+        tokio::net::TcpListener::bind(format!("0.0.0.0:{}", upnp_local)).await.ok()
+    } else {
+        tokio::net::TcpListener::bind("0.0.0.0:0").await.ok()
+    };
 
     const MAX_TIME: Duration = Duration::from_secs(30);
     let started = std::time::Instant::now();
