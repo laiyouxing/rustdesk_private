@@ -3813,9 +3813,7 @@ Widget _buildSymmetricNatWarning() {
   final icon = nat == 2
       ? Icons.warning_amber_rounded
       : Icons.language;
-  final shortLabel = nat == 2
-      ? '⚠ ${natStr}'
-      : '🌐 ${natStr}';
+  final shortLabel = natStr;
   final fullTip = nat == 2
       ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natStr'
       : '${translate('NAT')}: $natStr\n${translate('Public Address')}: $publicAddr';
