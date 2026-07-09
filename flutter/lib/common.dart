@@ -3799,19 +3799,18 @@ Widget _buildSymmetricNatWarning() {
   if (isMobile) return SizedBox.shrink();
   final nat = bind.mainGetNatType();
   final publicAddr = bind.mainGetPublicAddr();
-  if (nat != 2 && publicAddr.isEmpty) {
+  if (nat == 0 && publicAddr.isEmpty) {
     return SizedBox.shrink();
   }
   final color = nat == 2 ? Colors.orange : Colors.green;
   final icon = nat == 2
       ? Icons.warning_amber_rounded
       : Icons.language;
+  final natTypeStr = nat == 2 ? translate('symmetric_nat') : translate('cone_nat');
   final message = nat == 2
-      ? translate('symmetric_nat_warning')
-      : '${translate('Public Address')}: $publicAddr';
-  final subtitle = publicAddr.isNotEmpty
-      ? '\n${translate('Public Address')}: $publicAddr'
-      : '';
+      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natTypeStr'
+      : '${translate('NAT')}: $natTypeStr\n${translate('Public Address')}: $publicAddr';
+  final subtitle = '';
 
   return Container(
     color: color.shade100,

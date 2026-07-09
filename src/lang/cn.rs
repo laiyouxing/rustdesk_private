@@ -184,6 +184,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Direct and unencrypted connection", "非加密直连"),
         ("Relayed and unencrypted connection", "非加密中继连接"),
         ("Enter Remote ID", "输入对方 ID"),
+        ("Enter Hostname", "请输入主机名"),
         ("Enter your password", "输入密码"),
         ("Logging in...", "正在登录..."),
         ("Enable RDP session sharing", "允许 RDP 会话共享"),
@@ -751,5 +752,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Public Address", "公网地址"),
         ("NAT", "NAT类型"),
         ("symmetric_nat", "对称NAT (NAT4)"),
+        ("cone_nat", "锥形NAT (NAT1-3)"),
     ].iter().cloned().collect();
 }

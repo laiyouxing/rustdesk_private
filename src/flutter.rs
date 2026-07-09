@@ -1542,6 +1542,17 @@ pub mod connection_manager {
             );
         }
 
+        fn set_punch_status(&self, id: i32, status: String, info: String) {
+            self.push_event(
+                "cm_punch_status",
+                &[
+                    ("id", &id.to_string()),
+                    ("status", &status),
+                    ("info", &info),
+                ],
+            );
+        }
+
         fn change_theme(&self, dark: String) {
             self.push_event("theme", &[("dark", &dark)]);
         }

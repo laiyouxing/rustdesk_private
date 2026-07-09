@@ -13,7 +13,8 @@ use hbb_common::{
     allow_err,
     anyhow::{self, bail},
     config::{
-        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT,
+        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL,
+        RENDEZVOUS_PORT, RELAY_PORT,
     },
     futures::future::join_all,
     log,
@@ -21,6 +22,7 @@ use hbb_common::{
     rendezvous_proto::*,
     sleep,
     socket_client::{self, connect_tcp, is_ipv4, new_direct_udp_for, new_udp_for},
+    timeout,
     tokio::{self, select, sync::Mutex, time::interval},
     udp::FramedSocket,
     AddrMangle, IntoTargetAddr, ResultType, Stream, TargetAddr,
@@ -73,6 +75,22 @@ impl RendezvousMediator {
             crate::updater::start_auto_update();
         }
         check_zombie();
+        // Ensure the Windows service (rustdesk.exe --service) is running on startup.
+        // Clear stale stop-service flag (left over from update uninstall) so that
+        // the server loop below runs normally. If user manually stopped the service,
+        // it will be auto-restarted on next app launch (same as most software).
+        #[cfg(target_os = "windows")]
+        {
+            Config::set_option("stop-service".into(), "".into());
+            if crate::platform::is_installed() && !crate::platform::is_self_service_running() {
+                log::info!("Service not running on startup, starting it now...");
+                std::process::Command::new("sc")
+                    .arg("start")
+                    .arg(crate::get_app_name())
+                    .spawn()
+                    .ok();
+            }
+        }
         let server = new_server();
         if config::option2bool("stop-service", &Config::get_option("stop-service")) {
             crate::test_rendezvous_server();
@@ -306,10 +324,72 @@ impl RendezvousMediator {
                 }
             }
             Some(rendezvous_message::Union::PunchHole(ph)) => {
-                let rz = self.clone();
-                let server = server.clone();
+                // Send PunchHoleSent to hbbs so it can forward PunchHoleResponse
+                // back to the controller (A) with relay_server info.
+                // We do NOT do actual hole punching here — Phase3 upgrade handles it.
+                let host = self.host.clone();
+                let peer_addr_bytes = ph.socket_addr.clone();
+                let provided_relay_server = ph.relay_server.clone();
+                let relay_servers: Vec<String> = ph.relay_servers.to_vec();
+                let punch_nat_type = ph.nat_type;
                 tokio::spawn(async move {
-                    allow_err!(rz.handle_punch_hole(ph, server).await);
+                    // If hbbs provided relay candidates, test latency and sort them.
+                    // The sorted list (top 3) is sent back so A can also test and
+                    // compute combined (A + B) RTT for optimal relay selection.
+                    let (picked, candidates, candidate_rtts) = if relay_servers.len() > 1 {
+                        let (sorted_hosts, sorted_rtts) =
+                            sort_relays_by_latency(&relay_servers).await;
+                        let best = sorted_hosts.first().cloned().unwrap_or_default();
+                        log::info!(
+                            "B tested {} relays, best='{}'({}ms), hbbs default='{}'",
+                            sorted_hosts.len(),
+                            best,
+                            sorted_rtts.first().copied().unwrap_or(0),
+                            provided_relay_server,
+                        );
+                        // Take top 3 for A to also evaluate
+                        let top_n: Vec<String> =
+                            sorted_hosts.into_iter().take(3).collect();
+                        let top_rtts: Vec<i32> =
+                            sorted_rtts.into_iter().take(3).collect();
+                        (best, top_n, top_rtts)
+                    } else if relay_servers.len() == 1 {
+                        (relay_servers[0].clone(), vec![], vec![])
+                    } else {
+                        (provided_relay_server.clone(), vec![], vec![])
+                    };
+                    // Local config override takes highest priority
+                    let (final_relay, final_candidates, final_rtts) = {
+                        let cfg = Config::get_option("relay-server");
+                        if cfg.is_empty() {
+                            (picked, candidates, candidate_rtts)
+                        } else {
+                            (cfg, vec![], vec![])
+                        }
+                    };
+                    log::info!("B using relay_server: {}", final_relay);
+                    if let Ok(mut socket) = hbb_common::socket_client::connect_tcp(
+                        host.clone(), CONNECT_TIMEOUT
+                    ).await {
+                        let key = crate::get_key(true).await;
+                        if crate::secure_tcp(&mut socket, &key).await.is_ok() {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_punch_hole_sent(PunchHoleSent {
+                                socket_addr: peer_addr_bytes,
+                                id: Config::get_id(),
+                                relay_server: final_relay,
+                                nat_type: punch_nat_type,
+                                version: crate::VERSION.to_owned(),
+                                upnp_port: crate::common::get_upnp_port() as _,
+                                relay_servers: final_candidates.into(),
+                                relay_rtts: final_rtts.into(),
+                                ..Default::default()
+                            });
+                            if socket.send(&msg_out).await.is_ok() {
+                                log::info!("Sent PunchHoleSent to hbbs for relay_server assignment");
+                            }
+                        }
+                    }
                 });
             }
             Some(rendezvous_message::Union::RequestRelay(rr)) => {
@@ -545,24 +625,28 @@ impl RendezvousMediator {
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&fla.socket_addr);
         log::debug!("Handle intranet from {:?}", peer_addr);
+        // Create TCP listener FIRST to avoid TIME_WAIT race with hbbs connection port.
+        let listener = hbb_common::tcp::new_listener(
+            SocketAddr::from(([0u8; 4], 0u16)), false
+        ).await?;
+        let listen_addr = listener.local_addr()?;
+        let port = listen_addr.port();
+        // Then connect to hbbs to send LocalAddr message.
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
-        let port = socket.local_addr().port();
-        // enumerate all non-loopback IPv4 addresses for multi-network support
+        // enumerate ALL non-loopback IPv4 addresses using native OS API
+        // to capture virtual adapters (Tailscale/WireGuard VPN, L2 bridges).
         let mut local_addrs: Vec<Vec<u8>> = Vec::new();
-        for interface in default_net::get_interfaces() {
-            for ipv4 in &interface.ipv4 {
-                if !ipv4.addr.is_loopback() && !ipv4.addr.is_unspecified() {
-                    let addr = SocketAddr::new(std::net::IpAddr::V4(ipv4.addr), port);
-                    local_addrs.push(AddrMangle::encode(addr).into());
-                }
-            }
-        }
-        if local_addrs.is_empty() {
-            // fallback to TCP socket's local address
-            let addr: SocketAddr =
-                format!("{}:{}", socket.local_addr().ip(), port).parse()?;
+        for ip in crate::common::get_all_ipv4_addrs() {
+            let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
             local_addrs.push(AddrMangle::encode(addr).into());
         }
+        if local_addrs.is_empty() {
+            // fallback to listener's local address
+            local_addrs.push(AddrMangle::encode(listen_addr).into());
+        }
+        log::info!("HandleIntranet: listener_port={} enumerating {} local address(es): {:?}",
+            port, local_addrs.len(),
+            local_addrs.iter().map(|b| AddrMangle::decode(b)).collect::<Vec<_>>());
         let mut msg_out = Message::new();
         msg_out.set_local_addr(LocalAddr {
             id: Config::get_id(),
@@ -575,18 +659,36 @@ impl RendezvousMediator {
         });
         let bytes = msg_out.write_to_bytes()?;
         socket.send_raw(bytes).await?;
-        crate::accept_connection(
-            server.clone(),
-            socket,
-            peer_addr,
-            true,
-            fla.control_permissions.into_option(),
-        )
-        .await;
+        drop(socket);
+        // Accept connection from A on the pre-created listener.
+        if let Ok((stream, addr)) = timeout(CONNECT_TIMEOUT, listener.accept()).await? {
+            stream.set_nodelay(true).ok();
+            let stream_addr = stream.local_addr()?;
+            crate::server::create_tcp_connection(
+                server,
+                Stream::from(stream, stream_addr),
+                addr,
+                true,
+                fla.control_permissions.into_option(),
+                false,
+            )
+            .await?;
+        }
         Ok(())
     }
 
     async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
+        // Verify the connecting peer is also running our custom fork.
+        let expected_tag = crate::common::CUSTOM_TAG.as_bytes();
+        if ph.custom_tag.as_ref() != expected_tag {
+            log::warn!(
+                "Rejecting punch hole from {:?}: custom_tag mismatch (got {:?}, expected {:?})",
+                AddrMangle::decode(&ph.socket_addr),
+                String::from_utf8_lossy(ph.custom_tag.as_ref()),
+                crate::common::CUSTOM_TAG,
+            );
+            return Ok(());
+        }
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
         let mut last = LAST_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
@@ -602,35 +704,47 @@ impl RendezvousMediator {
 
         // Host-side: always start background punching when receiving punch hole
         // so that both sides punch simultaneously, enabling NAT traversal
-        // Use ph.udp_port if available (known port, NAT mapping predictable),
-        // otherwise fallback to random port.
+        // host_peer_addr: target connector's public address. Note that PunchHole.socket_addr
+        // carries the connector's TCP address (port), so we must override the port with
+        // ph.udp_port (connector's UDP port) to reach the connector's UDP socket.
+        // Host does NOT need to bind a specific local port — its NAT will allocate
+        // an external port. The earlier code mistakenly used ph.udp_port (connector's
+        // port) as host's bind port, which is wrong.
+        //
+        // Asymmetric: connector uses KcpStream::connect (in relay_upgrade_task),
+        // host uses KcpStream::accept here. Both first send empty packets to
+        // establish NAT mappings, but only the host LISTENS for KCP.
         {
-            let host_peer_addr = peer_addr;
-            let host_udp_port = ph.udp_port;
+            let host_peer_addr = if ph.udp_port > 0 {
+                let mut addr = peer_addr;
+                addr.set_port(ph.udp_port as u16);
+                addr
+            } else {
+                peer_addr
+            };
             let host_server = server.clone();
             let host_cp = control_permissions.clone();
             tokio::spawn(async move {
-                for round in 0..10 {
-                    let bind_addr = if host_udp_port > 0 {
-                        SocketAddr::from(([0u8; 4], host_udp_port as u16))
-                    } else {
-                        SocketAddr::from(([0u8; 4], 0))
-                    };
+                for _round in 0..5 {
+                    // Bind to any free local port; NAT will assign external port.
+                    let bind_addr = SocketAddr::from(([0u8; 4], 0u16));
                     let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
                         Ok(s) => Arc::new(s),
                         Err(_) => {
-                            sleep(10.0).await;
+                            sleep(2.0).await;
                             continue;
                         }
                     };
                     if socket.connect(host_peer_addr).await.is_err() {
-                        sleep(10.0).await;
+                        sleep(2.0).await;
                         continue;
                     }
-                    if let Ok(Some(data)) = crate::common::punch_udp(socket.clone(), true).await {
+                    // Send empty packet to establish our NAT mapping for the
+                    // connector's address, then listen for KCP handshake.
+                    if let Ok(Some(data)) =
+                        crate::common::punch_udp(socket.clone(), true).await
+                    {
                         log::info!("Host-side punching succeeded! Setting up KCP accept...");
-                        // [Fix #5]: After successful punch, set up KCP listener so the
-                        // connector's relay_upgrade_task KCP connect can be accepted.
                         if let Ok((_kcp, stream)) = crate::kcp_stream::KcpStream::accept(
                             socket.clone(),
                             Duration::from_millis(CONNECT_TIMEOUT as _),
@@ -644,12 +758,13 @@ impl RendezvousMediator {
                                 host_peer_addr,
                                 true,
                                 host_cp.clone(),
+                                false,
                             )
                             .await;
                         }
                         return;
                     }
-                    let delay = std::cmp::min(30, 5 + round * 5) as u64;
+                    let delay = std::cmp::min(30, 2 + _round * 2) as u64;
                     sleep(delay as f32).await;
                 }
                 log::info!("Host-side punching finished without success");
@@ -694,6 +809,7 @@ impl RendezvousMediator {
             relay_server,
             nat_type: nat_type.into(),
             version: crate::VERSION.to_owned(),
+            upnp_port: crate::common::get_upnp_port() as _,
             socket_addr_v6,
             ..Default::default()
         };
@@ -892,6 +1008,7 @@ async fn direct_server(server: ServerPtr) {
                             addr,
                             false,
                             None, // Direct connections don't have control_permissions
+                            false,
                         )
                         .await
                     );
@@ -969,6 +1086,7 @@ async fn udp_nat_listen(
             peer_addr_v4,
             true,
             control_permissions,
+            false,
         )
         .await?;
         Ok(())
@@ -1005,5 +1123,65 @@ impl Drop for CheckIfResendPk {
             Config::set_key_confirmed(false);
             log::info!("Set key_confirmed to false due to pk changed, will resend register_pk");
         }
+    }
+}
+
+/// Test TCP latency to each relay server and return them sorted by RTT (fastest first).
+/// Returns (sorted_hosts, sorted_rtts_ms). Hosts include port (e.g., "host:21117").
+async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i32>) {
+    if relay_servers.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if relay_servers.len() == 1 {
+        let host = if !relay_servers[0].contains(':') {
+            format!("{}:{}", relay_servers[0], RELAY_PORT)
+        } else {
+            relay_servers[0].clone()
+        };
+        return (vec![host], vec![0]);
+    }
+
+    let mut futs = Vec::new();
+    for rs in relay_servers.iter() {
+        let host = if !rs.contains(':') {
+            format!("{}:{}", rs, RELAY_PORT)
+        } else {
+            rs.clone()
+        };
+        futs.push(tokio::spawn(async move {
+            let begin = Instant::now();
+            match hbb_common::socket_client::connect_tcp(&*host, 2000).await {
+                Ok(_) => {
+                    let rtt_ms = begin.elapsed().as_millis() as i32;
+                    log::debug!("Relay {} latency: {}ms", host, rtt_ms);
+                    Some((host, rtt_ms))
+                }
+                Err(e) => {
+                    log::debug!("Relay {} unreachable: {}", host, e);
+                    None
+                }
+            }
+        }));
+    }
+
+    let results = join_all(futs).await;
+    let mut sorted: Vec<_> = results
+        .into_iter()
+        .filter_map(|r| r.ok().flatten())
+        .collect();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1));
+
+    if sorted.is_empty() {
+        log::warn!("No relay reachable from B, returning first candidate");
+        let host = if !relay_servers[0].contains(':') {
+            format!("{}:{}", relay_servers[0], RELAY_PORT)
+        } else {
+            relay_servers[0].clone()
+        };
+        (vec![host], vec![0])
+    } else {
+        let (hosts, rtts): (Vec<_>, Vec<_>) = sorted.into_iter().unzip();
+        log::info!("Relay latency order: {:?} rtts={:?}", hosts, rtts);
+        (hosts, rtts)
     }
 }

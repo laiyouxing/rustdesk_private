@@ -46,6 +46,10 @@ def system2(cmd):
 
 
 def get_version():
+    # CI builds pass BUILD_VERSION from Git tag; use it if available
+    build_version = os.environ.get("BUILD_VERSION")
+    if build_version:
+        return build_version.strip().lstrip('v')
     with open("Cargo.toml", encoding="utf-8") as fh:
         for line in fh:
             if line.startswith("version"):

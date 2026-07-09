@@ -616,7 +616,7 @@ class _ConnectionPageState extends State<ConnectionPage>
             decoration: InputDecoration(
               filled: false,
               counterText: '',
-              hintText: translate('Enter Remote ID'),
+              hintText: translate('Enter Hostname'),
               contentPadding: const EdgeInsets.symmetric(
                   horizontal: 15, vertical: 13),
               border: OutlineInputBorder(

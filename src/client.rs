@@ -409,7 +409,8 @@ impl Client {
         }
         log::info!("rendezvous server: {}", rendezvous_server);
         let mut socket = socket?;
-        let my_addr = socket.local_addr();
+        let _my_addr = socket.local_addr();
+
         let mut signed_id_pk = Vec::new();
         let mut relay_server = "".to_owned();
         let mut peer_addr = Config::get_any_listen_addr(true);
@@ -418,6 +419,9 @@ impl Client {
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
         let mut feedback = 0;
+        let mut candidates_from_b: Vec<String> = Vec::new();
+        let mut rtts_from_b: Vec<i32> = Vec::new();
+        let mut relay_test: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async { None });
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -430,15 +434,24 @@ impl Client {
             secure_tcp(&mut socket, &key)
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
-        } else if let Some(udp) = udp.1.as_ref() {
+        }
+        // Wait for UDP NAT test to complete BEFORE sending PunchHoleRequest.
+        // The TestNatResponse from hbbs carries the actual NAT external port
+        // of the punch socket. We need this to populate `udp_port` in the
+        // PunchHoleRequest so the peer can punch back correctly.
+        // Previously this only ran in the else branch, but with secure TCP
+        // (key/token present) the wait was skipped entirely, leaving
+        // udp_nat_port=0 and forcing TCP punch fallback.
+        if let Some(udp) = udp.1.as_ref() {
             let tm = Instant::now();
             loop {
                 let port = *udp.lock().unwrap();
                 if port > 0 {
                     break;
                 }
-                // await for 0.5 RTT
-                if tm.elapsed() > rtt / 2 {
+                // Wait up to 1.5 RTT for the UDP NAT test to complete.
+                if tm.elapsed() > rtt + rtt / 2 {
+                    log::warn!("UDP NAT test did not complete in time, udp_port={}", port);
                     break;
                 }
                 hbb_common::sleep(0.001).await;
@@ -446,44 +459,43 @@ impl Client {
         }
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
-        let mut msg_out = RendezvousMessage::new();
-        let mut ipv6 = if crate::get_ipv6_punch_enabled() {
-            if let Some((socket, addr)) = crate::get_ipv6_socket().await {
-                (Some(socket), Some(addr))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
-        let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
-        msg_out.set_punch_hole_request(PunchHoleRequest {
+        // Enumerate ALL local non-loopback IPv4 addresses using native OS API
+        // to capture virtual adapters (Tailscale/WireGuard VPN, L2 bridges)
+        // that default_net::get_interfaces() may skip on Windows.
+        let local_port = socket.local_addr().port();
+        let mut local_addrs: Vec<Vec<u8>> = Vec::new();
+        for ip in crate::common::get_all_ipv4_addrs() {
+            let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), local_port);
+            local_addrs.push(AddrMangle::encode(addr).into());
+        }
+        let mut msg_out = RendezvousMessage::new();
+        // Send PunchHoleRequest to hbbs to obtain relay_server from response.
+        // This is the same mechanism as original code — hbbs returns a PunchHole
+        // message containing the assigned relay server address.
+        let _ = msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
             nat_type: nat_type.into(),
             licence_key: key.to_owned(),
             conn_type: conn_type.into(),
-            version: crate::VERSION.to_owned(),
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
-            socket_addr_v6: ipv6.1.unwrap_or_default(),
+            upnp_port: crate::common::get_upnp_port() as _,
+            local_addrs: local_addrs.into_iter().map(|v| v.into()).collect(),
             ..Default::default()
         });
-        for i in 1..=3 {
-            log::info!(
-                "#{} {} punch attempt with {}, id: {}",
-                i,
-                punch_type,
-                my_addr,
-                peer
-            );
-            socket.send(&msg_out).await?;
-            // below timeout should not bigger than hbbs's connection timeout.
-            if let Some(msg_in) =
-                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 3000)).await
-            {
+        if socket.send(&msg_out).await.is_ok() {
+            if let Some(msg_in) = crate::get_next_nonkeyexchange_msg(&mut socket, Some(3000)).await {
                 match msg_in.union {
+                    Some(rendezvous_message::Union::PunchHole(ph)) => {
+                        // Non-LAN path: hbbs returns PunchHole with relay_server
+                        relay_server = ph.relay_server;
+                        peer_nat_type = ph.nat_type.enum_value().unwrap_or(NatType::UNKNOWN_NAT);
+                        peer_addr = AddrMangle::decode(&ph.socket_addr);
+                        log::info!("Got PunchHole from hbbs: relay_server={}, peer_addr={}",
+                            relay_server, peer_addr);
+                    }
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
                         if ph.socket_addr.is_empty() {
                             if !ph.other_failure.is_empty() {
@@ -507,135 +519,97 @@ impl Client {
                         } else {
                             peer_nat_type = ph.nat_type();
                             is_local = ph.is_local();
+                            feedback = ph.feedback;
+                            peer_addr = AddrMangle::decode(&ph.socket_addr);
+                            // Moves must come after all borrows
                             signed_id_pk = ph.pk.into();
                             relay_server = ph.relay_server;
-                            peer_addr = AddrMangle::decode(&ph.socket_addr);
-                            peer_addrs.clear();
-                            for addr_bytes in &ph.socket_addrs {
-                                let a = AddrMangle::decode(addr_bytes);
-                                if a.port() > 0 {
-                                    peer_addrs.push(a);
-                                }
-                            }
-                            feedback = ph.feedback;
-                            let s = udp.0.take();
-                            if ph.is_udp && s.is_some() {
-                                if let Some(s) = s {
-                                    allow_err!(s.connect(peer_addr).await);
-                                    udp.0 = Some(s);
-                                }
-                            }
-                            let s = ipv6.0.take();
-                            if !ph.socket_addr_v6.is_empty() && s.is_some() {
-                                let addr = AddrMangle::decode(&ph.socket_addr_v6);
-                                if addr.port() > 0 {
-                                    if let Some(s) = s {
-                                        allow_err!(s.connect(addr).await);
-                                        ipv6.0 = Some(s);
+                            candidates_from_b = ph.relay_servers.to_vec();
+                            rtts_from_b = ph.relay_rtts.to_vec();
+                            log::info!("Got PunchHoleResponse from hbbs: relay_server={}, is_local={}, peer_addr={}",
+                                relay_server, is_local, peer_addr);
+
+                            // Start relay latency testing in background to run in
+                            // parallel with LAN testing. If LAN succeeds, discard result.
+                            let relay_candidates = candidates_from_b.clone();
+                            let relay_rtts = rtts_from_b.clone();
+                            relay_test = tokio::spawn(async move {
+                                pick_best_relay_combined(&relay_candidates, &relay_rtts).await
+                            });
+
+                            // If same_intranet, try host's LAN addresses first
+                            if is_local {
+                                let lan_addrs: Vec<SocketAddr> = ph.socket_addrs
+                                    .iter()
+                                    .filter_map(|b| {
+                                        let addr = AddrMangle::decode(b);
+                                        if addr.port() > 0 { Some(addr) } else { None }
+                                    })
+                                    .collect();
+                                log::info!("Host LAN addresses received ({}/{} valid): {:?}",
+                                    lan_addrs.len(), ph.socket_addrs.len(), lan_addrs);
+                                for &lan_addr in &lan_addrs {
+                                    if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
+                                        lan_addr, 3000
+                                    ).await {
+                                        log::info!("LAN direct connection to {} succeeded!", lan_addr);
+                                        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut lan_stream).await?;
+                                        return Ok((
+                                            (lan_stream, true, pk, None, "LAN"),
+                                            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+                                            false,
+                                        ));
                                     }
                                 }
-                            }
-                            log::info!("{} Hole Punched {} = {}", punch_type, peer, peer_addr);
-                            break;
-                        }
-                    }
-                    Some(rendezvous_message::Union::RelayResponse(rr)) => {
-                        log::info!(
-                            "relay requested from peer, time used: {:?}, relay_server: {}",
-                            start.elapsed(),
-                            rr.relay_server
-                        );
-                        start = Instant::now();
-                        let mut connect_futures = Vec::new();
-                        if let Some(s) = ipv6.0 {
-                            let addr = AddrMangle::decode(&rr.socket_addr_v6);
-                            if addr.port() > 0 {
-                                if s.connect(addr).await.is_ok() {
-                                    connect_futures
-                                        .push(udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).boxed());
+                                log::info!("All LAN addresses failed, trying direct port {}",
+                                    RENDEZVOUS_PORT + 2);
+                                // Use the original peer address's IP with the direct access port
+                                let direct_port = (RENDEZVOUS_PORT + 2) as u16;
+                                let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
+                                if let Ok(mut direct_stream) = hbb_common::socket_client::connect_tcp(
+                                    direct_addr, 3000
+                                ).await {
+                                    log::info!("Direct port connection to {} succeeded!", direct_addr);
+                                    let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut direct_stream).await?;
+                                    return Ok((
+                                        (direct_stream, true, pk, None, "LAN"),
+                                        (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+                                        false,
+                                    ));
                                 }
+                                log::info!("Direct port failed, falling back to relay");
                             }
                         }
-                        signed_id_pk = rr.pk().into();
-                        let fut = Self::create_relay(
-                            &peer,
-                            rr.uuid,
-                            rr.relay_server,
-                            &key,
-                            conn_type,
-                            my_addr.is_ipv4(),
-                        );
-                        connect_futures.push(
-                            async move {
-                                let conn = fut.await?;
-                                Ok((conn, None, if use_ws() { "WebSocket" } else { "Relay" }))
-                            }
-                            .boxed(),
-                        );
-                        // Run all connection attempts concurrently, return the first successful one
-                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
-                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-
-                            Err(e) => (Err(e), None, ""),
-                        };
-                        let mut conn = conn?;
-                        feedback = rr.feedback;
-                        log::info!("{:?} used to establish {typ} connection", start.elapsed());
-                        let pk =
-                            Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
-                        return Ok((
-                            (conn, typ == "IPv6", pk, kcp, typ),
-                            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
-                            false,
-                        ));
                     }
-                    _ => {
-                        log::error!("Unexpected protobuf msg received: {:?}", msg_in);
-                    }
+                    _ => {}
                 }
             }
         }
-        drop(socket);
-        if peer_addr.port() == 0 {
-            bail!("Failed to connect via rendezvous server");
+        // Await the background relay latency test.
+        if let Some(best) = relay_test.await.unwrap_or(None) {
+            log::info!("A selected relay '{}' with best combined RTT (A+B)", best);
+            relay_server = best;
         }
-        let time_used = start.elapsed().as_millis() as u64;
-        log::info!(
-            "{} ms used to {} punch hole, relay_server: {}, {}",
-            time_used,
-            punch_type,
-            relay_server,
-            if is_local {
-                "is_local: true".to_owned()
-            } else {
-                format!("nat_type: {:?}", peer_nat_type)
-            }
-        );
-        Ok((
-            Self::connect(
-                my_addr,
-                peer_addr,
-                peer_addrs.clone(),
-                &peer,
-                signed_id_pk,
-                &relay_server,
-                &rendezvous_server,
-                time_used,
-                peer_nat_type,
-                my_nat_type,
-                is_local,
-                &key,
-                &token,
-                conn_type,
-                interface,
-                udp.0,
-                ipv6.0,
-                punch_type,
-            )
-            .await?,
-            (feedback, rendezvous_server, relay_server.clone(), peer_addr, peer_addrs.clone(), udp_nat_port),
-            true,
-        ))
+        // Phase3/ReSTUN will attempt to upgrade to direct connection later.// Phase3/ReSTUN will attempt to upgrade to direct connection later.
+        let secure = !key.is_empty() && !token.is_empty();
+        let relay_conn = Self::request_relay(
+            &peer,
+            relay_server.clone(),
+            &rendezvous_server,
+            secure,
+            &key,
+            &token,
+            conn_type,
+        )
+        .await?;
+        let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
+        let mut relay_conn = relay_conn;
+        let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut relay_conn).await?;
+        return Ok((
+            (relay_conn, false, pk, None, relay_type),
+            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+            false,
+        ));
     }
 
     /// Connect to the peer.
@@ -695,23 +669,8 @@ impl Client {
         // TCP simultaneous open: staggered connect attempts
         // to increase chance of SYNs crossing with the peer
         if is_local && !peer_addrs.is_empty() {
-            for (i, addr) in peer_addrs.iter().enumerate() {
+            for addr in peer_addrs.iter() {
                 let fut = connect_tcp_local(*addr, Some(local_addr), connect_timeout);
-                let delay = i as u64 * 300;
-                connect_futures.push(
-                    async move {
-                        if delay > 0 {
-                            hbb_common::tokio::time::sleep(Duration::from_millis(delay)).await;
-                        }
-                        let conn = fut.await?;
-                        Ok((conn, None, "TCP"))
-                    }
-                    .boxed(),
-                );
-            }
-        } else {
-            {
-                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
                 connect_futures.push(
                     async move {
                         let conn = fut.await?;
@@ -720,28 +679,34 @@ impl Client {
                     .boxed(),
                 );
             }
-            {
-                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-                connect_futures.push(
-                    async move {
-                        hbb_common::tokio::time::sleep(Duration::from_millis(200)).await;
-                        let conn = fut.await?;
-                        Ok((conn, None, "TCP+1"))
+        }
+        // Always add public TCP punching attempts so that if all local
+        // addresses fail (e.g. firewall blocks direct LAN), the punch
+        // still has a chance through NAT.  Previously these were gated
+        // behind `else`, meaning a misdetected LAN would skip public
+        // punching entirely and jump straight to relay.
+        // Increased from 3→5 attempts with tighter intervals to maximize
+        // the chance of TCP simultaneous open (SYN crossing).
+        const TCP_INTERVALS: [(&str, u64); 5] = [
+            ("TCP", 0),
+            ("TCP+1", 50),
+            ("TCP+2", 150),
+            ("TCP+3", 350),
+            ("TCP+4", 750),
+        ];
+        for (label, delay) in &TCP_INTERVALS {
+            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+            let delay = *delay;
+            connect_futures.push(
+                async move {
+                    if delay > 0 {
+                        hbb_common::tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
-                    .boxed(),
-                );
-            }
-            {
-                let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-                connect_futures.push(
-                    async move {
-                        hbb_common::tokio::time::sleep(Duration::from_millis(700)).await;
-                        let conn = fut.await?;
-                        Ok((conn, None, "TCP+2"))
-                    }
-                    .boxed(),
-                );
-            }
+                    let conn = fut.await?;
+                    Ok((conn, None, *label))
+                }
+                .boxed(),
+            );
         }
         if let Some(udp_socket_nat) = udp_socket_nat {
             connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
@@ -4213,11 +4178,11 @@ async fn test_udp_uat(
     udp_port: Arc<Mutex<u16>>,
     mut stop_udp_rx: oneshot::Receiver<()>,
 ) -> ResultType<()> {
-    let (tx, mut rx) = oneshot::channel::<_>();
+    // Run STUN only to detect public IP / NAT type. Do NOT use STUN's port —
+    // the STUN socket is different from the punch socket, so its NAT external
+    // port is unreliable. Always trust the TestNatResponse from hbbs.
     tokio::spawn(async {
-        if let Ok(v) = crate::test_nat_ipv4().await {
-            tx.send(v).ok();
-        }
+        let _ = crate::test_nat_ipv4().await;
     });
 
     let start = Instant::now();
@@ -4245,11 +4210,6 @@ async fn test_udp_uat(
 
     loop {
         tokio::select! {
-            Ok((addr, server)) = &mut rx => {
-                *udp_port.lock().unwrap() = addr.port();
-                log::debug!("UDP NAT test received response from {}: {}", addr, server);
-                break;
-            }
             _ = &mut stop_udp_rx => {
                 log::debug!("UDP NAT test received stop signal after {} packets", packets_sent);
                 break;
@@ -4274,13 +4234,14 @@ async fn test_udp_uat(
                     last_send_time = Instant::now();
                 }
             }
-            res = udp_socket.recv(&mut buf[..]) => {
+            res = udp_socket.recv_from(&mut buf[..]) => {
                 match res {
-                    Ok(n) => {
+                    Ok((n, _src)) => {
                         match RendezvousMessage::parse_from_bytes(&buf[0..n]) {
                             Ok(msg_in) => {
                                 if let Some(rendezvous_message::Union::TestNatResponse(response)) = msg_in.union {
                                     *udp_port.lock().unwrap() = response.port as u16;
+                                    log::info!("UDP NAT test: got TestNatResponse port={} from hbbs", response.port);
                                     break;
                                 }
                             }
@@ -4321,6 +4282,18 @@ async fn udp_nat_connect(
             log::debug!("{err}");
             anyhow!(err)
         })?;
+    // Brief delay to give the peer time to start its own UDP punch task.
+    // Without this delay, our KCP handshake can arrive at the peer's NAT
+    // before the peer has sent any UDP packet, so the peer's NAT drops
+    // our packet (it doesn't know us yet).
+    // Re-send empty packets during this delay to keep our NAT mapping
+    // active and increase the chance the peer's punch catches us.
+    let delay = Duration::from_millis(150);
+    let delay_start = std::time::Instant::now();
+    while delay_start.elapsed() < delay {
+        socket.send(&[]).await.ok();
+        hbb_common::tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let res = KcpStream::connect(socket, Duration::from_millis(ms_timeout))
         .await
         .map_err(|err| {
@@ -4328,4 +4301,53 @@ async fn udp_nat_connect(
             anyhow!(err)
         })?;
     Ok((res.1, Some(res.0), typ))
+}
+
+
+
+/// Test TCP latency to each relay candidate and return the one with
+/// minimum combined (A_RTT + B_RTT). Called in background alongside LAN testing.
+async fn pick_best_relay_combined(candidates: &[String], rtts_from_b: &[i32]) -> Option<String> {
+    if candidates.len() < 2 || candidates.len() != rtts_from_b.len() {
+        return None;
+    }
+    let mut results = Vec::new();
+    log::info!(
+        "A testing {} relay candidates in parallel for combined RTT",
+        candidates.len()
+    );
+    for (i, host) in candidates.iter().enumerate() {
+        let b_rtt = rtts_from_b[i];
+        let begin = std::time::Instant::now();
+        let reachable = hbb_common::socket_client::connect_tcp(host.as_str(), 2000)
+            .await
+            .is_ok();
+        let a_rtt = begin.elapsed().as_millis() as i32;
+        let combined = if reachable { a_rtt + b_rtt } else { i32::MAX };
+        log::info!(
+            "  Candidate {}: host={}, A_RTT={}ms, B_RTT={}ms, combined={}",
+            i,
+            host,
+            a_rtt,
+            b_rtt,
+            if combined == i32::MAX {
+                "unreachable".to_string()
+            } else {
+                format!("{}ms", combined)
+            }
+        );
+        results.push((combined, host.clone()));
+    }
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some((combined, best)) = results.first() {
+        if *combined < i32::MAX {
+            log::info!(
+                "A selected relay '{}' with combined RTT {}ms (A+B)",
+                best,
+                combined
+            );
+            return Some(best.clone());
+        }
+    }
+    None
 }

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::{ops::Deref, sync::Arc};
 
 lazy_static::lazy_static! {
-    pub static ref HIDE_CM: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    pub static ref HIDE_CM: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
 }
 
 #[derive(Clone, Default)]
@@ -73,6 +73,10 @@ impl InvokeUiCM for SciterHandler {
     }
 
     fn file_transfer_log(&self, _action: &str, _log: &str) {}
+
+    fn set_punch_status(&self, id: i32, status: String, info: String) {
+        self.call("setPunchStatus", &make_args!(id, status, info));
+    }
 }
 
 impl SciterHandler {

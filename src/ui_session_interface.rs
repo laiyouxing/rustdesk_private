@@ -15,7 +15,7 @@ use hbb_common::fs;
 use hbb_common::{
     allow_err,
     config::{Config, LocalConfig, PeerConfig},
-    get_version_number, log,
+    get_version_number, log, sleep,
     message_proto::*,
     rendezvous_proto::ConnType,
     tokio::{
@@ -2020,7 +2020,22 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         return;
     }
     let mut remote = Remote::new(handler, receiver, sender);
-    remote.io_loop(&key, &token, round).await;
+    // Auto-reconnect with exponential backoff to survive transient outages
+    // such as Windows login/session switch (host process may restart).
+    // Initial: 1s, then 1.5s, 2.3s, 3.4s... capped at 15s, up to 30 attempts.
+    let max_retries: u32 = 30;
+    let mut delay = 1.0f32;
+    for retry in 0..max_retries {
+        if retry > 0 {
+            log::info!("Connection lost, auto-reconnect attempt #{}/{} (delay={:.1}s)", retry + 1, max_retries, delay);
+            sleep(delay).await;
+            delay = (delay * 1.5).min(15.0);
+        }
+        remote.io_loop(&key, &token, round).await;
+        if remote.sent_close_reason {
+            break;
+        }
+    }
     let _ = remote.sync_jobs_status_to_local().await;
 }
 

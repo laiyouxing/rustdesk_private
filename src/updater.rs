@@ -1,8 +1,8 @@
 // All update logic is disabled for custom builds.
 #![allow(dead_code)]
 
-use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
-use hbb_common::{bail, config, log, ResultType};
+use crate::{common::do_check_software_update, hbbs_http::{create_http_client_with_url, create_http_client}};
+use hbb_common::{bail, config, log, tls::TlsType, ResultType};
 use std::{
     io::Write,
     path::PathBuf,
@@ -135,21 +135,39 @@ fn check_update(manually: bool) -> ResultType<()> {
     if update_url.is_empty() {
         log::debug!("No update available.");
     } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
-        #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
-            format!(
-                "{}/rustdesk-{}-x86_64.{}",
-                download_url,
-                version,
-                if update_msi { "msi" } else { "exe" }
-            )
+        let version = crate::common::SOFTWARE_UPDATE_VERSION
+            .lock()
+            .unwrap()
+            .clone();
+        let download_url = if crate::is_custom_client()
+            || !update_url.contains("releases/tag")
+        {
+            // Custom build or non-GitHub URL: use the download URL as-is
+            update_url.clone()
         } else {
-            format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
+            // Original GitHub release flow: construct download URL
+            let dl_url = update_url.replace("tag", "download");
+            let ver = dl_url.split('/').last().unwrap_or_default();
+            #[cfg(target_os = "windows")]
+            let dl_url = if cfg!(feature = "flutter") {
+                format!(
+                    "{}/rustdesk-{}-x86_64.{}",
+                    dl_url,
+                    ver,
+                    if update_msi { "msi" } else { "exe" }
+                )
+            } else {
+                format!("{}/rustdesk-{}-x86-sciter.exe", dl_url, ver)
+            };
+            dl_url
         };
         log::debug!("New version available: {}", &version);
-        let client = create_http_client_with_url(&download_url);
+        // For custom builds, always accept invalid certs to support self-signed HTTPS
+        let client = if crate::is_custom_client() {
+            create_http_client(TlsType::Rustls, true)
+        } else {
+            create_http_client_with_url(&download_url)
+        };
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
@@ -288,6 +306,11 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
 }
 
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
-    let filename = url.split('/').last()?;
-    Some(std::env::temp_dir().join(filename))
+    let filename = url.split('/').filter(|s| !s.is_empty()).last()?;
+    if filename.is_empty() || !filename.contains('.') {
+        // Fallback: use a generic name when the URL has no recognizable filename
+        Some(std::env::temp_dir().join("rustdesk_update.exe"))
+    } else {
+        Some(std::env::temp_dir().join(filename))
+    }
 }

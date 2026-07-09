@@ -90,6 +90,8 @@ jobs:
         with:
           ref: ${{ matrix.job.ref }}
           submodules: recursive
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
 
       - name: Import the codesign cert
         if: env.MACOS_P12_BASE64 != null
@@ -251,6 +253,8 @@ jobs:
         with:
           ref: ${{ matrix.job.ref }}
           submodules: recursive
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
 
       - name: Install dependencies
         run: |

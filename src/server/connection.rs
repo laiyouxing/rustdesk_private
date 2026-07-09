@@ -17,6 +17,7 @@ use crate::{
     client::{
         new_voice_call_request, new_voice_call_response, start_audio_thread, MediaData, MediaSender,
     },
+    common::relay_phase3_punch_to_peer,
     display_service, ipc, privacy_mode, video_service, VERSION,
 };
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -50,6 +51,7 @@ use serde_derive::Serialize;
 use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{
     collections::HashSet,
     net::Ipv6Addr,
@@ -322,6 +324,9 @@ pub struct Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     terminal_user_token: Option<TerminalUserToken>,
     terminal_generic_service: Option<Box<GenericService>>,
+    // Phase 3 relay upgrade
+    punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>>>,
+    punch_notify: Option<Arc<hbb_common::tokio::sync::Notify>>,
 }
 
 impl ConnInner {
@@ -373,6 +378,7 @@ impl Connection {
         id: i32,
         server: super::ServerPtrWeak,
         control_permissions: Option<ControlPermissions>,
+        is_relay: bool,
     ) {
         // Android is not supported yet, so we always set control_permissions to None.
         #[cfg(target_os = "android")]
@@ -500,6 +506,8 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
             terminal_generic_service: None,
+            punch_stream: None,
+            punch_notify: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -574,6 +582,73 @@ impl Connection {
         #[cfg(not(feature = "unix-file-copy-paste"))]
         {
             (_tx_clip, rx_clip) = mpsc::unbounded_channel::<i32>();
+        }
+
+        // Phase 3 relay upgrade: set up punch channels and spawn background task
+        let punch_notify = Arc::new(hbb_common::tokio::sync::Notify::new());
+        let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>> =
+            Arc::new(hbb_common::tokio::sync::Mutex::new(None));
+        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+        conn.punch_stream = Some(punch_stream.clone());
+        conn.punch_notify = Some(punch_notify.clone());
+        // Phase3 (Host-side): discover our public address via STUN and send it
+        // to the peer so both sides can punch through NAT concurrently.
+        // Run for ALL connections (relay + direct punch), not just relay,
+        // because the host also needs to exchange its public address.
+        {
+            let phase3_tx = phase3_out_tx;
+            let tx_to_cm = conn.tx_to_cm.clone();
+            tokio::spawn(async move {
+                // 0. Create TCP listener for TCP simultaneous open before STUN
+                // so we can exchange the TCP port alongside the STUN address.
+                let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+                let tcp_port = tcp_listener.as_ref()
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.port());
+                // 1. STUN to discover our public IPv4 address
+                if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                    let socket = Arc::new(socket);
+                    match crate::common::stun_query_with_socket(&socket).await {
+                        Ok((stun_addr, _)) => {
+                            log::info!("Phase3(Host): our public address via STUN: {}", stun_addr);
+                            let nat = if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
+                                "symmetric_nat"
+                            } else {
+                                "cone_nat"
+                            };
+                            let _ = tx_to_cm.send(ipc::Data::PunchStatus {
+                                status: nat.to_owned(),
+                                info: stun_addr.to_string(),
+                            });
+                            if phase3_tx.send(stun_addr).await.is_err() {
+                                log::info!("Phase3(Host): failed to send own address");
+                            }
+                            // Send TCP listener address for TCP simultaneous open
+                            if let Some(tcp_port_val) = tcp_port {
+                                let tcp_addr = std::net::SocketAddr::new(
+                                    stun_addr.ip(), tcp_port_val);
+                                let _ = phase3_tx.send(tcp_addr).await;
+                                log::info!("Phase3(Host): sent TCP listener address: {}", tcp_addr);
+                            }
+                        }
+                        Err(e) => {
+                            log::info!("Phase3(Host): STUN failed: {:?}", e);
+                        }
+                    }
+                }
+                // 2. Also send IPv6 address if available (for dual-stack peers)
+                if crate::get_ipv6_punch_enabled() {
+                    crate::test_ipv6().await;
+                    if let Some(ipv6_addr) = crate::common::get_cached_ipv6_addr() {
+                        let _ = tx_to_cm.send(ipc::Data::PunchStatus {
+                            status: "cone_nat".to_owned(),
+                            info: ipv6_addr.to_string(),
+                        });
+                        let _ = phase3_tx.send(ipv6_addr).await;
+                        log::info!("Phase3(Host): sent IPv6 address to peer: {}", ipv6_addr);
+                    }
+                }
+            });
         }
 
         loop {
@@ -861,6 +936,31 @@ impl Connection {
                         conn.on_close("Reset by the peer", true).await;
                         break;
                     }
+                },
+                _ = punch_notify.notified() => {
+                    let mut guard = punch_stream.lock().await;
+                    if let Some(new_stream) = guard.take() {
+                        let saved_key = conn.stream.take_key();
+                        log::info!("Phase3(Host): Relay upgraded to direct connection!");
+                        conn.stream = new_stream;
+                        if let Some(enc) = saved_key {
+                            conn.stream.set_encrypt(enc);
+                            log::info!("Phase3(Host): encryption key transferred to new stream");
+                        } else {
+                            log::warn!("Phase3(Host): no encryption key from old stream!");
+                        }
+                    }
+                },
+                Some(phase3_my_addr) = phase3_out_rx.recv() => {
+                    // Phase 3: Forward host's STUN-discovered address to connector through relay
+                    let mut misc = Misc::new();
+                    let mut ppa = PunchPeerAddr::new();
+                    ppa.addr = phase3_my_addr.to_string().into();
+                    misc.set_punch_peer_addr(ppa);
+                    let mut msg = Message::new();
+                    msg.set_misc(misc);
+                    allow_err!(conn.stream.send(&msg).await);
+                    log::info!("Phase3(Host): sent our address to peer: {}", phase3_my_addr);
                 },
                 _ = conn.file_timer.tick() => {
                     if !conn.read_jobs.is_empty() {
@@ -2328,6 +2428,34 @@ impl Connection {
                 self.on_close("Peer close", true).await;
                 raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
                 return false;
+            }
+            // Phase 3: Received connector's public address through relay
+            if let Some(misc::Union::PunchPeerAddr(ppa)) = &misc.union {
+                if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
+                {
+                    log::info!("Phase3(Host): received peer address: {}", peer_addr);
+                    let punch_stream = self.punch_stream.clone();
+                    let punch_notify = self.punch_notify.clone();
+                    let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                        Arc::new(std::sync::Mutex::new(None));
+                    tokio::spawn(async move {
+                        match relay_phase3_punch_to_peer(peer_addr, kcp_handle).await {
+                            Ok(stream) => {
+                                if let Some(s) = punch_stream {
+                                    let mut guard = s.lock().await;
+                                    *guard = Some(stream);
+                                }
+                                if let Some(n) = punch_notify {
+                                    n.notify_one();
+                                }
+                                log::info!("Phase3(Host): punch succeeded!");
+                            }
+                            Err(e) => {
+                                log::info!("Phase3(Host): punch to {} failed: {:?}", peer_addr, e);
+                            }
+                        }
+                    });
+                }
             }
         }
         // After handling CloseReason messages, proceed to process other message types

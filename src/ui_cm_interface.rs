@@ -196,6 +196,8 @@ pub trait InvokeUiCM: Send + Clone + 'static + Sized {
     fn update_voice_call_state(&self, client: &Client);
 
     fn file_transfer_log(&self, action: &str, log: &str);
+
+    fn set_punch_status(&self, id: i32, status: String, info: String);
 }
 
 impl<T: InvokeUiCM> Deref for ConnectionManager<T> {
@@ -613,6 +615,9 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 Data::FileTransferLog((action, log)) => {
                                     self.cm.ui_handler.file_transfer_log(&action, &log);
+                                }
+                                Data::PunchStatus { status, info } => {
+                                    self.cm.ui_handler.set_punch_status(self.conn_id, status, info);
                                 }
                                 #[cfg(target_os = "windows")]
                                 Data::ClipboardFile(_clip) => {

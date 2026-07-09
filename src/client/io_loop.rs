@@ -78,7 +78,19 @@ pub struct Remote<T: InvokeUiSession> {
     video_threads: HashMap<usize, VideoThread>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
-    sent_close_reason: bool,
+    pub sent_close_reason: bool,
+    // Relay upgrade
+    punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
+    punch_notify: Option<Arc<Notify>>,
+    // Phase 3: shared vec for relay_upgrade_task to pick up peer addresses
+    punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Phase 3 TCP: separate vec for peer TCP listener addresses (TCP simultaneous open)
+    punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Handle to cancel the previous Phase3 task on reconnection
+    phase3_handle: Option<tokio::task::JoinHandle<bool>>,
+    // Inactivity timeout: track last user input for auto-disconnect
+    last_input_time: Instant,
+    inactivity_warning_remaining: Option<u32>,
 }
 
 #[derive(Default)]
@@ -128,6 +140,13 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            punch_stream: None,
+            punch_notify: None,
+            punch_peer_addrs: None,
+            punch_tcp_addrs: None,
+            phase3_handle: None,
+            last_input_time: Instant::now(),
+            inactivity_warning_remaining: None,
         }
     }
 
@@ -184,29 +203,73 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
-                // Relay upgrade to direct (Tailscale-style background UDP punching)
+                // Relay upgrade to direct — merged Phase 3 into relay_upgrade_task
                 let punch_notify = Arc::new(Notify::new());
                 let punch_done = Arc::new(Notify::new());
                 let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
                     Arc::new(hbb_common::tokio::sync::Mutex::new(None));
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Channel for relay_upgrade_task to send our STUN address → io_loop → peer
+                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+                // Shared state for handle_msg_from_peer to push peer Phase 3 addresses
+                // into relay_upgrade_task's target list (same socket, no duplicate)
+                let phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                // Separate channel for peer TCP listener addresses (TCP simultaneous open).
+                // Identified by port: after KCP+IPv6 are received, the next different-port
+                // address from the same peer IP is the TCP listener address.
+                let phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                // Store for handle_msg_from_peer to access
+                self.punch_stream = Some(punch_stream.clone());
+                self.punch_notify = Some(punch_notify.clone());
+                self.punch_peer_addrs = Some(phase3_peer_rx.clone());
+                self.punch_tcp_addrs = Some(phase3_tcp_rx.clone());
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
-                    let n = punch_notify.clone();
-                    let d = punch_done.clone();
-                    let s = punch_stream.clone();
-                    let succ = punch_success.clone();
-                    // Include peer_addr (hbbs-reported public address) AND peer_addrs
-                    let mut p2p_addrs = peer_addrs.clone();
-                    if !p2p_addrs.contains(&peer_addr) {
-                        p2p_addrs.push(peer_addr);
-                    }
-                    self.handler.set_punch_status("trying", "");
-                    tokio::spawn(async move {
-                        relay_upgrade_task(p2p_addrs, n, s, udp_nat_port).await;
-                        succ.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Skip Phase3 if it failed on a previous attempt (reconnection path).
+                    // Only app restart or a successful Phase3 will reset this.
+                    if crate::common::should_skip_phase3() {
+                        log::info!("Phase3: skipped (previously failed in this session)");
+                    } else {
+                        let n = punch_notify.clone();
+                        let d = punch_done.clone();
+                        let s = punch_stream.clone();
+                        let succ = punch_success.clone();
+                        let mut p2p_addrs = peer_addrs.clone();
+                        if !p2p_addrs.contains(&peer_addr) {
+                            p2p_addrs.push(peer_addr);
+                        }
+                        let phase3_peer = phase3_peer_rx.clone();
+                        let phase3_tcp = phase3_tcp_rx.clone();
+                        let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                            Arc::new(std::sync::Mutex::new(None));
+                        self.handler.set_punch_status("trying", "");
+                        // Cancel any previous Phase3 task to avoid parallel instances
+                        if let Some(old) = self.phase3_handle.take() {
+                            old.abort();
+                            log::info!("Phase3: cancelled previous punch task on reconnection");
+                        }
+                        // Prefer UPnP local port so UDP socket uses the mapped port
+                        let punch_port = {
+                            let upnp_local = crate::common::get_upnp_local_port();
+                            if upnp_local > 0 {
+                                crate::common::release_upnp_reservation();
+                                upnp_local
+                            } else {
+                                udp_nat_port
+                            }
+                        };
+                        self.phase3_handle = Some(tokio::spawn(async move {
+                            let ok = relay_upgrade_task(
+                            p2p_addrs, n, s, kcp_handle, punch_port,
+                            phase3_out_tx, phase3_peer, phase3_tcp,
+                        ).await;
+                        succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                         d.notify_one();
-                    });
-                }
+                        ok
+                    }));
+                    } // end else
+                } // end if !direct
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
                     self.handler
                         .set_fingerprint(crate::common::pk_to_fingerprint(pk.unwrap_or_default()));
@@ -250,7 +313,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             if let Some(res) = res {
                                 match res {
                                     Err(err) => {
-                                        self.handler.on_establish_connection_error(err.to_string());
+                                        if received {
+                                            log::info!("Connection lost, reconnecting...");
+                                            self.handler.set_punch_status("reconnecting", "");
+                                        } else {
+                                            self.handler.on_establish_connection_error(err.to_string());
+                                        }
                                         break;
                                     }
                                     Ok(ref bytes) => {
@@ -269,6 +337,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if self.handler.is_restarting_remote_device() {
                                     log::info!("Restart remote device");
                                     self.handler.msgbox("restarting", "Restarting remote device", "remote_restarting_tip", "");
+                                } else if received {
+                                    log::info!("Reset by the peer, reconnecting...");
+                                    self.handler.set_punch_status("reconnecting", "");
                                 } else {
                                     log::info!("Reset by the peer");
                                     self.handler.msgbox("error", "Connection Error", "Reset by the peer", "");
@@ -291,7 +362,15 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut guard = punch_stream.lock().await;
                             if let Some(new_peer) = guard.take() {
                                 log::info!("Relay upgraded to direct connection!");
+                                let saved_key = peer.take_key();
                                 peer = new_peer;
+                                if let Some(enc) = saved_key {
+                                    peer.set_encrypt(enc);
+                                    log::info!("Phase3: encryption key transferred to new stream");
+                                } else {
+                                    log::warn!("Phase3: no encryption key from old stream!");
+                                }
+                                crate::common::record_phase3_success();
                                 self.handler.update_direct(Some(true));
                                 self.handler.set_connection_type(
                                     peer.is_secured(), true, "UDP", &relay_server
@@ -300,10 +379,35 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = punch_done.notified() => {
-                            if !punch_success.load(std::sync::atomic::Ordering::SeqCst) {
+                            if punch_success.load(std::sync::atomic::Ordering::SeqCst) {
+                                let mut guard = punch_stream.lock().await;
+                                if let Some(new_stream) = guard.take() {
+                                    log::info!("RelayUpgrade: punch succeeded, replacing relay stream");
+                                    let saved_key = peer.take_key();
+                                    peer = new_stream;
+                                    if let Some(enc) = saved_key {
+                                        peer.set_encrypt(enc);
+                                        log::info!("Phase3: encryption key transferred to new stream");
+                                    } else {
+                                        log::warn!("Phase3: no encryption key from old stream!");
+                                    }
+                                }
+                            } else {
+                                crate::common::record_phase3_failure();
                                 log::info!("RelayUpgrade: punch failed, staying on relay");
                                 self.handler.set_punch_status("failed", "");
                             }
+                        }
+                        Some(phase3_my_addr) = phase3_out_rx.recv() => {
+                            // Phase 3: Forward our STUN-discovered address to peer through relay
+                            let mut misc = Misc::new();
+                            let mut ppa = PunchPeerAddr::new();
+                            ppa.addr = phase3_my_addr.to_string().into();
+                            misc.set_punch_peer_addr(ppa);
+                            let mut msg = Message::new();
+                            msg.set_misc(misc);
+                            allow_err!(peer.send(&msg).await);
+                            log::info!("Phase3: sent our address to peer: {}", phase3_my_addr);
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {
@@ -357,6 +461,28 @@ impl<T: InvokeUiSession> Remote<T> {
                                 codec_format,
                                 ..Default::default()
                             });
+                            // Inactivity timeout check: 30 min idle → 30s countdown → disconnect
+                            const IDLE_TIMEOUT_MIN: u64 = 30;
+                            const COUNTDOWN_SEC: u32 = 30;
+                            let idle_secs = self.last_input_time.elapsed().as_secs();
+                            if idle_secs >= IDLE_TIMEOUT_MIN * 60 {
+                                if let Some(remaining) = self.inactivity_warning_remaining {
+                                    if remaining == 0 {
+                                        log::info!("Inactivity timeout: closing connection");
+                                        self.handler.msgbox("error", "Connection Error",
+                                            "Disconnected due to inactivity", "");
+                                        break;
+                                    }
+                                    let remain = remaining - 1;
+                                    self.inactivity_warning_remaining = Some(remain);
+                                    self.handler.set_punch_status(
+                                        "inactive",
+                                        &format!("{}s后自动断开", remain));
+                                } else {
+                                    self.inactivity_warning_remaining = Some(COUNTDOWN_SEC);
+                                    log::info!("Inactivity timeout warning: {}s countdown", COUNTDOWN_SEC);
+                                }
+                            }
                         }
                     }
                 }
@@ -567,6 +693,7 @@ impl<T: InvokeUiSession> Remote<T> {
         if self.sent_close_reason {
             return;
         }
+        crate::common::reset_phase3_state();
         let mut misc = Misc::new();
         misc.set_close_reason(reason.to_owned());
         let mut msg = Message::new();
@@ -591,6 +718,18 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.check_clipboard_file_context();
             }
             Data::Message(msg) => {
+                // Track user input for inactivity timeout
+                let is_input = matches!(&msg.union, 
+                    Some(message::Union::KeyEvent(_)) | 
+                    Some(message::Union::MouseEvent(_)));
+                if is_input {
+                    self.last_input_time = Instant::now();
+                    // Dismiss inactivity warning on any input
+                    if self.inactivity_warning_remaining.is_some() {
+                        self.inactivity_warning_remaining = None;
+                        self.handler.set_punch_status("connected", "");
+                    }
+                }
                 match &msg.union {
                     Some(message::Union::Misc(misc)) => match misc.union {
                         Some(misc::Union::RefreshVideo(_)) => {
@@ -2009,6 +2148,41 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::FollowCurrentDisplay(d_idx)) => {
                         self.handler.set_current_display(d_idx);
+                    }
+                    Some(misc::Union::PunchPeerAddr(ppa)) => {
+                        // Phase 3: Received peer's public address through relay.
+                        // Route to appropriate channel:
+                        // - KCP/UDP addresses → punch_peer_addrs (for port-scan + KCP punch)
+                        // - TCP listener addresses → punch_tcp_addrs (for TCP simultaneous open)
+                        // Heuristic: if we already have addresses from this peer IP in
+                        // punch_peer_addrs, the new address with a different port is TCP.
+                        if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
+                            log::info!("Phase3: received peer address: {}", peer_addr);
+                            let is_tcp = self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
+                                ppa_ref.lock().map(|addrs| {
+                                    addrs.iter().any(|a| a.ip() == peer_addr.ip() && a.port() != peer_addr.port())
+                                }).unwrap_or(false)
+                            });
+                            if is_tcp {
+                                if let Some(ref punch_tcp) = self.punch_tcp_addrs {
+                                    if let Ok(mut addrs) = punch_tcp.lock() {
+                                        if !addrs.contains(&peer_addr) {
+                                            addrs.push(peer_addr);
+                                            log::info!("Phase3: added TCP peer address: {}", peer_addr);
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(ref punch_peer) = self.punch_peer_addrs {
+                                    if let Ok(mut addrs) = punch_peer.lock() {
+                                        if !addrs.contains(&peer_addr) {
+                                            addrs.push(peer_addr);
+                                            log::info!("Phase3: added KCP peer address: {}", peer_addr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 },
