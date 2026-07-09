@@ -3802,17 +3802,23 @@ Widget _buildSymmetricNatWarning() {
   if (nat == 0 && publicAddr.isEmpty) {
     return SizedBox.shrink();
   }
+  // NAT types: 0=UNKNOWN_NAT, 1=ASYMMETRIC(cone), 2=SYMMETRIC
+  final natLabels = {
+    0: 'UNKNOWN_NAT',
+    1: 'ASYMMETRIC',
+    2: 'SYMMETRIC',
+  };
+  final natStr = natLabels[nat] ?? 'NAT${nat}';
   final color = nat == 2 ? Colors.orange : Colors.green;
   final icon = nat == 2
       ? Icons.warning_amber_rounded
       : Icons.language;
-  final natTypeStr = nat == 2 ? translate('symmetric_nat') : translate('cone_nat');
   final shortLabel = nat == 2
-      ? '⚠ ${natTypeStr}'
-      : '🌐 ${natTypeStr}';
+      ? '⚠ ${natStr}'
+      : '🌐 ${natStr}';
   final fullTip = nat == 2
-      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natTypeStr'
-      : '${translate('NAT')}: $natTypeStr\n${translate('Public Address')}: $publicAddr';
+      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natStr'
+      : '${translate('NAT')}: $natStr\n${translate('Public Address')}: $publicAddr';
 
   return Container(
     color: color.shade100,
