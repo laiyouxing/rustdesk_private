@@ -3807,10 +3807,12 @@ Widget _buildSymmetricNatWarning() {
       ? Icons.warning_amber_rounded
       : Icons.language;
   final natTypeStr = nat == 2 ? translate('symmetric_nat') : translate('cone_nat');
-  final message = nat == 2
+  final shortLabel = nat == 2
+      ? '⚠ ${natTypeStr}'
+      : '🌐 ${natTypeStr}';
+  final fullTip = nat == 2
       ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natTypeStr'
       : '${translate('NAT')}: $natTypeStr\n${translate('Public Address')}: $publicAddr';
-  final subtitle = '';
 
   return Container(
     color: color.shade100,
@@ -3818,11 +3820,14 @@ Widget _buildSymmetricNatWarning() {
       children: [
         Icon(icon, color: color.shade800, size: 20).paddingOnly(right: 8),
         Expanded(
-          child: Text(
-            message + subtitle,
-            style: TextStyle(color: color.shade900, fontSize: 13),
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
+          child: Tooltip(
+            message: fullTip,
+            child: Text(
+              shortLabel,
+              style: TextStyle(color: color.shade900, fontSize: 13),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ),
       ],
