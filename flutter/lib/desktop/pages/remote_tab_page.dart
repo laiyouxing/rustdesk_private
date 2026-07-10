@@ -178,8 +178,8 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
             }
             // Show local NAT type in tooltip as well
             final natType = bind.mainGetNatType();
-            final natLabels = {0:'UNKNOWN_NAT',1:'ASYMMETRIC',2:'SYMMETRIC'};
-            punchInfo += '\nNAT: ${natLabels[natType] ?? "NAT$natType"}';
+            final natLabels = {0:'未知',1:'非对称型(锥型)',2:'对称型'};
+            punchInfo += '\n${translate('NAT')}: ${natLabels[natType] ?? "NAT$natType"}';
             var msgFingerprint = '${translate('Fingerprint')}:\n';
             var fingerprint = FingerprintState.find(key).value;
             if (fingerprint.isEmpty) {
