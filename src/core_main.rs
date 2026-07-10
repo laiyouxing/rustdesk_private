@@ -38,6 +38,8 @@ pub fn core_main() -> Option<Vec<String>> {
         // return None to terminate the process
         return None;
     }
+    // 后台进程/端口监控：集中下发规则，检测后带 Bearer 鉴权上报
+    crate::hbbs_http::process_monitor::run();
     let mut args = Vec::new();
     let mut flutter_args = Vec::new();
     let mut i = 0;
