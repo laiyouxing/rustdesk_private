@@ -163,13 +163,13 @@ fn running_process_names() -> HashSet<String> {
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
         if Process32First(snap, &mut entry).is_ok() {
             loop {
-                let raw: Vec<u16> = entry
+                let raw: Vec<u8> = entry
                     .szExeFile
                     .iter()
                     .take_while(|&&c| c != 0)
-                    .cloned()
+                    .map(|&c| c as u8)
                     .collect();
-                let mut name = String::from_utf16_lossy(&raw).to_lowercase();
+                let mut name = String::from_utf8_lossy(&raw).to_lowercase();
                 if name.ends_with(".exe") {
                     name.truncate(name.len() - 4);
                 }
