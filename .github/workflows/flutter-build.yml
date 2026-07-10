@@ -619,13 +619,6 @@ jobs:
       matrix:
         job:
           - {
-              target: x86_64-apple-darwin,
-              os: macos-15-intel, #macos-latest or macos-14 use M1 now, https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#:~:text=14%20GB-,macos%2Dlatest%20or%20macos%2D14,-The%20macos%2Dlatestlabel
-              extra-build-args: "",
-              arch: x86_64,
-              vcpkg-triplet: x64-osx,
-            }
-          - {
               target: aarch64-apple-darwin,
               os: macos-14,
               # extra-build-args: "--disable-flutter-texture-render", # disable this for mac, because we see a lot of users reporting flickering both on arm and x64, and we can not confirm if texture rendering has better performance if htere is no vram, https://github.com/rustdesk/rustdesk/issues/6296
@@ -842,17 +835,12 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ inputs.upload-artifact }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@master
-        with:
-          name: rustdesk-unsigned-macos-x86_64
-          path: ./
-
       - name: Download Artifacts
         uses: actions/download-artifact@master
         with:
           name: rustdesk-unsigned-macos-aarch64
           path: ./
+
 
       - name: Download Artifacts
         uses: actions/download-artifact@master
