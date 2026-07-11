@@ -283,5 +283,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("NAT", "NAT Type"),
         ("symmetric_nat", "Symmetric NAT (NAT4)"),
         ("cone_nat", "Cone NAT (NAT1-3)"),
+        ("nat_type_unknown", "Unknown"),
+        ("nat_type_asymmetric", "Asymmetric (Cone)"),
+        ("nat_type_symmetric", "Symmetric"),
     ].iter().cloned().collect();
 }

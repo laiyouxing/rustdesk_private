@@ -3804,9 +3804,9 @@ Widget _buildSymmetricNatWarning() {
   }
   // NAT types: 0=UNKNOWN_NAT, 1=ASYMMETRIC(cone), 2=SYMMETRIC
   final natLabels = {
-    0: '未知',
-    1: '非对称型(锥型)',
-    2: '对称型',
+    0: translate('nat_type_unknown'),
+    1: translate('nat_type_asymmetric'),
+    2: translate('nat_type_symmetric'),
   };
   final natStr = natLabels[nat] ?? 'NAT${nat}';
   final color = nat == 2 ? Colors.orange : Colors.green;

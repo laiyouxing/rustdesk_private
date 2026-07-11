@@ -172,7 +172,7 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
             }
             // Show local NAT type in tooltip as well
             final natType = bind.mainGetNatType();
-            final natLabels = {0:'未知',1:'非对称型(锥型)',2:'对称型'};
+            final natLabels = {0:translate('nat_type_unknown'),1:translate('nat_type_asymmetric'),2:translate('nat_type_symmetric')};
             punchInfo += '\n${translate('NAT')}: ${natLabels[natType] ?? "NAT$natType"}';
             var msgFingerprint = '${translate('Fingerprint')}:\n';
             var fingerprint = FingerprintState.find(key).value;
