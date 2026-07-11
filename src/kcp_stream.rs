@@ -35,6 +35,12 @@ impl KcpStream {
         init_packet: Option<BytesMut>,
     ) -> ResultType<(Self, Stream)> {
         let mut endpoint = KcpEndpoint::new();
+        // Community/common KCP tuning for a low-latency P2P control channel:
+        // nodelay mode (no congestion control), 10ms internal update, 2x fast
+        // resend; MTU 1400; enlarged send/recv windows.
+        endpoint.set_nodelay(1, 10, 2, 1);
+        endpoint.set_mtu(1400);
+        endpoint.set_wndsize(128, 128);
         endpoint.run().await;
 
         let (input, output) = (
@@ -70,6 +76,12 @@ impl KcpStream {
         timeout: std::time::Duration,
     ) -> ResultType<(Self, Stream)> {
         let mut endpoint = KcpEndpoint::new();
+        // Community/common KCP tuning for a low-latency P2P control channel:
+        // nodelay mode (no congestion control), 10ms internal update, 2x fast
+        // resend; MTU 1400; enlarged send/recv windows.
+        endpoint.set_nodelay(1, 10, 2, 1);
+        endpoint.set_mtu(1400);
+        endpoint.set_wndsize(128, 128);
         endpoint.run().await;
 
         let (input, output) = (

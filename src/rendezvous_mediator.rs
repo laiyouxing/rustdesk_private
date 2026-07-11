@@ -40,7 +40,11 @@ lazy_static::lazy_static! {
     // (encoded_socket_addr_bytes, decoded_addr, timestamp)
     // Using encoded bytes + decoded addr as key to prevent false dedup
     // when different peers happen to have the same decoded addr (extremely rare).
-    static ref LAST_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    // Dedup keys split by message type: PunchHole and FetchLocalAddr must not
+    // share one key, otherwise a PunchHole and an intranet FetchLocalAddr arriving
+    // within 100ms with the same encoded bytes+addr would falsely suppress each other.
+    static ref LAST_PUNCH_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    static ref LAST_INTRANET_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -567,7 +571,7 @@ impl RendezvousMediator {
 
     async fn handle_intranet(&self, fla: FetchLocalAddr, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&fla.socket_addr);
-        let mut last = LAST_MSG.lock().await;
+        let mut last = LAST_INTRANET_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
         if last.0 == fla.socket_addr.as_ref() && last.1 == addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
@@ -690,7 +694,7 @@ impl RendezvousMediator {
             return Ok(());
         }
         let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
-        let mut last = LAST_MSG.lock().await;
+        let mut last = LAST_PUNCH_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
         if last.0 == ph.socket_addr.as_ref() && last.1 == peer_addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
@@ -725,20 +729,23 @@ impl RendezvousMediator {
             let host_server = server.clone();
             let host_cp = control_permissions.clone();
             tokio::spawn(async move {
-                for _round in 0..5 {
-                    // Bind to any free local port; NAT will assign external port.
-                    let bind_addr = SocketAddr::from(([0u8; 4], 0u16));
-                    let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
-                        Ok(s) => Arc::new(s),
-                        Err(_) => {
-                            sleep(2.0).await;
-                            continue;
-                        }
-                    };
-                    if socket.connect(host_peer_addr).await.is_err() {
-                        sleep(2.0).await;
-                        continue;
+                // Bind ONCE and reuse the same socket across all punch rounds so the
+                // host NAT external port stays stable. Rebinding every round (old
+                // behaviour) made the external port drift, so the connector's KCP
+                // connect could hit a stale port and the traversal failed silently.
+                let bind_addr = SocketAddr::from(([0u8; 4], 0u16));
+                let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
+                    Ok(s) => Arc::new(s),
+                    Err(_) => {
+                        log::warn!("Host-side punching: failed to bind UDP socket");
+                        return;
                     }
+                };
+                if socket.connect(host_peer_addr).await.is_err() {
+                    log::warn!("Host-side punching: failed to connect UDP socket");
+                    return;
+                }
+                for _round in 0..5 {
                     // Send empty packet to establish our NAT mapping for the
                     // connector's address, then listen for KCP handshake.
                     if let Ok(Some(data)) =
