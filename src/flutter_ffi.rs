@@ -26,7 +26,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicI32, Ordering},
-        Arc,
+        Arc, Once,
     },
     time::{Duration, SystemTime},
 };
@@ -80,6 +80,9 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     {
         // core_main's init_log does not work for flutter since it is only applied to its load_library in main.c
         hbb_common::init_log(false, "flutter_ffi");
+        // Periodically re-check for a newer version (every 24h) so a long-running
+        // client that is never restarted still picks up newly published releases.
+        start_periodic_update_check();
     }
 }
 
@@ -1744,6 +1747,38 @@ pub fn main_get_last_remote_id() -> String {
 
 pub fn main_get_software_update_url() {
     crate::common::check_software_update();
+}
+
+/// Interval between periodic software update checks: 24 hours.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Guard ensuring the periodic update-check thread is spawned at most once per process.
+static PERIODIC_UPDATE_CHECK_STARTED: Once = Once::new();
+
+/// Spawn a background thread that performs a software update check once every 24 hours.
+///
+/// The client already checks for updates once at startup (see
+/// [`main_get_software_update_url`]). However, a long-running client that is never
+/// restarted would otherwise never re-check for a newly published version, so it
+/// would keep running the old build until the next manual restart.
+///
+/// This spawns a dedicated OS thread that sleeps for [`UPDATE_CHECK_INTERVAL`] and
+/// then calls the existing [`crate::common::check_software_update`] (the same entry
+/// point used by the startup check). It reuses the existing update-check logic and
+/// therefore respects the custom-API-server flow in `common::check_custom_update`.
+///
+/// The thread is spawned at most once per process via [`PERIODIC_UPDATE_CHECK_STARTED`],
+/// so repeated calls (e.g. if `initialize` runs more than once) will not create
+/// duplicate polling threads.
+fn start_periodic_update_check() {
+    PERIODIC_UPDATE_CHECK_STARTED.call_once(|| {
+        std::thread::spawn(|| loop {
+            // Sleep first so the very first periodic check happens 24h after startup,
+            // avoiding a redundant immediate re-check (startup already checked once).
+            std::thread::sleep(UPDATE_CHECK_INTERVAL);
+            crate::common::check_software_update();
+        });
+    });
 }
 
 pub fn main_get_home_dir() -> String {
