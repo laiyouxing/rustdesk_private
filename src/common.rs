@@ -274,8 +274,9 @@ fn start_upnp_renew_task() {
             }
             match crate::upnp::try_add_port_mapping_with_port(local_port) {
                 Some(m) => {
+                    let external_port = m.external_port;
                     *UPNP_MAPPING.lock().unwrap() = Some(m);
-                    log::info!("UPnP: renewed external port {} -> local {}", m.external_port, local_port);
+                    log::info!("UPnP: renewed external port {} -> local {}", external_port, local_port);
                 }
                 None => log::warn!("UPnP: renew failed (will retry next cycle)"),
             }
