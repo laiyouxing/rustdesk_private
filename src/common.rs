@@ -173,6 +173,9 @@ impl Drop for SimpleCallOnReturn {
 static UPNP_MAPPING: std::sync::Mutex<Option<crate::upnp::UpnpMapping>> =
     std::sync::Mutex::new(None);
 
+/// Local port reserved for the UPnP mapping (set at startup, read by the renew task).
+pub static UPNP_LOCAL_PORT: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
+
 /// Reservation socket that keeps the UPnP local port occupied until Phase3 uses it.
 /// Prevents TOCTOU race: port is reserved between UPnP discovery and socket creation.
 static UPNP_RESERVATION: std::sync::Mutex<Option<std::net::UdpSocket>> =
@@ -218,9 +221,11 @@ pub fn global_init() -> bool {
                     if let Ok(mut rguard) = UPNP_RESERVATION.lock() {
                         *rguard = Some(reservation);
                     }
+                    *UPNP_LOCAL_PORT.lock().unwrap() = Some(local_port);
                     if let Ok(mut guard) = UPNP_MAPPING.lock() {
                         *guard = crate::upnp::try_add_port_mapping_with_port(local_port);
                     }
+                    start_upnp_renew_task();
                 }
             }
         }
@@ -235,6 +240,42 @@ pub fn global_clean() {
             crate::upnp::try_remove_mapping(mapping.external_port);
         }
     }
+}
+
+/// Background task: keep the UPnP mapping alive only while a remote desktop
+/// connection is active. Renews the lease (and re-probes LAN IP) when in use;
+/// lets the mapping expire when idle; re-maps on LAN IP change.
+fn start_upnp_renew_task() {
+    std::thread::spawn(|| {
+        const RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800); // 30 min, < 1h lease
+        let mut last_lan: Option<std::net::Ipv4Addr> = None;
+        loop {
+            std::thread::sleep(RENEW_INTERVAL);
+            let local_port = match *UPNP_LOCAL_PORT.lock().unwrap() {
+                Some(p) => p,
+                None => break,
+            };
+            let active = crate::server::active_remote_conn_count();
+            let lan = crate::upnp::local_ipv4();
+            let should_remap = match (active > 0, lan != last_lan) {
+                (true, _) => true,       // in use -> renew (also re-probes LAN IP)
+                (false, true) => true,   // idle but LAN IP changed -> re-map so next connect works
+                (false, false) => false, // idle and IP stable -> let lease expire
+            };
+            last_lan = lan;
+            if !should_remap {
+                log::debug!("UPnP: idle, skipping renew (mapping will expire naturally)");
+                continue;
+            }
+            match crate::upnp::try_add_port_mapping_with_port(local_port) {
+                Some(m) => {
+                    *UPNP_MAPPING.lock().unwrap() = Some(m);
+                    log::info!("UPnP: renewed external port {} -> local {}", m.external_port, local_port);
+                }
+                None => log::warn!("UPnP: renew failed (will retry next cycle)"),
+            }
+        }
+    });
 }
 
 #[inline]

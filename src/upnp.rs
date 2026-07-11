@@ -29,22 +29,51 @@ pub fn try_add_port_mapping_with_port(local_port: u16) -> Option<UpnpMapping> {
     }
 }
 
+/// Probe the local LAN IPv4 address without introducing new dependencies.
+/// Uses a UDP "connect" to a public host; the OS selects the egress interface,
+/// and the socket's local address reveals the real LAN IPv4. Returns `None` if
+/// the probe fails.
+pub fn local_ipv4() -> Option<Ipv4Addr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    match s.local_addr().ok()? {
+        SocketAddr::V4(a) => Some(*a.ip()),
+        _ => None,
+    }
+}
+
 fn add_mapping(local_port: u16) -> ResultType<u16> {
     let rt = tokio::runtime::Runtime::new()?;
-    let gateway = rt.block_on(async {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            search_gateway(Default::default()),
-        )
-        .await
-    });
 
-    let gateway = match gateway {
-        Ok(Ok(g)) => g,
-        _ => bail!("no UPnP gateway found"),
+    // Retry gateway discovery a few times to tolerate slow/late routers at boot.
+    let gateway = {
+        let mut found = None;
+        for _ in 0..3 {
+            let result = rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    search_gateway(Default::default()),
+                )
+                .await
+            });
+            match result {
+                Ok(Ok(g)) => {
+                    found = Some(g);
+                    break;
+                }
+                _ => {
+                    // Sleep outside of block_on so we don't block the runtime thread.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
+        }
+        match found {
+            Some(g) => g,
+            None => bail!("no UPnP gateway found"),
+        }
     };
 
-    let local_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), local_port);
+    let local_addr = SocketAddrV4::new(local_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED), local_port);
 
     // Try the exact port first, then fallback to any available port
     let ports = [local_port, 0];
@@ -54,7 +83,7 @@ fn add_mapping(local_port: u16) -> ResultType<u16> {
                 .add_any_port(
                     PortMappingProtocol::TCP,
                     SocketAddr::V4(local_addr),
-                    0, // lease duration: 0 = permanent
+                    3600, // lease duration in seconds (1h); some routers reject 0/permanent
                     "RustDesk Direct Access",
                 )
                 .await

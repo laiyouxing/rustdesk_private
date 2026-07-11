@@ -5906,6 +5906,17 @@ mod raii {
     }
 }
 
+/// Number of currently authorized *remote desktop* connections (real-time).
+/// Used by the UPnP renew task to decide whether to keep the port mapping alive.
+pub fn active_remote_conn_count() -> usize {
+    AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| matches!(c.conn_type, AuthConnType::Remote))
+        .count()
+}
+
 mod test {
     #[allow(unused)]
     use super::*;
