@@ -257,6 +257,11 @@ fn start_upnp_renew_task() {
             };
             let active = crate::server::active_remote_conn_count();
             let lan = crate::upnp::local_ipv4();
+            if last_lan.is_none() {
+                // 首探仅记录当前 LAN IP，不误判为"IP 变化"导致空闲期误续期
+                last_lan = lan;
+                continue;
+            }
             let should_remap = match (active > 0, lan != last_lan) {
                 (true, _) => true,       // in use -> renew (also re-probes LAN IP)
                 (false, true) => true,   // idle but LAN IP changed -> re-map so next connect works
