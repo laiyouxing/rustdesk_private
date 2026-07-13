@@ -36,12 +36,20 @@ pub fn run() {
                 thread::sleep(Duration::from_secs(60));
                 continue;
             }
-            // 与审计上报一致：未关联 api-server 账号(access_token 为空)则不上报，定时重试
+            // 允许未登录（无 access_token）的设备也上报进程/端口监控：
+            // 未登录时由服务端用设备 key（与 api-server 配置中的 rustdesk.key 一致）校验身份；
+            // 已登录则正常走 token 验证。两者任一通过即放行。
             let token = LocalConfig::get_option("access_token");
-            if token.is_empty() {
-                thread::sleep(Duration::from_secs(60));
-                continue;
-            }
+            // 设备身份 key：取本地保存的服务器公钥（hbbs pub key）。
+            // 与 api-server 配置中的 rustdesk.key 为同一值，用于未登录场景下的设备身份校验。
+            let key = {
+                let k = Config::get_option("key");
+                if k.is_empty() {
+                    hbb_common::config::RS_PUB_KEY.to_owned()
+                } else {
+                    k
+                }
+            };
             let peer_id = Config::get_id();
             let client = create_http_client_with_url(&format!("{}{}", api_server, CONFIG_PATH));
 
@@ -50,6 +58,7 @@ pub fn run() {
                 .get(&format!("{}{}", api_server, CONFIG_PATH))
                 .query(&[("peer_id", peer_id.clone())])
                 .header("Authorization", format!("Bearer {}", token))
+                .header("X-Rustdesk-Key", key.clone())
                 .send()
             {
                 Ok(resp) => match resp.json::<serde_json::Value>() {
@@ -77,7 +86,7 @@ pub fn run() {
                 .min()
                 .unwrap_or(DEFAULT_INTERVAL as i64) as u64;
 
-            if let Err(e) = detect_and_report(&client, &api_server, &token, &peer_id, &rule_list) {
+            if let Err(e) = detect_and_report(&client, &api_server, &token, &key, &peer_id, &rule_list) {
                 log::warn!("process_monitor report failed: {}", e);
             }
             thread::sleep(Duration::from_secs(interval));
@@ -89,6 +98,7 @@ fn detect_and_report(
     client: &reqwest::blocking::Client,
     api_server: &str,
     token: &str,
+    key: &str,
     peer_id: &str,
     rules: &[serde_json::Value],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -140,6 +150,7 @@ fn detect_and_report(
     let resp = client
         .post(&format!("{}{}", api_server, STATUS_PATH))
         .header("Authorization", format!("Bearer {}", token))
+        .header("X-Rustdesk-Key", key)
         .json(&body)
         .send()?;
     if !resp.status().is_success() {
