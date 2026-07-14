@@ -544,13 +544,17 @@ impl<T: InvokeUiSession> Remote<T> {
                     let file_transfer_enabled =
                         self.handler.lc.read().unwrap().enable_file_copy_paste.v;
                     let view_only = self.handler.lc.read().unwrap().view_only.v;
-                    let stop = is_stopping_allowed
+                    // Bugfix: 在连接未建立(is_connected=false)时不触发 set_is_stopped()，
+                    // 否则 CM 握手阶段发送的 MonitorReady 会被 stop 拦截并永久停止 CM，
+                    // 导致文件剪贴板永远无法工作（文字剪贴板走 arboard 不受影响）。
+                    // 详见 https://github.com/rustdesk/rustdesk/issues/9977
+                    let stop = self.is_connected
+                        && is_stopping_allowed
                         && (view_only
-                            || !self.is_connected
                             || !(server_file_transfer_enabled && file_transfer_enabled));
                     log::debug!(
                         "Process clipboard message from system, stop: {}, is_stopping_allowed: {}, view_only: {}, server_file_transfer_enabled: {}, file_transfer_enabled: {}",
-                        view_only, stop, is_stopping_allowed, server_file_transfer_enabled, file_transfer_enabled
+                        stop, is_stopping_allowed, view_only, server_file_transfer_enabled, file_transfer_enabled
                     );
                     if stop {
                         #[cfg(target_os = "windows")]
