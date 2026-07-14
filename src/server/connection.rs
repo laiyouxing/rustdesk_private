@@ -327,6 +327,10 @@ pub struct Connection {
     // Phase 3 relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>>>,
     punch_notify: Option<Arc<hbb_common::tokio::sync::Notify>>,
+    // Persistent UDP socket shared between STUN query and hole punching.
+    // Using the same socket ensures the NAT mapping is consistent, so the
+    // STUN-discovered address is valid for subsequent punch attempts.
+    punch_socket: Option<Arc<tokio::net::UdpSocket>>,
 }
 
 impl ConnInner {
@@ -508,6 +512,7 @@ impl Connection {
             terminal_generic_service: None,
             punch_stream: None,
             punch_notify: None,
+            punch_socket: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -595,9 +600,20 @@ impl Connection {
         // to the peer so both sides can punch through NAT concurrently.
         // Run for ALL connections (relay + direct punch), not just relay,
         // because the host also needs to exchange its public address.
+        //
+        // Create a persistent UDP socket that is shared between the STUN query
+        // and subsequent hole punching. This ensures the NAT mapping discovered
+        // by STUN is valid for punch attempts (same source socket → same
+        // external port).
         {
             let phase3_tx = phase3_out_tx;
             let tx_to_cm = conn.tx_to_cm.clone();
+            // Create persistent socket before spawn so both STUN and punch share it
+            let punch_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => Some(Arc::new(s)),
+                Err(_) => None,
+            };
+            conn.punch_socket = punch_socket.clone();
             tokio::spawn(async move {
                 // 0. Create TCP listener for TCP simultaneous open before STUN
                 // so we can exchange the TCP port alongside the STUN address.
@@ -605,10 +621,9 @@ impl Connection {
                 let tcp_port = tcp_listener.as_ref()
                     .and_then(|l| l.local_addr().ok())
                     .map(|a| a.port());
-                // 1. STUN to discover our public IPv4 address
-                if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                    let socket = Arc::new(socket);
-                    match crate::common::stun_query_with_socket(&socket).await {
+                // 1. STUN to discover our public IPv4 address using the persistent socket
+                if let Some(ref socket) = punch_socket {
+                    match crate::common::stun_query_with_socket(socket).await {
                         Ok((stun_addr, _)) => {
                             log::info!("Phase3(Host): our public address via STUN: {}", stun_addr);
                             let nat = if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
@@ -2436,10 +2451,11 @@ impl Connection {
                     log::info!("Phase3(Host): received peer address: {}", peer_addr);
                     let punch_stream = self.punch_stream.clone();
                     let punch_notify = self.punch_notify.clone();
+                    let punch_socket = self.punch_socket.clone();
                     let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
                         Arc::new(std::sync::Mutex::new(None));
                     tokio::spawn(async move {
-                        match relay_phase3_punch_to_peer(peer_addr, kcp_handle).await {
+                        match relay_phase3_punch_to_peer(peer_addr, kcp_handle, punch_socket).await {
                             Ok(stream) => {
                                 if let Some(s) = punch_stream {
                                     let mut guard = s.lock().await;

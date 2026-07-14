@@ -794,6 +794,22 @@ async fn test_nat_type_() -> ResultType<bool> {
         }
     }
 
+    // Prefer UDP STUN-based NAT detection (reflects actual UDP hole-punch
+    // behavior). Many NATs treat TCP and UDP differently — a device may be
+    // "cone" for TCP but "symmetric" for UDP. The TCP-only detection below
+    // (querying two hbbs ports) is kept as a fallback.
+    //
+    // Only use STUN to confirm SYMMETRIC (high confidence). For ASYMMETRIC /
+    // inconclusive results, fall through to TCP-based detection to avoid
+    // misclassifying due to STUN server unavailability.
+    if let Ok(true) = detect_symmetric_nat().await {
+        Config::set_nat_type(NatType::SYMMETRIC as _);
+        log::info!("Tested nat type: SYMMETRIC (UDP STUN) in {:?}", start.elapsed());
+        return Ok(true);
+    }
+
+    // Fallback: TCP-based NAT detection via hbbs (two different server ports).
+    // This is less reliable for UDP hole-punching but works when UDP is blocked.
     let server1 = Config::get_rendezvous_server();
     let server2 = crate::increase_port(&server1, -1);
     let mut msg_out = RendezvousMessage::new();
@@ -3031,7 +3047,7 @@ pub async fn relay_upgrade_task(
     }
 
     const TOTAL_BUDGET: Duration = Duration::from_secs(30);
-    const PREDICTED_SCAN_RANGE: u16 = 10;
+    const PREDICTED_SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
@@ -3415,23 +3431,32 @@ pub async fn relay_upgrade_task(
 /// Host-side Phase 3 punch: called when the host receives PunchPeerAddr
 /// through the relay connection. Uses the same optimizations as
 /// relay_upgrade_task (burst + connect/accept race + keep-alive).
+///
+/// `punch_socket` is an optional persistent UDP socket created before the
+/// STUN query. When provided, STUN discovery and hole punching share the
+/// same socket, so the NAT mapping is consistent. When `None`, a new socket
+/// is created internally (fallback for edge cases).
 pub async fn relay_phase3_punch_to_peer(
     peer_addr: std::net::SocketAddr,
     kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
+    punch_socket: Option<Arc<tokio::net::UdpSocket>>,
 ) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
-    // Use UPnP local port if available so the mapped port is active
-    let upnp_local = crate::common::get_upnp_local_port();
-    let bind_addr = if peer_addr.is_ipv6() {
-        SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16))
-    } else if upnp_local > 0 {
-        SocketAddr::from(([0u8; 4], upnp_local))
+    // Use the persistent punch socket if available, otherwise create a new one.
+    let socket = if let Some(s) = punch_socket {
+        s
     } else {
-        SocketAddr::from(([0u8; 4], 0u16))
+        let upnp_local = crate::common::get_upnp_local_port();
+        let bind_addr = if peer_addr.is_ipv6() {
+            SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16))
+        } else if upnp_local > 0 {
+            SocketAddr::from(([0u8; 4], upnp_local))
+        } else {
+            SocketAddr::from(([0u8; 4], 0u16))
+        };
+        Arc::new(UdpSocket::bind(bind_addr).await?)
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
-    let socket = Arc::new(socket);
 
     // Create TCP listener for TCP simultaneous open fallback.
     // Use UPnP local port if available.

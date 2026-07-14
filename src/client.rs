@@ -444,14 +444,17 @@ impl Client {
         // udp_nat_port=0 and forcing TCP punch fallback.
         if let Some(udp) = udp.1.as_ref() {
             let tm = Instant::now();
+            // Minimum 3s or 2×TCP-RTT to give the UDP NAT test enough time
+            // on slow or lossy networks. The earlier 1.5×RTT was too tight
+            // when the UDP path latency differs from TCP RTT.
+            let udp_wait = std::cmp::max(rtt * 2, Duration::from_millis(3000));
             loop {
                 let port = *udp.lock().unwrap();
                 if port > 0 {
                     break;
                 }
-                // Wait up to 1.5 RTT for the UDP NAT test to complete.
-                if tm.elapsed() > rtt + rtt / 2 {
-                    log::warn!("UDP NAT test did not complete in time, udp_port={}", port);
+                if tm.elapsed() > udp_wait {
+                    log::warn!("UDP NAT test did not complete in time (waited {:?}), udp_port={}", udp_wait, port);
                     break;
                 }
                 hbb_common::sleep(0.001).await;
