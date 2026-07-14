@@ -9,6 +9,7 @@ use hbb_common::{
 };
 use kcp_sys::{
     endpoint::KcpEndpoint,
+    ffi_safe::KcpConfig,
     packet_def::{KcpPacket, KcpPacketHeader},
     stream,
 };
@@ -38,9 +39,17 @@ impl KcpStream {
         // Community/common KCP tuning for a low-latency P2P control channel:
         // nodelay mode (no congestion control), 10ms internal update, 2x fast
         // resend; MTU 1400; enlarged send/recv windows.
-        endpoint.set_nodelay(1, 10, 2, 1);
-        endpoint.set_mtu(1400);
-        endpoint.set_wndsize(128, 128);
+        // Uses KcpConfigFactory as KcpEndpoint does not expose set_nodelay/set_mtu/set_wndsize.
+        endpoint.set_kcp_config_factory(Box::new(|conv| KcpConfig {
+            conv,
+            mtu: Some(1400),
+            sndwnd: Some(128),
+            rcvwnd: Some(128),
+            nodelay: Some(1),
+            interval: Some(10),
+            resend: Some(2),
+            nc: Some(1),
+        }));
         endpoint.run().await;
 
         let (input, output) = (
@@ -79,9 +88,17 @@ impl KcpStream {
         // Community/common KCP tuning for a low-latency P2P control channel:
         // nodelay mode (no congestion control), 10ms internal update, 2x fast
         // resend; MTU 1400; enlarged send/recv windows.
-        endpoint.set_nodelay(1, 10, 2, 1);
-        endpoint.set_mtu(1400);
-        endpoint.set_wndsize(128, 128);
+        // Uses KcpConfigFactory as KcpEndpoint does not expose set_nodelay/set_mtu/set_wndsize.
+        endpoint.set_kcp_config_factory(Box::new(|conv| KcpConfig {
+            conv,
+            mtu: Some(1400),
+            sndwnd: Some(128),
+            rcvwnd: Some(128),
+            nodelay: Some(1),
+            interval: Some(10),
+            resend: Some(2),
+            nc: Some(1),
+        }));
         endpoint.run().await;
 
         let (input, output) = (

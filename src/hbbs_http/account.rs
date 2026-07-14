@@ -186,10 +186,6 @@ impl OidcSession {
             &[("code", code), ("id", id), ("uuid", uuid)],
         )?;
         Self::ensure_client(api_server);
-        #[derive(Deserialize)]
-        struct HttpResponseBody {
-            body: String,
-        }
 
         let resp = crate::http_request_sync(
             url.to_string(),
@@ -197,8 +193,7 @@ impl OidcSession {
             None,
             "{}".to_owned(),
         )?;
-        let resp = serde_json::from_str::<HttpResponseBody>(&resp)?;
-        HbbHttpResponse::parse(&resp.body)
+        HbbHttpResponse::parse(&resp)
     }
 
     fn reset(&mut self) {
