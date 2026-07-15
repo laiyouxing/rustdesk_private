@@ -2637,15 +2637,15 @@ async fn stun_ipv4_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
 }
 
 static STUNS_V4_DEFAULT: [&str; 3] = [
-    "stun.l.google.com:19302",
-    "stun.cloudflare.com:3478",
-    "stun.nextcloud.com:3478",
+    "stun.qq.com:3478",
+    "stun.aliyun.com:3478",
+    "stun.miwifi.com:3478",
 ];
 
 static STUNS_V6: [&str; 3] = [
-    "stun.l.google.com:19302",
-    "stun.cloudflare.com:3478",
-    "stun.nextcloud.com:3478",
+    "stun.qq.com:3478",
+    "stun.aliyun.com:3478",
+    "stun.miwifi.com:3478",
 ];
 
 /// Returns the list of STUN servers to use for IPv4.
