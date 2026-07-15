@@ -367,6 +367,8 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut guard = punch_stream.lock().await;
                             if let Some(new_peer) = guard.take() {
                                 log::info!("Relay upgraded to direct connection!");
+                                // 先让 relay 刷新挂起的消息，减少切流丢包
+                                allow_err!(peer.send(&Message::new()).await);
                                 let saved_key = peer.take_key();
                                 peer = new_peer;
                                 if let Some(enc) = saved_key {
@@ -375,6 +377,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 } else {
                                     log::warn!("Phase3: no encryption key from old stream!");
                                 }
+                                // 给新流 50ms 稳定时间
+                                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
                                 crate::common::record_phase3_success();
                                 self.handler.update_direct(Some(true));
                                 self.handler.set_connection_type(
@@ -388,6 +392,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 let mut guard = punch_stream.lock().await;
                                 if let Some(new_stream) = guard.take() {
                                     log::info!("RelayUpgrade: punch succeeded, replacing relay stream");
+                                    // 先让 relay 刷新挂起的消息，减少切流丢包
+                                    allow_err!(peer.send(&Message::new()).await);
                                     let saved_key = peer.take_key();
                                     peer = new_stream;
                                     if let Some(enc) = saved_key {
@@ -396,6 +402,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                     } else {
                                         log::warn!("Phase3: no encryption key from old stream!");
                                     }
+                                    // 给新流 50ms 稳定时间
+                                    hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
                                 }
                             } else {
                                 crate::common::record_phase3_failure();

@@ -3050,6 +3050,9 @@ pub async fn relay_upgrade_task(
 ) -> bool {
     use crate::kcp_stream::KcpStream;
 
+    // 先等 relay 稳定再启动任何网络操作，避免与中继抢 tokio 运行时资源
+    hbb_common::tokio::time::sleep(Duration::from_secs(3)).await;
+
     // #2: if we haven't determined NAT type yet, try STUN-based detection.
     if Config::get_nat_type() == 0 {
         if let Ok(true) = detect_symmetric_nat().await {
@@ -3081,9 +3084,6 @@ pub async fn relay_upgrade_task(
     if tcp_listener.is_some() {
         log::info!("RelayUpgrade: created TCP listener for simultaneous open");
     }
-
-    // Brief initial wait for relay to stabilize (reduced from 2s→0.5s)
-    hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Create persistent sockets for all rounds.
     let socket_v4 = {
