@@ -3061,10 +3061,10 @@ pub async fn relay_upgrade_task(
         }
     }
 
-    // Performance tuning: lower values reduce impact on relay traffic.
-    // ±30 instead of ±50 → ~60 targets/peer vs ~100; burst 8 instead of 20.
-    const TOTAL_BUDGET: Duration = Duration::from_secs(30);
-    const PREDICTED_SCAN_RANGE: u16 = 30;
+    // "以时间换资源"：中继已建立，不急。拉长总预算到 3 分钟，每个目标间隔 1s，
+    // 空包只发 2-3 个，让 Phase3 几乎不影响中继操作。
+    const TOTAL_BUDGET: Duration = Duration::from_secs(180);
+    const PREDICTED_SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
@@ -3372,11 +3372,11 @@ pub async fn relay_upgrade_task(
             if socket.connect(target).await.is_err() {
                 continue;
             }
-            // Brief yield to avoid monopolizing the async runtime and starving relay I/O
-            hbb_common::tokio::time::sleep(Duration::from_millis(10)).await;
+            // 串行慢慢试：每个目标间隔 1s，让中继操作不被干扰
+            hbb_common::tokio::time::sleep(Duration::from_millis(1000)).await;
 
-            // Empty packet burst: 8 packets at 5ms spacing (reduced from 20 to minimize relay interference)
-            for _ in 0..8 {
+            // Minimal burst: 2 packets at 5ms spacing (relay already established, no rush)
+            for _ in 0..2 {
                 if started.elapsed() >= TOTAL_BUDGET {
                     return false;
                 }
@@ -3495,18 +3495,8 @@ pub async fn relay_upgrade_task(
             }
         }
 
-        // Keep-alive: send empty packets during inter-round gap to prevent
-        // NAT mapping from expiring. NAT mappings typically time out after
-        // 30-60s of inactivity.
-        let gap_budget = Duration::from_millis(500);
-        let gap_start = std::time::Instant::now();
-        while gap_start.elapsed() < gap_budget {
-            if started.elapsed() >= TOTAL_BUDGET {
-                return false;
-            }
-            socket.send(&[]).await.ok();
-            hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // 轮间休息 2s，让中继操作不被 Phase3 干扰
+        hbb_common::tokio::time::sleep(Duration::from_millis(2000)).await;
         // Also check for new Phase 3 addresses during gap
         if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
             for addr in peer_addrs.drain(..) {
