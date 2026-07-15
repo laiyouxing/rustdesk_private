@@ -244,11 +244,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
                             Arc::new(std::sync::Mutex::new(None));
                         self.handler.set_punch_status("trying", "");
-                        // Cancel any previous Phase3 task to avoid parallel instances
-                        if let Some(old) = self.phase3_handle.take() {
-                            old.abort();
-                            log::info!("Phase3: cancelled previous punch task on reconnection");
-                        }
+                        // 独立线程的 Phase3 无法直接取消，但 180s 预算后会自动退出
                         // Prefer UPnP local port so UDP socket uses the mapped port
                         let punch_port = {
                             let upnp_local = crate::common::get_upnp_local_port();
@@ -259,15 +255,23 @@ impl<T: InvokeUiSession> Remote<T> {
                                 udp_nat_port
                             }
                         };
-                        self.phase3_handle = Some(tokio::spawn(async move {
-                            let ok = relay_upgrade_task(
-                            p2p_addrs, n, s, kcp_handle, punch_port,
-                            phase3_out_tx, phase3_peer, phase3_tcp,
-                        ).await;
-                        succ.store(ok, std::sync::atomic::Ordering::SeqCst);
-                        d.notify_one();
-                        ok
-                    }));
+                        // Phase3 在独立线程的 tokio 运行时中运行，避免与 io_loop 抢资源
+                        // （主 tokio 运行时 flavor=current_thread，不能共用以防卡顿）
+                        self.phase3_handle = None;
+                        std::thread::spawn(move || {
+                            let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("Phase3 runtime");
+                            rt.block_on(async move {
+                                let ok = relay_upgrade_task(
+                                    p2p_addrs, n, s, kcp_handle, punch_port,
+                                    phase3_out_tx, phase3_peer, phase3_tcp,
+                                ).await;
+                                succ.store(ok, std::sync::atomic::Ordering::SeqCst);
+                                d.notify_one();
+                            });
+                        });
                     } // end else
                 } // end if !direct
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
