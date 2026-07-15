@@ -1542,12 +1542,29 @@ async fn read_dir(dir: &str, include_hidden: bool, tx: &UnboundedSender<Data>) {
             fs::get_path(dir)
         }
     };
-    if let Ok(Ok(fd)) = spawn_blocking(move || fs::read_dir(&path, include_hidden)).await {
-        let mut msg_out = Message::new();
-        let mut file_response = FileResponse::new();
-        file_response.set_dir(fd);
-        msg_out.set_file_response(file_response);
-        send_raw(msg_out, tx);
+    match spawn_blocking(move || fs::read_dir(&path, include_hidden)).await {
+        Ok(Ok(fd)) => {
+            let mut msg_out = Message::new();
+            let mut file_response = FileResponse::new();
+            file_response.set_dir(fd);
+            msg_out.set_file_response(file_response);
+            send_raw(msg_out, tx);
+        }
+        Ok(Err(e)) => {
+            log::error!("[文件传输] ReadDir 失败: path={}, err={}", path, e);
+            // 把错误通知回控制器
+            let mut msg_out = Message::new();
+            let mut file_response = FileResponse::new();
+            file_response.set_error(FileTransferError {
+                error: format!("读取目录失败: {}", e),
+                ..Default::default()
+            });
+            msg_out.set_file_response(file_response);
+            send_raw(msg_out, tx);
+        }
+        Err(e) => {
+            log::error!("[文件传输] ReadDir 阻塞任务失败: {}", e);
+        }
     }
 }
 
