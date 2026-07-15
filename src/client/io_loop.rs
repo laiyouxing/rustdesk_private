@@ -502,8 +502,9 @@ impl<T: InvokeUiSession> Remote<T> {
                             // 发一个空 protobuf Message 保持中继连接活跃，
                             // 防止 hbbr 30 秒空闲超时中断会话。
                             if !direct && last_recv_time.elapsed().as_secs() > 15 {
+                                log::info!("keepalive: sending keep-alive on relay (idle {}s)", last_recv_time.elapsed().as_secs());
                                 if let Err(e) = peer.send(&Message::new()).await {
-                                    log::debug!("keepalive send failed: {}", e);
+                                    log::info!("keepalive send failed: {}", e);
                                 }
                             }
                         }
