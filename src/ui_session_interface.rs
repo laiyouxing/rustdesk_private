@@ -2022,9 +2022,8 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     let mut remote = Remote::new(handler, receiver, sender);
     // Auto-reconnect with exponential backoff to survive transient outages
     // such as Windows login/session switch (host process may restart).
-    // Initial: 1s, then 1.5s, 2.3s, 3.4s... capped at 15s. Retry indefinitely
-    // until user manually closes the session (sent_close_reason breaks the loop).
-    let max_retries: u32 = u32::MAX;
+    // Initial: 1s, then 1.5s, 2.3s, 3.4s... capped at 15s, up to 30 attempts.
+    let max_retries: u32 = 30;
     let mut delay = 1.0f32;
     for retry in 0..max_retries {
         if retry > 0 {
