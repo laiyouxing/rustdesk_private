@@ -2486,12 +2486,14 @@ impl Connection {
                         keys::OPTION_ENABLE_FILE_TRANSFER,
                         &self.control_permissions,
                     ) {
+                        log::info!("[文件传输] 权限被拒绝");
                         self.send_login_error("No permission of file transfer")
                             .await;
                         sleep(1.).await;
                         return false;
                     }
                     self.file_transfer = Some((ft.dir, ft.show_hidden));
+                    log::info!("[文件传输] 登录请求接收: dir={:?}, show_hidden={}", ft.dir, ft.show_hidden);
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
                     if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
@@ -3113,9 +3115,11 @@ impl Connection {
                         }
                         match fa.union {
                             Some(file_action::Union::ReadEmptyDirs(rd)) => {
+                                log::info!("[文件传输] ReadEmptyDirs 消息接收: path={}", rd.path);
                                 self.read_empty_dirs(&rd.path, rd.include_hidden);
                             }
                             Some(file_action::Union::ReadDir(rd)) => {
+                                log::info!("[文件传输] ReadDir 消息接收: path={}, include_hidden={}", rd.path, rd.include_hidden);
                                 self.read_dir(&rd.path, rd.include_hidden);
                             }
                             Some(file_action::Union::AllFiles(f)) => {
@@ -3151,7 +3155,8 @@ impl Connection {
                                 }
                             }
                             Some(file_action::Union::Send(s)) => {
-                                // server to client
+                                // server to client (下载/接收文件)
+                                log::info!("[文件传输] Send 消息接收: path={}, id={}, file_num={}", s.path, s.id, s.file_num);
                                 let id = s.id;
                                 let path = s.path.clone();
                                 let job_type = JobType::from_proto(s.file_type);
@@ -3219,7 +3224,8 @@ impl Connection {
                                 self.file_transferred = true;
                             }
                             Some(file_action::Union::Receive(r)) => {
-                                // client to server
+                                // client to server (上传/发送文件到被控)
+                                log::info!("[文件传输] Receive 消息接收: path={}, id={}, file_num={}", r.path, r.id, r.file_num);
                                 // note: 1.1.10 introduced identical file detection, which breaks original logic of send/recv files
                                 // whenever got send/recv request, check peer version to ensure old version of rustdesk
                                 let od = can_enable_overwrite_detection(get_version_number(
@@ -4752,6 +4758,7 @@ impl Connection {
     }
 
     fn read_dir(&mut self, dir: &str, include_hidden: bool) {
+        log::info!("[文件传输] ReadDir 发送到 CM: dir={}, include_hidden={}", dir, include_hidden);
         let dir = dir.to_string();
         self.send_fs(ipc::FS::ReadDir {
             dir,

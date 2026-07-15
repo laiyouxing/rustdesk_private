@@ -3309,7 +3309,7 @@ pub async fn relay_upgrade_task(
 
     for _round in 0..6 {
         if started.elapsed() >= TOTAL_BUDGET {
-            log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
+            log::info!("[NAT穿透] 穿透总预算({}s)超时, 放弃", TOTAL_BUDGET.as_secs());
             return false;
         }
 
@@ -3422,7 +3422,7 @@ pub async fn relay_upgrade_task(
                 }
             };
             if punched {
-                log::info!("RelayUpgrade: KCP punch succeeded after {:?}", started.elapsed());
+                log::info!("[NAT穿透] Phase3 KCP 打洞成功, 耗时={:?}", started.elapsed());
                 return true;
             }
         }
@@ -3523,7 +3523,7 @@ pub async fn relay_upgrade_task(
             }
         }
     }
-    log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
+    log::info!("[NAT穿透] 穿透未成功, 耗时={:?}", started.elapsed());
     false
 }
 
