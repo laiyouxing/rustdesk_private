@@ -1518,18 +1518,25 @@ async fn read_empty_dirs(dir: &str, include_hidden: bool, tx: &UnboundedSender<D
     let path = dir.to_owned();
     let path_clone = dir.to_owned();
 
-    if let Ok(Ok(fds)) =
-        spawn_blocking(move || fs::get_empty_dirs_recursive(&path, include_hidden)).await
-    {
-        let mut msg_out = Message::new();
-        let mut file_response = FileResponse::new();
-        file_response.set_empty_dirs(ReadEmptyDirsResponse {
-            path: path_clone,
-            empty_dirs: fds,
-            ..Default::default()
-        });
-        msg_out.set_file_response(file_response);
-        send_raw(msg_out, tx);
+    match spawn_blocking(move || fs::get_empty_dirs_recursive(&path, include_hidden)).await {
+        Ok(Ok(fds)) => {
+            let mut msg_out = Message::new();
+            let mut file_response = FileResponse::new();
+            file_response.set_empty_dirs(ReadEmptyDirsResponse {
+                path: path_clone,
+                empty_dirs: fds,
+                ..Default::default()
+            });
+            msg_out.set_file_response(file_response);
+            send_raw(msg_out, tx);
+        }
+        Ok(Err(e)) => {
+            log::error!("[文件传输] ReadEmptyDirs 失败: path={}, err={}", dir, e);
+            send_raw(fs::new_error(0, format!("读取空目录失败: {}", e), -1), tx);
+        }
+        Err(e) => {
+            log::error!("[文件传输] ReadEmptyDirs 阻塞任务失败: {}", e);
+        }
     }
 }
 
