@@ -68,41 +68,44 @@ pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String:
 /// this custom fork (not stock RustDesk).  Set in PunchHoleRequest.custom_tag.
 pub const CUSTOM_TAG: &str = "rustdesk-custom";
 
-/// Timestamp of the last Phase3 punch failure.
-/// Used to skip Phase3 on reconnection if it recently failed.
+/// Timestamp of the last Phase3 punch failure, and retry counter.
+/// Up to 3 retries are allowed with exponential backoff (via auto-reconnect).
 static LAST_PHASE3_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
+static PHASE3_RETRY_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+const PHASE3_MAX_RETRIES: u32 = 3;
 
-/// Record that Phase3 succeeded, clearing any previous failure record.
+/// Record that Phase3 succeeded, clearing failure record and retry counter.
 /// On subsequent reconnections, Phase3 will be attempted again.
 pub fn record_phase3_success() {
+    PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
         guard.take();
     }
 }
 
-/// Record that Phase3 failed. On subsequent reconnections,
-/// Phase3 will be skipped (stay on relay) to avoid repeated failure.
-/// Reset only on app restart or when Phase3 succeeds again.
+/// Record that Phase3 failed. Increments retry counter; after
+/// PHASE3_MAX_RETRIES failures, Phase3 is permanently skipped until
+/// user actively disconnects (reset) or Phase3 succeeds.
 pub fn record_phase3_failure() {
+    PHASE3_RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
         *guard = Some(std::time::Instant::now());
     }
 }
 
-/// Returns true if Phase3 should be skipped (failed on a previous attempt).
-/// Once failed, Phase3 is never retried for the rest of the session lifetime.
+/// Returns true if Phase3 should be skipped.
+/// Allows up to PHASE3_MAX_RETRIES attempts; auto-reconnect exponential
+/// backoff provides natural spacing between retries (1s→1.5s→2.3s→…).
 pub fn should_skip_phase3() -> bool {
-    if let Ok(guard) = LAST_PHASE3_FAIL_AT.lock() {
-        guard.is_some()
-    } else {
-        false
-    }
+    PHASE3_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= PHASE3_MAX_RETRIES
 }
 
 /// Reset Phase3 state so the next connection will try punching again.
 /// Called when the user explicitly closes the connection.
 pub fn reset_phase3_state() {
+    PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
         guard.take();
     }
@@ -3118,40 +3121,72 @@ pub async fn relay_upgrade_task(
     let mut selected_server: Option<String> = None;
 
     for i in 0..5 {
-        let result = if let Some(ref server) = selected_server {
-            // Queries 2-5: use the SAME server for consistent delta on Symmetric NAT
-            stun_query_single_server(&socket, server).await
-        } else {
-            // Query 1: race all servers, pick the best
-            stun_query_with_socket(&socket).await
-        };
-        match result {
-            Ok((addr, srv)) => {
-                if our_addr.is_none() {
-                    selected_server = Some(srv.clone());
-                    our_addr = Some(addr);
-                    log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
-                        i + 1, addr, addr.port(), srv);
-                    if let Ok(mut public) = PUBLIC_ADDR.lock() {
-                        *public = addr.to_string();
+        // P1: retry up to 2 times with exponential backoff (200ms, 400ms)
+        let mut retries: u32 = 2;
+        loop {
+            let result = if let Some(ref server) = selected_server {
+                // Queries 2-5: prefer locked server for consistent delta on Symmetric NAT
+                stun_query_single_server(&socket, server).await
+            } else {
+                // Query 1: race all servers, pick the best
+                stun_query_with_socket(&socket).await
+            };
+            match result {
+                Ok((addr, srv)) => {
+                    if our_addr.is_none() {
+                        selected_server = Some(srv.clone());
+                        our_addr = Some(addr);
+                        log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
+                            i + 1, addr, addr.port(), srv);
+                        if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                            *public = addr.to_string();
+                        }
+                    } else {
+                        log::info!("RelayUpgrade STUN #{}: port {} via {}",
+                            i + 1, addr.port(), srv);
                     }
-                } else {
-                    log::info!("RelayUpgrade STUN #{}: port {} via {}",
-                        i + 1, addr.port(), srv);
+                    stun_ports.push(addr.port());
+                    break; // success, exit retry loop
                 }
-                stun_ports.push(addr.port());
-                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => {
-                if our_addr.is_none() {
-                    log::info!("RelayUpgrade STUN #{} failed: {:?}", i + 1, e);
-                    break;
-                } else {
-                    log::info!("RelayUpgrade STUN #{} failed, stopping prediction: {:?}", i + 1, e);
+                Err(e) => {
+                    if retries > 0 {
+                        let delay = Duration::from_millis(200 * (3 - retries) as u64);
+                        log::info!("RelayUpgrade STUN #{} retrying in {:?} ({}/2): {:?}",
+                            i + 1, delay, 3 - retries, e);
+                        retries -= 1;
+                        hbb_common::tokio::time::sleep(delay).await;
+                        // P0: if locked server exhausted retries, fall back to concurrent
+                        if retries == 0 && selected_server.is_some() {
+                            log::info!("RelayUpgrade STUN #{} locked server unresponsive, falling back to concurrent query", i + 1);
+                            match stun_query_with_socket(&socket).await {
+                                Ok((addr, srv)) => {
+                                    log::info!("RelayUpgrade STUN #{} fallback OK via {} (port {})",
+                                        i + 1, srv, addr.port());
+                                    selected_server = Some(srv.clone());
+                                    stun_ports.push(addr.port());
+                                }
+                                Err(e2) => {
+                                    log::info!("RelayUpgrade STUN #{} concurrent fallback also failed: {:?}", i + 1, e2);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // All retries exhausted, no locked server to fall back from
+                    if our_addr.is_none() {
+                        log::info!("RelayUpgrade STUN #{} failed after retries: {:?}", i + 1, e);
+                    } else {
+                        log::info!("RelayUpgrade STUN #{} failed, stopping prediction: {:?}", i + 1, e);
+                    }
                     break;
                 }
             }
         }
+        // If very first query completely failed (no our_addr yet), exit early
+        if our_addr.is_none() && selected_server.is_none() {
+            break;
+        }
+        hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // Phase 3: send our public address to peer through relay
@@ -3176,34 +3211,63 @@ pub async fn relay_upgrade_task(
         log::info!("Phase3: sent TCP listener address: {}", tcp_addr);
     }
 
-    // Measure our symmetric NAT delta by querying a different STUN server.
+    // Measure our symmetric NAT delta by querying different STUN servers.
     // On symmetric NAT, the mapped port changes for each different destination.
-    // This delta helps us predict the peer's port offset.
+    // P2: Try multiple alternative servers and take the consensus delta
+    // (most common non-zero value) instead of relying on a single server.
     let our_delta: i16 = if stun_ports.len() >= 2 && our_addr.is_some() {
         let base_port = stun_ports[0] as i16;
         let alt_servers = get_stun_servers_v4();
-        let alt_server = selected_server.as_ref().and_then(|s| {
-            alt_servers.iter().find(|a| *a != s)
-        }).or_else(|| alt_servers.first());
-        match alt_server {
-            Some(srv) => {
-                if let Some(alt) = srv.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
-                    let _ = socket.connect(alt).await;
-                    socket.send(&[]).await.ok();
-                    if let Ok((alt_addr, _)) = stun_query_single_server(&socket, srv).await {
-                        let delta = alt_addr.port() as i16 - base_port;
-                        log::info!("RelayUpgrade: symmetric delta measured: {} (port {} vs {})",
-                            delta, base_port, alt_addr.port());
-                        delta
-                    } else {
-                        log::info!("RelayUpgrade: no symmetric delta (alt STUN failed)");
-                        0
-                    }
-                } else {
-                    0
-                }
+        let mut deltas: Vec<i16> = Vec::new();
+        // Try up to 4 different servers, collect all non-zero deltas
+        for alt in alt_servers.iter() {
+            // Skip the primary server (delta to self is always 0)
+            if selected_server.as_ref().map_or(false, |s| s == alt) {
+                continue;
             }
-            None => 0,
+            if let Some(alt_addr) = alt.to_socket_addrs().ok()
+                .and_then(|mut i| i.find(|a| a.is_ipv4()))
+            {
+                let _ = socket.connect(alt_addr).await;
+                socket.send(&[]).await.ok();
+                match stun_query_single_server(&socket, alt).await {
+                    Ok((alt_result, _)) => {
+                        let delta = alt_result.port() as i16 - base_port;
+                        log::info!("RelayUpgrade: delta vs {}: {} (port {} vs {})",
+                            alt, delta, base_port, alt_result.port());
+                        if delta != 0 {
+                            deltas.push(delta);
+                        }
+                    }
+                    Err(e) => {
+                        log::info!("RelayUpgrade: delta vs {} failed: {:?}", alt, e);
+                    }
+                }
+                hbb_common::tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            // Collect up to 4 deltas for consensus
+            if deltas.len() >= 4 {
+                break;
+            }
+        }
+        // P2 consensus: pick the most frequent non-zero delta
+        if deltas.is_empty() {
+            log::info!("RelayUpgrade: no symmetric delta (all alt STUN failed or returned 0)");
+            0
+        } else if deltas.len() == 1 {
+            log::info!("RelayUpgrade: symmetric delta = {} (only 1 server worked)", deltas[0]);
+            deltas[0]
+        } else {
+            // Find most common delta value
+            use std::collections::HashMap;
+            let mut freq: HashMap<i16, usize> = HashMap::new();
+            for &d in &deltas {
+                *freq.entry(d).or_insert(0) += 1;
+            }
+            let best = freq.into_iter().max_by_key(|&(_, count)| count).unwrap();
+            log::info!("RelayUpgrade: symmetric delta = {} (consensus from {} servers, freq {})",
+                best.0, deltas.len(), best.1);
+            best.0
         }
     } else {
         0
