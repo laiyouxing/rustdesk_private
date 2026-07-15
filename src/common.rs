@@ -91,14 +91,10 @@ pub fn record_phase3_failure() {
 }
 
 /// Returns true if Phase3 should be skipped (failed on a previous attempt).
-/// Phase3 failure is remembered and retried only after a cooldown period,
-/// so repeated reconnections don't hammer STUN/punch but eventually recover.
+/// Once failed, Phase3 is never retried for the rest of the session lifetime.
 pub fn should_skip_phase3() -> bool {
     if let Ok(guard) = LAST_PHASE3_FAIL_AT.lock() {
-        match *guard {
-            Some(fail_at) => fail_at.elapsed() < std::time::Duration::from_secs(120),
-            None => false,
-        }
+        guard.is_some()
     } else {
         false
     }
