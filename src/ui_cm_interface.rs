@@ -973,6 +973,7 @@ async fn handle_fs(
     tx_log: Option<&UnboundedSender<String>>,
     _conn_id: i32,
 ) {
+    log::info!("[文件传输] CM收到FS命令: {:?}", std::mem::discriminant(&fs));
     match fs {
         ipc::FS::ReadEmptyDirs {
             dir,
@@ -1551,6 +1552,8 @@ async fn read_dir(dir: &str, include_hidden: bool, tx: &UnboundedSender<Data>) {
     };
     match spawn_blocking(move || fs::read_dir(&path, include_hidden)).await {
         Ok(Ok(fd)) => {
+            let entries_count = fd.entries.len();
+            log::info!("[文件传输] ReadDir 成功: path={}, entries={}", path, entries_count);
             let mut msg_out = Message::new();
             let mut file_response = FileResponse::new();
             file_response.set_dir(fd);

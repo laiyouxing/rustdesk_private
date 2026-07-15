@@ -818,6 +818,7 @@ impl Connection {
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
+                            log::info!("[文件传输] CM返回数据转发到客户端, bytes_len={}", bytes.len());
                             allow_err!(conn.stream.send_raw(bytes).await);
                         }
                         #[cfg(target_os = "windows")]
@@ -1359,7 +1360,7 @@ impl Connection {
 
     async fn check_privacy_mode_on(&mut self) -> bool {
         if privacy_mode::is_in_privacy_mode() {
-            self.send_login_error("Someone turns on privacy mode, exit")
+            self.send_login_error("对方开启了隐私模式，已断开连接")
                 .await;
             false
         } else {
@@ -1385,7 +1386,7 @@ impl Connection {
                 .next()
                 .is_none()
         {
-            self.send_login_error("Your ip is blocked by the peer")
+            self.send_login_error("你的IP已被对端屏蔽")
                 .await;
             Self::post_alarm_audit(
                 AlarmAuditType::IpWhitelist, //"ip whitelist",
@@ -1404,7 +1405,7 @@ impl Connection {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if crate::is_server() && Config::get_option("allow-only-conn-window-open") == "Y" {
             if !crate::check_process("", !crate::platform::is_root()) {
-                self.send_login_error("The main window is not open").await;
+                self.send_login_error("主窗口未打开").await;
                 return false;
             }
         }
@@ -1555,7 +1556,7 @@ impl Connection {
                     addr = "RDP".to_owned();
                 }
                 self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
+                    "无法访问远程{}. 请确保该服务可达/已打开。",
                     addr
                 ))
                 .await;
@@ -1567,7 +1568,7 @@ impl Connection {
                     addr = "RDP".to_owned();
                 }
                 self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
+                    "无法访问远程{}. 请确保该服务可达/已打开。",
                     addr
                 ))
                 .await;
@@ -1896,8 +1897,10 @@ impl Connection {
                 ""
             };
             if !wait_session_id_confirm {
+                log::info!("[文件传输] 立即发送 ReadDir 到 CM: dir={}", dir);
                 self.read_dir(dir, show_hidden);
             } else {
+                log::info!("[文件传输] 延迟 ReadDir (等待session确认): dir={}, show_hidden={}", dir, show_hidden);
                 self.delayed_read_dir = Some((dir.to_owned(), show_hidden));
             }
         } else if self.terminal {
@@ -2487,7 +2490,7 @@ impl Connection {
                         &self.control_permissions,
                     ) {
                         log::info!("[文件传输] 权限被拒绝");
-                        self.send_login_error("No permission of file transfer")
+                        self.send_login_error("没有文件传输权限")
                             .await;
                         sleep(1.).await;
                         return false;
@@ -2497,7 +2500,7 @@ impl Connection {
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
                     if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
-                        self.send_login_error("No permission of viewing camera")
+                        self.send_login_error("没有摄像头查看权限")
                             .await;
                         sleep(1.).await;
                         return false;
@@ -2506,13 +2509,13 @@ impl Connection {
                 }
                 Some(login_request::Union::Terminal(terminal)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
-                        self.send_login_error("No permission of terminal").await;
+                        self.send_login_error("没有终端权限").await;
                         sleep(1.).await;
                         return false;
                     }
                     #[cfg(target_os = "windows")]
                     if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
-                        self.send_login_error("Supported only in the installed version.")
+                        self.send_login_error("仅支持已安装版本.")
                             .await;
                         sleep(1.).await;
                         return false;
@@ -2554,7 +2557,7 @@ impl Connection {
                 }
                 Some(login_request::Union::PortForward(mut pf)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
-                        self.send_login_error("No permission of IP tunneling").await;
+                        self.send_login_error("没有IP隧道权限").await;
                         sleep(1.).await;
                         return false;
                     }
@@ -3083,6 +3086,7 @@ impl Connection {
                     if handle_fa {
                         if self.delayed_read_dir.is_some() {
                             if let Some(file_action::Union::ReadDir(rd)) = fa.union {
+                                log::info!("[文件传输] delayed_read_dir还在等待中, 收到新ReadDir (覆盖): path={}", rd.path);
                                 self.delayed_read_dir = Some((rd.path, rd.include_hidden));
                             }
                             return true;
@@ -3347,6 +3351,7 @@ impl Connection {
                         });
                     }
                     Some(file_response::Union::Done(d)) => {
+                        log::info!("[文件传输] FileResponse::Done 接收: id={}, file_num={}", d.id, d.file_num);
                         self.send_fs(ipc::FS::WriteDone {
                             id: d.id,
                             file_num: d.file_num,
@@ -3361,6 +3366,7 @@ impl Connection {
                         is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
+                        log::info!("[文件传输] FileResponse::Error 接收: id={}, file_num={}, err={}", e.id, e.file_num, e.error);
                         self.send_fs(ipc::FS::WriteError {
                             id: e.id,
                             file_num: e.file_num,
@@ -3512,6 +3518,7 @@ impl Connection {
                             }
                             if self.file_transfer.is_some() {
                                 if let Some((dir, show_hidden)) = self.delayed_read_dir.take() {
+                                    log::info!("[文件传输] session确认后执行延迟的ReadDir: dir={}, show_hidden={}", dir, show_hidden);
                                     self.read_dir(&dir, show_hidden);
                                 }
                             } else if self.view_camera {
@@ -3767,7 +3774,7 @@ impl Connection {
 
         if failure_prefix.2 > thresh {
             self.send_login_error(format!(
-                "Too many wrong attempts for IPv6 prefix /{}",
+                "IPv6前缀/{}尝试次数过多",
                 prefix_num
             ))
             .await;
@@ -3810,7 +3817,7 @@ impl Connection {
             .unwrap_or((0, 0, 0));
 
         let res = if failure.2 > 30 {
-            self.send_login_error("Too many wrong attempts").await;
+            self.send_login_error("尝试次数过多").await;
             Self::post_alarm_audit(
                 AlarmAuditType::ExceedThirtyAttempts,
                 json!({
@@ -3821,7 +3828,7 @@ impl Connection {
             );
             false
         } else if time == failure.0 && failure.1 > 6 {
-            self.send_login_error("Please try 1 minute later").await;
+            self.send_login_error("请1分钟后再试").await;
             Self::post_alarm_audit(
                 AlarmAuditType::SixAttemptsWithinOneMinute,
                 json!({
@@ -4543,6 +4550,7 @@ impl Connection {
         _include_hidden: bool,
         result: Result<Vec<u8>, String>,
     ) {
+        log::info!("[文件传输] handle_read_job_init_result: id={}, result_is_ok={}", id, result.is_ok());
         // Check if this response is still expected (not stale/cancelled)
         if !self.cm_read_job_ids.contains(&id) {
             log::warn!(
@@ -4750,6 +4758,7 @@ impl Connection {
     }
 
     fn read_empty_dirs(&mut self, dir: &str, include_hidden: bool) {
+        log::info!("[文件传输] read_empty_dirs 发送到CM: dir={}, include_hidden={}", dir, include_hidden);
         let dir = dir.to_string();
         self.send_fs(ipc::FS::ReadEmptyDirs {
             dir,
