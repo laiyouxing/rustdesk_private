@@ -568,9 +568,9 @@ class ServerModel with ChangeNotifier {
   void addConnection(Map<String, dynamic> evt) {
     try {
       final client = Client.fromJson(jsonDecode(evt["client"]));
+      final index = _clients.indexWhere((c) => c.id == client.id);
       if (client.authorized) {
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(client.id));
-        final index = _clients.indexWhere((c) => c.id == client.id);
         if (index < 0) {
           _clients.add(client);
         } else {
@@ -583,11 +583,20 @@ class ServerModel with ChangeNotifier {
           _clients[index].privacyMode = client.privacyMode;
         }
       } else {
-        final index = _clients.indexWhere((c) => c.id == client.id);
+        // 新连接请求未授权
         if (index >= 0) {
-          _clients[index].privacyMode = client.privacyMode;
-          notifyListeners();
-          return;
+          // 已有同 id 的 client (重连场景)
+          if (_clients[index].authorized) {
+            // 原 client 已授权过，自动重新授权（无需弹窗）
+            debugPrint(
+                "addConnection: same id=${client.id} already authorized, auto re-authorize");
+            bind.cmLoginRes(connId: client.id, res: true);
+            return;
+          }
+          // 原 client 未授权，移除旧的，让新流程重新弹窗
+          debugPrint(
+              "addConnection: same id=${client.id} not authorized, remove old and re-show dialog");
+          _clients.removeAt(index);
         }
         _clients.add(client);
       }
