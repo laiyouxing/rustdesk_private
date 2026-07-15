@@ -1177,6 +1177,7 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
         if force_update {
             // Force update: auto-download and install without user prompt
             log::info!("Force update to version {} from {}", latest_version, download_url);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
                 // Download using the same HTTP client
                 if let Ok(resp) = client.get(&download_url).send().await {

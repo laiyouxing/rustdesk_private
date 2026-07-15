@@ -968,7 +968,7 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .arg("--update")
                     .spawn();
             }
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(any(target_os = "android", target_os = "ios"))))]
             {
                 let _ = crate::platform::update_to(&file);
             }
