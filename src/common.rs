@@ -3061,8 +3061,10 @@ pub async fn relay_upgrade_task(
         }
     }
 
+    // Performance tuning: lower values reduce impact on relay traffic.
+    // ±30 instead of ±50 → ~60 targets/peer vs ~100; burst 8 instead of 20.
     const TOTAL_BUDGET: Duration = Duration::from_secs(30);
-    const PREDICTED_SCAN_RANGE: u16 = 50;
+    const PREDICTED_SCAN_RANGE: u16 = 30;
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
@@ -3305,7 +3307,7 @@ pub async fn relay_upgrade_task(
         }
     }
 
-    for _round in 0..10 {
+    for _round in 0..6 {
         if started.elapsed() >= TOTAL_BUDGET {
             log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
             return false;
@@ -3354,6 +3356,7 @@ pub async fn relay_upgrade_task(
             }
         }
         // Try each target address with KCP (UDP) hole punching.
+        // Inter-target delay prevents flooding the network and impacting relay traffic.
         for &target in &targets {
             if started.elapsed() >= TOTAL_BUDGET {
                 return false;
@@ -3369,9 +3372,11 @@ pub async fn relay_upgrade_task(
             if socket.connect(target).await.is_err() {
                 continue;
             }
+            // Brief yield to avoid monopolizing the async runtime and starving relay I/O
+            hbb_common::tokio::time::sleep(Duration::from_millis(10)).await;
 
-            // Empty packet burst: 20 packets at 5ms spacing
-            for _ in 0..20 {
+            // Empty packet burst: 8 packets at 5ms spacing (reduced from 20 to minimize relay interference)
+            for _ in 0..8 {
                 if started.elapsed() >= TOTAL_BUDGET {
                     return false;
                 }
