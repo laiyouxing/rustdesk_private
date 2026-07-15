@@ -301,6 +301,11 @@ impl<T: InvokeUiSession> Remote<T> {
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 let mut rx_clip_client = rx_clip_client_holder.0.lock().await;
 
+                // 中继保活定时器：每 20 秒检查，如果通过中继且无数据超过 15 秒则发空包，
+                // 防止 hbbr 30 秒空闲超时导致中继连接被断开。
+                let mut keepalive_timer =
+                    crate::rustdesk_interval(time::interval(Duration::new(20, 0)));
+
                 let mut status_timer =
                     crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
                 let mut fps_instant = Instant::now();
@@ -481,6 +486,16 @@ impl<T: InvokeUiSession> Remote<T> {
                                 } else {
                                     self.inactivity_warning_remaining = Some(COUNTDOWN_SEC);
                                     log::info!("Inactivity timeout warning: {}s countdown", COUNTDOWN_SEC);
+                                }
+                            }
+                        }
+                        _ = keepalive_timer.tick() => {
+                            // 中继保活：20s 检测一次，当通过中继且 15s 内无数据时，
+                            // 发一个空 protobuf Message 保持中继连接活跃，
+                            // 防止 hbbr 30 秒空闲超时中断会话。
+                            if !direct && last_recv_time.elapsed().as_secs() > 15 {
+                                if let Err(e) = peer.send(&Message::new()).await {
+                                    log::debug!("keepalive send failed: {}", e);
                                 }
                             }
                         }
