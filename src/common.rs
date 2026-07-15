@@ -3155,19 +3155,34 @@ pub async fn relay_upgrade_task(
                             i + 1, delay, 3 - retries, e);
                         retries -= 1;
                         hbb_common::tokio::time::sleep(delay).await;
-                        // P0: if locked server exhausted retries, fall back to concurrent
+                        // P0: if locked server exhausted retries, try other servers one by one.
+                        // Cannot use stun_query_with_socket (concurrent send_to) because
+                        // the socket may be connected (Windows WSAEISCONN on send_to mismatch).
                         if retries == 0 && selected_server.is_some() {
-                            log::info!("RelayUpgrade STUN #{} locked server unresponsive, falling back to concurrent query", i + 1);
-                            match stun_query_with_socket(&socket).await {
-                                Ok((addr, srv)) => {
-                                    log::info!("RelayUpgrade STUN #{} fallback OK via {} (port {})",
-                                        i + 1, srv, addr.port());
-                                    selected_server = Some(srv.clone());
-                                    stun_ports.push(addr.port());
+                            log::info!("RelayUpgrade STUN #{} locked server unresponsive, trying other servers one by one", i + 1);
+                            let alt_servers = get_stun_servers_v4();
+                            let mut fallback_ok = false;
+                            for alt_srv in alt_servers.iter() {
+                                if selected_server.as_ref().map_or(false, |s| s == alt_srv) {
+                                    continue; // skip the already-failed locked server
                                 }
-                                Err(e2) => {
-                                    log::info!("RelayUpgrade STUN #{} concurrent fallback also failed: {:?}", i + 1, e2);
+                                match stun_query_single_server(&socket, alt_srv).await {
+                                    Ok((fb_addr, fb_srv)) => {
+                                        log::info!("RelayUpgrade STUN #{} fallback OK via {} (port {})",
+                                            i + 1, fb_srv, fb_addr.port());
+                                        selected_server = Some(fb_srv);
+                                        stun_ports.push(fb_addr.port());
+                                        fallback_ok = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        log::info!("RelayUpgrade STUN #{} fallback vs {} failed: {:?}",
+                                            i + 1, alt_srv, e);
+                                    }
                                 }
+                            }
+                            if !fallback_ok {
+                                log::info!("RelayUpgrade STUN #{} all fallback servers failed", i + 1);
                             }
                         }
                         continue;
@@ -3189,12 +3204,13 @@ pub async fn relay_upgrade_task(
         hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Phase 3: send our public address to peer through relay
-    if let Some(addr) = our_addr {
-        let _ = phase3_out_tx.try_send(addr);
-        log::info!("Phase3: sent our address to relay loop: {}", addr);
-    }
-    // Also send IPv6 address if available (for dual-stack peers)
+
+
+    // Phase 3: send our public address to peer through relay.
+    // We delay this until AFTER delta measurement so we can include
+    // the predicted port for symmetric NAT (BUGFIX: on symmetric NAT,
+    // the STUN-discovered port differs from the port the peer must punch to).
+    // IPv6 and TCP listener are sent immediately (they don't need delta).
     if crate::get_ipv6_punch_enabled() {
         if let Some(ipv6_addr) = get_cached_ipv6_addr() {
             let _ = phase3_out_tx.try_send(ipv6_addr);
@@ -3272,9 +3288,22 @@ pub async fn relay_upgrade_task(
     } else {
         0
     };
-    // Restore socket connection to the peer's first target for punching.
-    // We disconnected it during delta measurement. Reconnect is not critical
-    // since we reconnect to each target in the loop below.
+    // BUGFIX: Send our address NOW (after delta measurement) so we can include
+    // the predicted port for symmetric NAT. On cone NAT both ports are the same.
+    // On symmetric NAT the peer needs to try: STUN_port (for our us→STUN mapping)
+    // AND STUN_port+our_delta (for our us→peer mapping).
+    if let Some(addr) = our_addr {
+        let _ = phase3_out_tx.try_send(addr);
+        log::info!("Phase3: sent our address to relay loop: {}", addr);
+        if our_delta != 0 {
+            let predicted_port = addr.port().wrapping_add(our_delta as u16);
+            if predicted_port > 0 && predicted_port != addr.port() {
+                let predicted_addr = std::net::SocketAddr::new(addr.ip(), predicted_port);
+                let _ = phase3_out_tx.try_send(predicted_addr);
+                log::info!("Phase3: sent predicted our address for symmetric NAT: {}", predicted_addr);
+            }
+        }
+    }
 
     for _round in 0..10 {
         if started.elapsed() >= TOTAL_BUDGET {
