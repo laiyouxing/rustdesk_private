@@ -2205,12 +2205,15 @@ impl<T: InvokeUiSession> Remote<T> {
                                     addrs.iter().any(|a| a.ip() == peer_addr.ip() && a.port() != peer_addr.port())
                                 }).unwrap_or(false)
                             });
-                            if is_tcp {
+                            // Sync addresses (0.0.0.0:TIMESTAMP) go to punch_tcp_addrs
+                            let is_sync = peer_addr.ip().is_unspecified();
+                            if is_tcp || is_sync {
                                 if let Some(ref punch_tcp) = self.punch_tcp_addrs {
                                     if let Ok(mut addrs) = punch_tcp.lock() {
                                         if !addrs.contains(&peer_addr) {
                                             addrs.push(peer_addr);
-                                            log::info!("Phase3: added TCP peer address: {}", peer_addr);
+                                            log::info!("Phase3: added {} peer address: {}",
+                                                if is_sync { "sync" } else { "TCP" }, peer_addr);
                                         }
                                     }
                                 }

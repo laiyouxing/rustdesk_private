@@ -3459,27 +3459,65 @@ pub async fn relay_upgrade_task(
         // far more reliable than trying TCP on KCP/UDP ports.
         // Also try WebSocket (WS/WSS) connect as some firewalls allow HTTP
         // upgrade traffic while blocking raw TCP on non-standard ports.
-        // Timing sync: both sides compute `punch_at = (next_5s_boundary) + 1s`
-        // from the peer_addr port hash, ensuring they enter the accept/connect
-        // select! at the same wall-clock time for TCP simultaneous open.
-        let punch_at = {
-            let now = hbb_common::tokio::time::Instant::now();
-            // Round up to next 5-second boundary, skewed by peer_addr port
-            let skew_ms = (tcp_listener_port.unwrap_or(0) as u64 % 1000) as u32;
-            let base = Duration::from_millis(
-                ((now + Duration::from_secs(5)).as_millis() / 5000 * 5000) as u64 + skew_ms as u64 + 1000
-            );
-            if base > now + Duration::from_secs(8) {
-                now + Duration::from_secs(5) + Duration::from_millis(skew_ms as u64)
-            } else {
-                base
+        // Timing sync for TCP simultaneous open: both sides exchange their
+        // current wall clock (SystemTime) via relay, compute the clock offset,
+        // and agree on a common punch_at timestamp. This ensures both sides
+        // enter the accept/connect select! at the same absolute time, even if
+        // local monotonic clocks differ.
+        // Exchange: encode our `now+2s` as a SocketAddr with UNSPECIFIED IP
+        // and the timestamp in the port field; receive peer's via phase3_tcp_rx.
+        let our_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let our_punch = our_ts + 2000; // our proposed punch time
+        let _ = phase3_out_tx.try_send(
+            std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), (our_punch & 0xFFFF) as u16)
+        );
+        // Wait for peer's timestamp (up to 10s), then compute common punch_at
+        let mut peer_ts = None;
+        let common_punch = {
+            let deadline = hbb_common::tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut peer_ts_local = None;
+            while hbb_common::tokio::time::Instant::now() < deadline {
+                if let Ok(addrs) = phase3_tcp_rx.lock() {
+                    for &addr in addrs.iter() {
+                        if addr.ip().is_unspecified() {
+                            // Port carries the lower 16 bits of peer's punch timestamp
+                            // Reconstruct full timestamp from our_ts high bits + peer port low bits
+                            let peer_low = addr.port() as u64;
+                            let peer_full = (our_ts & !0xFFFF) | peer_low;
+                            // Handle rollover: if peer's time wrapped past a 65536 boundary
+                            peer_ts_local = Some(if peer_full > our_ts + 10000 {
+                                peer_full - 0x10000
+                            } else if peer_full + 10000 < our_ts {
+                                peer_full + 0x10000
+                            } else {
+                                peer_full
+                            });
+                            break;
+                        }
+                    }
+                }
+                if peer_ts_local.is_some() { break; }
+                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            peer_ts = peer_ts_local;
+            // punch_at = max(both proposals), then round up to next 5s boundary
+            let max_ts = std::cmp::max(our_punch, peer_ts.unwrap_or(our_punch));
+            (max_ts / 5000 + 1) * 5000 + (tcp_listener_port.unwrap_or(0) as u64 % 1000)
         };
-        {
-            let wait = punch_at.saturating_duration_since(hbb_common::tokio::time::Instant::now());
-            if wait.as_millis() > 10 {
-                log::info!("[NAT穿透] TCP同时打开同步: 等待{}ms到对齐时间", wait.as_millis());
-                hbb_common::tokio::time::sleep(wait).await;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if common_punch > now_ms {
+            let wait_ms = common_punch - now_ms;
+            if wait_ms > 10 {
+                log::info!("[NAT穿透] TCP同时打开同步: offset={}ms, wait={}ms",
+                    if let Some(peer) = peer_ts { (our_punch as i64 - peer as i64).abs() } else { 0 },
+                    wait_ms);
+                hbb_common::tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
         }
         if let Some(ref listener) = tcp_listener {
