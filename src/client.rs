@@ -4253,7 +4253,7 @@ async fn test_udp_uat(
                                     *udp_port.lock().unwrap() = response.port as u16;
                                     // Also save the public IP from hbbs (more reliable than STUN for the punch socket)
                                     if !response.ip.is_empty() {
-                                        if let Ok(ip_str) = String::from_utf8(response.ip) {
+                                        if let Ok(ip_str) = String::from_utf8(response.ip.to_vec()) {
                                             // IPv6 地址需要方括号: [::1]:port 而非 ::1:port
                                             let addr_str = if ip_str.contains(':') {
                                                 format!("[{}]:{}", ip_str, response.port)
