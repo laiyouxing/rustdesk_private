@@ -4254,7 +4254,12 @@ async fn test_udp_uat(
                                     // Also save the public IP from hbbs (more reliable than STUN for the punch socket)
                                     if !response.ip.is_empty() {
                                         if let Ok(ip_str) = String::from_utf8(response.ip) {
-                                            let addr_str = format!("{}:{}", ip_str, response.port);
+                                            // IPv6 地址需要方括号: [::1]:port 而非 ::1:port
+                                            let addr_str = if ip_str.contains(':') {
+                                                format!("[{}]:{}", ip_str, response.port)
+                                            } else {
+                                                format!("{}:{}", ip_str, response.port)
+                                            };
                                             log::info!("UDP NAT test: got TestNatResponse ip={}, port={} from hbbs", ip_str, response.port);
                                             if let Ok(mut public) = crate::common::PUBLIC_ADDR.lock() {
                                                 *public = addr_str;
