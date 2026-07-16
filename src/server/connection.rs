@@ -2495,8 +2495,8 @@ impl Connection {
                         sleep(1.).await;
                         return false;
                     }
+                    log::info!("[文件传输] 登录请求接收: dir={:?}, show_hidden={}", &ft.dir, ft.show_hidden);
                     self.file_transfer = Some((ft.dir, ft.show_hidden));
-                    log::info!("[文件传输] 登录请求接收: dir={:?}, show_hidden={}", self.file_transfer.as_ref().map(|x| &x.0), self.file_transfer.as_ref().map(|x| x.1));
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
                     if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
