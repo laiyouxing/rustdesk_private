@@ -3130,25 +3130,26 @@ pub async fn relay_upgrade_task(
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
 
-    // Verify Phase3 socket's local port matches hbbs test socket port.
-    // If yes, hbbs-discovered address is accurate (same NAT mapping).
-    // If bind failed (port occupied), Phase3 uses random port → must run STUN.
+    // Primary: hbbs-discovered address (for the test socket, same local port).
+    // Secondary: STUN addresses (for Phase3 socket). Both are sent to the peer.
     let hbbs_port = HBBS_TEST_SOCKET_PORT.lock().map(|g| *g).unwrap_or(0);
     let phase3_port = socket_v4.local_addr().map(|a| a.port()).unwrap_or(0);
-    if hbbs_port > 0 && hbbs_port == phase3_port {
-        if let Ok(addr_str) = PUBLIC_ADDR.lock() {
-            if !addr_str.is_empty() {
-                if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                    our_addr = Some(addr);
-                    stun_ports.push(addr.port());
-                    log::info!("[NAT穿透] Phase3 using hbbs-discovered address: {} (port match, skip STUN)", addr);
-                }
-            }
+    let hbbs_addr: Option<std::net::SocketAddr> = if hbbs_port > 0 && hbbs_port == phase3_port {
+        match PUBLIC_ADDR.lock() {
+            Ok(addr_str) if !addr_str.is_empty() => addr_str.parse::<std::net::SocketAddr>().ok(),
+            _ => None,
         }
+    } else { None };
+    if let Some(addr) = hbbs_addr {
+        our_addr = Some(addr);
+        stun_ports.push(addr.port());
+        log::info!("[NAT穿透] Phase3 primary: hbbs address {} (hbbs_port={}, phase3_port={})",
+            addr, hbbs_port, phase3_port);
     }
 
-    // Only run STUN if hbbs didn't already provide the address
-    if our_addr.is_none() {
+    // Always run STUN as secondary: discover Phase3 socket's actual mapping,
+    // collect delta data for symmetric NAT port prediction.
+    // STUN result may be the same as hbbs (cone NAT) or different (symmetric NAT).
 
     for i in 0..5 {
         // P1: retry up to 2 times with exponential backoff (200ms, 400ms)
@@ -3233,8 +3234,12 @@ pub async fn relay_upgrade_task(
         }
         hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    } // end our_addr.is_none() (skip STUN when hbbs already provided addr)
 
+    // If STUN found an address and it differs from hbbs (symmetric NAT),
+    // send the hbbs address first as primary so peer starts punching earlier.
+    let hbbs_primary = hbbs_addr.and_then(|hb| {
+        our_addr.as_ref().filter(|sa| sa.port() != hb.port()).map(|_| hb)
+    });
 
     // Phase 3: send our public address to peer through relay.
     // We delay this until AFTER delta measurement so we can include
@@ -3246,6 +3251,12 @@ pub async fn relay_upgrade_task(
             let _ = phase3_out_tx.try_send(ipv6_addr);
             log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
         }
+    }
+    // If hbbs-discovered address differs from STUN (symmetric NAT), send it
+    // first as the primary target so the peer starts punching immediately.
+    if let Some(hb_addr) = hbbs_primary {
+        let _ = phase3_out_tx.try_send(hb_addr);
+        log::info!("Phase3: sent hbbs primary address for peer: {}", hb_addr);
     }
     // Send TCP listener address for TCP simultaneous open fallback.
     if let Some(tcp_port) = tcp_listener_port {
