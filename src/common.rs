@@ -3399,6 +3399,10 @@ pub async fn relay_upgrade_task(
             if socket.connect(target).await.is_err() {
                 continue;
             }
+            // Send an initial empty packet immediately after connect to establish
+            // the NAT mapping. Without this, aggressive NATs may drop the mapping
+            // during the 1s sleep gap, causing all subsequent packets to fail.
+            socket.send(&[]).await.ok();
             // 串行慢慢试：每个目标间隔 1s，让中继操作不被干扰
             hbb_common::tokio::time::sleep(Duration::from_millis(1000)).await;
 
