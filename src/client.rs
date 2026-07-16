@@ -463,6 +463,13 @@ impl Client {
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
+        // Save test socket's local port so Phase3 can bind to the same port
+        // and benefit from hbbs's discovered NAT mapping (avoids STUN).
+        if let Some(ref test_socket) = udp.0 {
+            if let Ok(addr) = test_socket.local_addr() {
+                *crate::common::HBBS_TEST_SOCKET_PORT.lock().unwrap() = addr.port();
+            }
+        }
         // Enumerate ALL local non-loopback IPv4 addresses using native OS API
         // to capture virtual adapters (Tailscale/WireGuard VPN, L2 bridges)
         // that default_net::get_interfaces() may skip on Windows.

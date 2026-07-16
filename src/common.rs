@@ -64,6 +64,11 @@ pub const PLATFORM_ANDROID: &str = "Android";
 // and also during relay_upgrade_task for the latest NAT mapping.
 pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+// Local port of the hbbs test socket (used by test_udp_uat).
+// Phase3 binds to this same port so the NAT mapping matches hbbs's discovery,
+// allowing Phase3 to skip STUN entirely.
+pub static HBBS_TEST_SOCKET_PORT: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
+
 /// Custom build identifier used to verify that the remote peer is also running
 /// this custom fork (not stock RustDesk).  Set in PunchHoleRequest.custom_tag.
 pub const CUSTOM_TAG: &str = "rustdesk-custom";
@@ -3117,10 +3122,27 @@ pub async fn relay_upgrade_task(
 
     // Multi-STUN: query multiple times to detect port increment pattern
     // for Symmetric NAT port prediction.
+    // BUT if hbbs already discovered our address (via test_udp_uat), use it
+    // directly -- no need for STUN since the Phase3 socket binds to the same
+    // local port, so the NAT mapping is the same.
     let mut targets = peer_addrs.clone();
     let mut our_addr: Option<std::net::SocketAddr> = None;
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
+
+    // Check if hbbs already gave us the public address for this socket
+    if let Ok(addr_str) = PUBLIC_ADDR.lock() {
+        if !addr_str.is_empty() {
+            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                our_addr = Some(addr);
+                stun_ports.push(addr.port());
+                log::info!("[NAT穿透] Phase3 using hbbs-discovered address: {} (skip STUN)", addr);
+            }
+        }
+    }
+
+    // Only run STUN if hbbs didn't already provide the address
+    if our_addr.is_none() {
 
     for i in 0..5 {
         // P1: retry up to 2 times with exponential backoff (200ms, 400ms)
@@ -3205,7 +3227,7 @@ pub async fn relay_upgrade_task(
         }
         hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
+    } // end our_addr.is_none() (skip STUN when hbbs already provided addr)
 
 
     // Phase 3: send our public address to peer through relay.
