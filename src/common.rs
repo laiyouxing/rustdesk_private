@@ -3141,7 +3141,6 @@ pub async fn relay_upgrade_task(
                 if let Ok(Ok((n, _))) = hbb_common::tokio::time::timeout(
                     Duration::from_secs(3), socket.recv_from(&mut buf)
                 ).await {
-                    let n = n.0; // bytes read
                     if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
                         if let Some(rendezvous_message::Union::TestNatResponse(resp)) = msg_in.union {
                             let port = resp.port as u16;
