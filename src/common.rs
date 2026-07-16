@@ -3277,8 +3277,7 @@ pub async fn relay_upgrade_task(
             deltas[0]
         } else {
             // Find most common delta value
-            use std::collections::HashMap;
-            let mut freq: HashMap<i16, usize> = HashMap::new();
+            let mut freq: std::collections::HashMap<i16, usize> = std::collections::HashMap::new();
             for &d in &deltas {
                 *freq.entry(d).or_insert(0) += 1;
             }
