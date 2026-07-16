@@ -3130,13 +3130,19 @@ pub async fn relay_upgrade_task(
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
 
-    // Check if hbbs already gave us the public address for this socket
-    if let Ok(addr_str) = PUBLIC_ADDR.lock() {
-        if !addr_str.is_empty() {
-            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                our_addr = Some(addr);
-                stun_ports.push(addr.port());
-                log::info!("[NAT穿透] Phase3 using hbbs-discovered address: {} (skip STUN)", addr);
+    // Verify Phase3 socket's local port matches hbbs test socket port.
+    // If yes, hbbs-discovered address is accurate (same NAT mapping).
+    // If bind failed (port occupied), Phase3 uses random port → must run STUN.
+    let hbbs_port = HBBS_TEST_SOCKET_PORT.lock().map(|g| *g).unwrap_or(0);
+    let phase3_port = socket_v4.local_addr().map(|a| a.port()).unwrap_or(0);
+    if hbbs_port > 0 && hbbs_port == phase3_port {
+        if let Ok(addr_str) = PUBLIC_ADDR.lock() {
+            if !addr_str.is_empty() {
+                if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                    our_addr = Some(addr);
+                    stun_ports.push(addr.port());
+                    log::info!("[NAT穿透] Phase3 using hbbs-discovered address: {} (port match, skip STUN)", addr);
+                }
             }
         }
     }
@@ -3453,6 +3459,29 @@ pub async fn relay_upgrade_task(
         // far more reliable than trying TCP on KCP/UDP ports.
         // Also try WebSocket (WS/WSS) connect as some firewalls allow HTTP
         // upgrade traffic while blocking raw TCP on non-standard ports.
+        // Timing sync: both sides compute `punch_at = (next_5s_boundary) + 1s`
+        // from the peer_addr port hash, ensuring they enter the accept/connect
+        // select! at the same wall-clock time for TCP simultaneous open.
+        let punch_at = {
+            let now = hbb_common::tokio::time::Instant::now();
+            // Round up to next 5-second boundary, skewed by peer_addr port
+            let skew_ms = (tcp_listener_port.unwrap_or(0) as u64 % 1000) as u32;
+            let base = Duration::from_millis(
+                ((now + Duration::from_secs(5)).as_millis() / 5000 * 5000) as u64 + skew_ms as u64 + 1000
+            );
+            if base > now + Duration::from_secs(8) {
+                now + Duration::from_secs(5) + Duration::from_millis(skew_ms as u64)
+            } else {
+                base
+            }
+        };
+        {
+            let wait = punch_at.saturating_duration_since(hbb_common::tokio::time::Instant::now());
+            if wait.as_millis() > 10 {
+                log::info!("[NAT穿透] TCP同时打开同步: 等待{}ms到对齐时间", wait.as_millis());
+                hbb_common::tokio::time::sleep(wait).await;
+            }
+        }
         if let Some(ref listener) = tcp_listener {
             let tcp_targets: Vec<std::net::SocketAddr> = if let Ok(addrs) = phase3_tcp_rx.lock() {
                 addrs.clone()
