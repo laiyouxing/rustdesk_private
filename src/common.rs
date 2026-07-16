@@ -64,11 +64,6 @@ pub const PLATFORM_ANDROID: &str = "Android";
 // and also during relay_upgrade_task for the latest NAT mapping.
 pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-// Local port of the hbbs test socket (used by test_udp_uat).
-// Phase3 binds to this same port so the NAT mapping matches hbbs's discovery,
-// allowing Phase3 to skip STUN entirely.
-pub static HBBS_TEST_SOCKET_PORT: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
-
 /// Custom build identifier used to verify that the remote peer is also running
 /// this custom fork (not stock RustDesk).  Set in PunchHoleRequest.custom_tag.
 pub const CUSTOM_TAG: &str = "rustdesk-custom";
@@ -3120,35 +3115,57 @@ pub async fn relay_upgrade_task(
         log::info!("RelayUpgrade: created IPv6 socket for dual-stack punching");
     }
 
-    // Multi-STUN: query multiple times to detect port increment pattern
-    // for Symmetric NAT port prediction.
-    // BUT if hbbs already discovered our address (via test_udp_uat), use it
-    // directly -- no need for STUN since the Phase3 socket binds to the same
-    // local port, so the NAT mapping is the same.
+    // Fresh hbbs TestNatRequest using OUR OWN socket. This replaces the
+    // old approach of relying on the pre-connection test socket (which goes
+    // stale on auto-reconnect). Each Phase3 invocation gets its own fresh
+    // address discovery, accurate for this specific socket, right now.
     let mut targets = peer_addrs.clone();
     let mut our_addr: Option<std::net::SocketAddr> = None;
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
 
-    // Primary: hbbs-discovered address (for the test socket, same local port).
-    // If port matches, hbbs address IS the correct mapping for this Phase3 socket.
-    // STUN is skipped -- no need for extra queries when we already have the truth.
-    let hbbs_port = HBBS_TEST_SOCKET_PORT.lock().map(|g| *g).unwrap_or(0);
-    let phase3_port = socket_v4.local_addr().map(|a| a.port()).unwrap_or(0);
-    if hbbs_port > 0 && hbbs_port == phase3_port {
-        if let Ok(addr_str) = PUBLIC_ADDR.lock() {
-            if !addr_str.is_empty() {
-                if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                    our_addr = Some(addr);
-                    stun_ports.push(addr.port());
-                    log::info!("[NAT穿透] Phase3 primary: hbbs address {} (skip STUN)", addr);
+    // Send TestNatRequest to hbbs using Phase3's own socket, get the
+    // real NAT mapping for THIS socket (not a stale one from minutes ago).
+    let hbbs_host = Config::get_rendezvous_server();
+    if !hbbs_host.is_empty() {
+        use std::net::ToSocketAddrs;
+        if let Ok(Some(hbbs_addr)) = hbbs_host
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut i| i.find(|a| a.is_ipv4()))
+        {
+            let mut msg = RendezvousMessage::new();
+            msg.set_test_nat_request(TestNatRequest::default());
+            if let Ok(data) = msg.write_to_bytes() {
+                socket.send_to(&data, hbbs_addr).await.ok();
+                let mut buf = vec![0u8; 1024];
+                if let Ok((n, _)) = hbb_common::tokio::time::timeout(
+                    Duration::from_secs(3), socket.recv_from(&mut buf)
+                ).await {
+                    if let Ok(Ok(msg_in)) = n.map(|(n, _)| {
+                        RendezvousMessage::parse_from_bytes(&buf[..n])
+                    }) {
+                        if let Some(rendezvous_message::Union::TestNatResponse(resp)) = msg_in.union {
+                            let port = resp.port as u16;
+                            // Extract IP from response (new server) or from sender addr
+                            let ip = if !resp.ip.is_empty() {
+                                String::from_utf8(resp.ip.to_vec()).unwrap_or_default()
+                            } else {
+                                hbbs_addr.ip().to_string()
+                            };
+                            if let Ok(addr) = format!("{}:{}", ip, port).parse::<std::net::SocketAddr>() {
+                                our_addr = Some(addr);
+                                stun_ports.push(addr.port());
+                                log::info!("[NAT穿透] Phase3 hbbs-inline: {} (skip STUN)", addr);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     // Only run STUN if hbbs didn't already provide the address
-    // (port mismatch or no hbbs discovery occurred).
     if our_addr.is_none() {
 
     for i in 0..5 {

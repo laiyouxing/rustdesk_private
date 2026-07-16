@@ -245,24 +245,14 @@ impl<T: InvokeUiSession> Remote<T> {
                             Arc::new(std::sync::Mutex::new(None));
                         self.handler.set_punch_status("trying", "");
                         // 独立线程的 Phase3 无法直接取消，但 180s 预算后会自动退出
-                        // Phase3 binds to the test socket's local port so the NAT mapping
-                        // matches what hbbs discovered (avoids STUN). Fallback: UPnP, then
-                        // hbbs NAT port (less reliable for binding), then 0 (random).
+                        // Prefer UPnP local port so UDP socket uses the mapped port
                         let punch_port = {
-                            let test_port = crate::common::HBBS_TEST_SOCKET_PORT
-                                .lock()
-                                .map(|g| *g)
-                                .unwrap_or(0);
-                            if test_port > 0 {
-                                test_port
+                            let upnp_local = crate::common::get_upnp_local_port();
+                            if upnp_local > 0 {
+                                crate::common::release_upnp_reservation();
+                                upnp_local
                             } else {
-                                let upnp_local = crate::common::get_upnp_local_port();
-                                if upnp_local > 0 {
-                                    crate::common::release_upnp_reservation();
-                                    upnp_local
-                                } else {
-                                    udp_nat_port
-                                }
+                                udp_nat_port
                             }
                         };
                         // Phase3 在独立线程的 tokio 运行时中运行，避免与 io_loop 抢资源
