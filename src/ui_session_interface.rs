@@ -2035,6 +2035,9 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         if remote.sent_close_reason {
             break;
         }
+        // Phase3 熔断重置：每次重连前重置 Phase3 失败计数，
+        // 使新连接能重新尝试 NAT 穿透（而非因上次会话累积 3 次失败后永久跳过）。
+        crate::common::reset_phase3_state();
         // 文件传输会话：重连前落盘当前进度并清空内存任务，
         // 使新连接建立后通过 load_last_jobs 从磁盘按 file_num 自动续传，
         // 避免残留任务向全新的被控端连接发送数据块而被丢弃导致传输失败。

@@ -151,6 +151,12 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
+        // Reset per-connection state for auto-reconnect path.
+        // User-initiated reconnect() clears peer_info via LoginConfigHandler,
+        // but the auto-reconnect loop reuses the same Remote struct, so we
+        // must clear it here to avoid stale feature-detection flags during
+        // the brief window before LoginResponse arrives on the new connection.
+        self.peer_info = Default::default();
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -324,10 +330,10 @@ impl<T: InvokeUiSession> Remote<T> {
                                     Err(err) => {
                                         if received {
                                             log::info!("Connection lost, reconnecting...");
-                                            self.handler.set_punch_status("reconnecting", "");
                                         } else {
-                                            self.handler.on_establish_connection_error(err.to_string());
+                                            log::info!("Connection lost during establishment: {}, reconnecting...", err);
                                         }
+                                        self.handler.set_punch_status("reconnecting", "");
                                         break;
                                     }
                                     Ok(ref bytes) => {
@@ -350,8 +356,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                     log::info!("Reset by the peer, reconnecting...");
                                     self.handler.set_punch_status("reconnecting", "");
                                 } else {
-                                    log::info!("Reset by the peer");
-                                    self.handler.msgbox("error", "Connection Error", "Reset by the peer", "");
+                                    log::info!("Reset by the peer during establishment, reconnecting...");
+                                    self.handler.set_punch_status("reconnecting", "");
                                 }
                                 break;
                             }
