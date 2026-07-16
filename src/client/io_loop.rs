@@ -1290,6 +1290,38 @@ impl<T: InvokeUiSession> Remote<T> {
         true
     }
 
+    /// 文件传输会话在自动重连前的准备工作。
+    ///
+    /// 背景：自动重连循环复用同一个 `Remote`，其内存中的 `read_jobs`/`write_jobs`
+    /// 会跨重连保留。但重连后被控端是一个全新的连接，并不知道旧连接上的传输任务，
+    /// 若继续用残留的内存任务发送数据块，被控端因没有对应任务而丢弃，导致
+    /// "重连后无法传输文件"。同时 `sync_jobs_status_to_local` 原本只在整个重连
+    /// 循环结束后才落盘一次，重连时 `load_last_jobs` 读到的是过期/为空的续传信息。
+    ///
+    /// 处理：重连前先把当前进度（`file_num`）落盘、标记为重连（使 `load_last_jobs`
+    /// 恢复的任务带 `auto_start` 自动续传），再清空内存任务，避免与重连后由
+    /// `load_last_jobs` → `AddJob`/`ResumeJob` 重新下发的任务重复/错位。
+    /// `ResumeJob` 会按落盘的 `file_num` 重新向被控端发起 `new_send`/`new_receive`
+    /// 握手，从而在新连接上正确续传。
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub async fn prepare_file_jobs_for_reconnect(&mut self) {
+        if !self.handler.is_file_transfer() {
+            return;
+        }
+        // 1. 落盘当前传输进度，供重连后按 file_num 续传
+        let _ = self.sync_jobs_status_to_local().await;
+        // 2. 标记为重连，使 load_last_jobs 恢复的任务 auto_start 自动续传
+        self.handler
+            .reconnect_count
+            .fetch_add(1, Ordering::SeqCst);
+        // 3. 清空内存中的残留任务，避免与重连后重新下发的任务重复/错位
+        self.read_jobs.clear();
+        self.write_jobs.clear();
+        self.remove_jobs.clear();
+        // 4. 重置定时器，避免残留 read 任务的 1ms 定时器空转
+        self.timer = crate::rustdesk_interval(time::interval(SEC30));
+    }
+
     async fn send_toggle_virtual_display_msg(&self, peer: &mut Stream) {
         if !self.peer_info.is_support_virtual_display() {
             return;

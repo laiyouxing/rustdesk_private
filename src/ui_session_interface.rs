@@ -2035,6 +2035,11 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         if remote.sent_close_reason {
             break;
         }
+        // 文件传输会话：重连前落盘当前进度并清空内存任务，
+        // 使新连接建立后通过 load_last_jobs 从磁盘按 file_num 自动续传，
+        // 避免残留任务向全新的被控端连接发送数据块而被丢弃导致传输失败。
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        remote.prepare_file_jobs_for_reconnect().await;
     }
     let _ = remote.sync_jobs_status_to_local().await;
 }
