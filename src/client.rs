@@ -4244,7 +4244,18 @@ async fn test_udp_uat(
                             Ok(msg_in) => {
                                 if let Some(rendezvous_message::Union::TestNatResponse(response)) = msg_in.union {
                                     *udp_port.lock().unwrap() = response.port as u16;
-                                    log::info!("UDP NAT test: got TestNatResponse port={} from hbbs", response.port);
+                                    // Also save the public IP from hbbs (more reliable than STUN for the punch socket)
+                                    if !response.ip.is_empty() {
+                                        if let Ok(ip_str) = String::from_utf8(response.ip) {
+                                            let addr_str = format!("{}:{}", ip_str, response.port);
+                                            log::info!("UDP NAT test: got TestNatResponse ip={}, port={} from hbbs", ip_str, response.port);
+                                            if let Ok(mut public) = crate::common::PUBLIC_ADDR.lock() {
+                                                *public = addr_str;
+                                            }
+                                        }
+                                    } else {
+                                        log::info!("UDP NAT test: got TestNatResponse port={} from hbbs (no IP)", response.port);
+                                    }
                                     break;
                                 }
                             }
