@@ -3128,8 +3128,7 @@ pub async fn relay_upgrade_task(
     // real NAT mapping for THIS socket (not a stale one from minutes ago).
     let hbbs_host = Config::get_rendezvous_server();
     if !hbbs_host.is_empty() {
-        use std::net::ToSocketAddrs;
-        if let Ok(Some(hbbs_addr)) = hbbs_host
+        if let Some(hbbs_addr) = hbbs_host
             .to_socket_addrs()
             .ok()
             .and_then(|mut i| i.find(|a| a.is_ipv4()))
@@ -3139,12 +3138,11 @@ pub async fn relay_upgrade_task(
             if let Ok(data) = msg.write_to_bytes() {
                 socket.send_to(&data, hbbs_addr).await.ok();
                 let mut buf = vec![0u8; 1024];
-                if let Ok((n, _)) = hbb_common::tokio::time::timeout(
+                if let Ok(Ok((n, _))) = hbb_common::tokio::time::timeout(
                     Duration::from_secs(3), socket.recv_from(&mut buf)
                 ).await {
-                    if let Ok(Ok(msg_in)) = n.map(|(n, _)| {
-                        RendezvousMessage::parse_from_bytes(&buf[..n])
-                    }) {
+                    let n = n.0; // bytes read
+                    if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
                         if let Some(rendezvous_message::Union::TestNatResponse(resp)) = msg_in.union {
                             let port = resp.port as u16;
                             // Extract IP from response (new server) or from sender addr
