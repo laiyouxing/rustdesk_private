@@ -1454,7 +1454,8 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
         exe = exe.replace(&_path, &path);
     }
     // 快速安装版：检测到已安装时走升级路径，仅停服杀进程，不卸载重装
-    if std::fs::metadata(&exe).is_ok() {
+    let is_upgrade = std::fs::metadata(&exe).is_ok();
+    if is_upgrade {
         uninstall_str = get_upgrade_prefix();
     }
     let mut version_major = "0";
@@ -1640,6 +1641,13 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
+    // 升级路径：前置脚本停了服务，安装完成后重启
+    if is_upgrade {
+        let app_name = crate::get_app_name();
+        allow_err!(std::process::Command::new("sc")
+            .args(&["start", &app_name])
+            .spawn());
+    }
     run_after_run_cmds(silent);
     Ok(())
 }
