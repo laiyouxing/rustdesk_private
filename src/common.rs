@@ -3708,11 +3708,13 @@ pub async fn relay_phase3_punch_to_peer(
     // - our_delta: prediction for symmetric NAT
     // - ±1, ±2, ±3: small drift
     // - ±5, ±10, ±20: larger drift
+    // Extended to ±50 to match the connector-side scan range (PREDICTED_SCAN_RANGE=50),
+    // improving hit rate on symmetric NAT where per-destination port increment can be large.
     let mut port_offsets: Vec<i16> = vec![0];
     if our_delta != 0 && !port_offsets.contains(&our_delta) {
         port_offsets.push(our_delta);
     }
-    for d in [1i16, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20] {
+    for d in [1i16, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20, 30, -30, 40, -40, 50, -50] {
         if !port_offsets.contains(&d) {
             port_offsets.push(d);
         }

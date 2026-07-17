@@ -216,7 +216,10 @@ impl<T: InvokeUiSession> Remote<T> {
                     Arc::new(hbb_common::tokio::sync::Mutex::new(None));
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Channel for relay_upgrade_task to send our STUN address → io_loop → peer
-                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+                // Buffer 16 — relay_upgrade_task may send multiple candidates (IPv6, TCP,
+                // main STUN addr, symmetric predicted addr, TCP timing).  Capacity 1 caused
+                // try_send to silently drop later candidates, losing TCP/symmetric fallback.
+                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(16);
                 // Shared state for handle_msg_from_peer to push peer Phase 3 addresses
                 // into relay_upgrade_task's target list (same socket, no duplicate)
                 let phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =

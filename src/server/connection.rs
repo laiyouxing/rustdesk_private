@@ -593,7 +593,10 @@ impl Connection {
         let punch_notify = Arc::new(hbb_common::tokio::sync::Notify::new());
         let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>> =
             Arc::new(hbb_common::tokio::sync::Mutex::new(None));
-        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+        // Buffer 16 — host Phase3 may send up to 3 addresses (STUN, TCP, IPv6).
+        // Capacity 1 risked blocking .send() if io_loop is temporarily busy; 16
+        // provides safe headroom and aligns with the connector-side channel.
+        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(16);
         conn.punch_stream = Some(punch_stream.clone());
         conn.punch_notify = Some(punch_notify.clone());
         // Phase3 (Host-side): discover our public address via STUN and send it
