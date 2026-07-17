@@ -78,6 +78,22 @@ impl RendezvousMediator {
         if crate::platform::is_installed() && crate::is_server() {
             crate::updater::start_auto_update();
         }
+        // 预启动 CM 进程，加快首次连接弹窗速度
+        // CM 在后台提前加载 Flutter 引擎，有连接进来时无需等待
+        #[cfg(windows)]
+        if crate::is_server() && !config::is_outgoing_only() {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if !crate::check_process("--cm", false) {
+                    log::info!("Pre-starting CM for faster connection dialog");
+                    if crate::platform::is_root() {
+                        let _ = crate::platform::run_as_user(vec!["--cm"]);
+                    } else {
+                        let _ = crate::run_me(vec!["--cm"]);
+                    }
+                }
+            });
+        }
         check_zombie();
         // Ensure the Windows service (rustdesk.exe --service) is running on startup.
         // Clear stale stop-service flag (left over from update uninstall) so that
