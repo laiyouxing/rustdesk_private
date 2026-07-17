@@ -6,6 +6,9 @@ use serde_json::{Map, Value};
 pub mod account;
 pub mod downloader;
 mod http_client;
+// 仅非安卓平台编译进程/端口监控模块：安卓端不编译该模块，
+// 避免 APK 二进制包含进程枚举/上报等特征代码被误报为病毒。
+#[cfg(not(target_os = "android"))]
 pub mod process_monitor;
 pub mod record_upload;
 pub mod sync;
