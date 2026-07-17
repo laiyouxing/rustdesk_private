@@ -171,8 +171,8 @@ class ServerModel with ChangeNotifier {
           if (_clients.isEmpty) {
             hideCmWindow();
             if (_zeroClientLengthCounter++ == 12) {
-              // 6 second
-              windowManager.close();
+              // 6 second: 隐藏窗口但不退出进程，保持引擎常驻
+              windowManager.hide();
             }
           } else {
             _zeroClientLengthCounter = 0;
