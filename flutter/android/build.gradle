@@ -9,9 +9,17 @@ allprojects {
 rootProject.buildDir = '../build'
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
-}
-subprojects {
     project.evaluationDependsOn(':app')
+    // 统一所有子项目（含第三方 Flutter 插件如 external_path）的 Kotlin 编译目标为 1.8，
+    // 与 app 模块的 compileOptions (Java 1.8) 保持一致，避免
+    // "Inconsistent JVM-target compatibility" 导致 assembleRelease 失败。
+    afterEvaluate { project ->
+        project.tasks.configureEach { task ->
+            if (task.hasProperty('kotlinOptions')) {
+                task.kotlinOptions.jvmTarget = '1.8'
+            }
+        }
+    }
 }
 
 tasks.register("clean", Delete) {
