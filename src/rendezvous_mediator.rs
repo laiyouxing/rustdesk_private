@@ -80,6 +80,7 @@ impl RendezvousMediator {
         }
         // 预启动 CM（完整UI模式），提前加载 Flutter 引擎
         // 引擎常驻内存，连接进来时立即弹窗，无需等待加载
+        // 同时拉起右下角 tray 图标（原在 start_ipc 中触发，现提前启动）
         #[cfg(windows)]
         if crate::is_server() && !config::is_outgoing_only() {
             std::thread::spawn(move || {
@@ -89,6 +90,14 @@ impl RendezvousMediator {
                         let _ = crate::platform::run_as_user(vec!["--cm"]);
                     } else {
                         let _ = crate::run_me(vec!["--cm"]);
+                    }
+                }
+                // 同时拉起 tray 图标
+                if !crate::check_process("--tray", false) {
+                    if crate::platform::is_root() {
+                        let _ = crate::platform::run_as_user(vec!["--tray"]);
+                    } else {
+                        let _ = crate::run_me(vec!["--tray"]);
                     }
                 }
             });
