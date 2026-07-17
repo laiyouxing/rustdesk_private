@@ -78,16 +78,13 @@ impl RendezvousMediator {
         if crate::platform::is_installed() && crate::is_server() {
             crate::updater::start_auto_update();
         }
-        // 预启动 CM 进程，加快首次连接弹窗速度
-        // CM 启动后创建命名管道监听器，不需要桌面就绪。
-        // 即使未登录（锁屏/登录画面），CM 后台引擎先加载好；
-        // 等用户登录后桌面可用时，CM 窗口自然能显示出来。
-        // 如果 CM 因为未登录启动失败（极少见），start_ipc 会重新启动它。
+        // 预启动 CM（完整UI模式），提前加载 Flutter 引擎
+        // 引擎常驻内存，连接进来时立即弹窗，无需等待加载
         #[cfg(windows)]
         if crate::is_server() && !config::is_outgoing_only() {
             std::thread::spawn(move || {
                 if !crate::check_process("--cm", false) {
-                    log::info!("Pre-starting CM (no wait for prelogin)");
+                    log::info!("Pre-starting CM");
                     if crate::platform::is_root() {
                         let _ = crate::platform::run_as_user(vec!["--cm"]);
                     } else {
