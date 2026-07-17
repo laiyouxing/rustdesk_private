@@ -2300,9 +2300,11 @@ impl Connection {
             .map(|s| s.to_owned());
         // last_recv_time is a mutex variable shared with connection, can be updated lively.
         if let Some(session) = session {
-            if !self.lr.password.is_empty()
-                && (tfa && session.tfa
-                    || !tfa && self.validate_password_plain(&session.random_password))
+            // 密码为空（Click 模式）：仅凭 session_key（peer_id+name+session_id）匹配即可放行
+            // 密码非空：还需校验密码匹配，确保密码认证场景安全
+            if self.lr.password.is_empty()
+                || tfa && session.tfa
+                || !tfa && self.validate_password_plain(&session.random_password)
             {
                 log::info!("is recent session");
                 return true;
@@ -5228,15 +5230,24 @@ async fn start_ipc(
                 .unwrap()
                 .push(crate::run_me(args)?);
         }
-        for _ in 0..20 {
-            sleep(0.3).await;
-            if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
+        loop {
+            sleep(1.).await;
+            if let Ok(s) = crate::ipc::connect(2000, "_cm").await {
                 stream = Some(s);
                 break;
             }
-        }
-        if stream.is_none() {
-            bail!("Failed to connect to connection manager");
+            // CM 可能因系统延迟/杀软/防病毒未就绪，持续重试，不 bail。
+            // 否则 start_cm_ipc_para 被消费后连接再无 CM 服务，弹窗永远出不来。
+            if stream.is_none() {
+                log::info!("Waiting for cm ...");
+            }
+            // CM 进程已退出（崩溃/被杀/窗口关闭），重新启动
+            if !crate::check_process("--cm", false) {
+                log::info!("CM process not found, restarting...");
+                if let Ok(task) = crate::run_me(vec!["--cm"]) {
+                    super::CHILD_PROCESS.lock().unwrap().push(task);
+                }
+            }
         }
     }
 
@@ -5793,31 +5804,10 @@ mod raii {
         }
 
         pub fn check_remove_session(conn_id: i32, key: SessionKey) {
-            let mut lock = SESSIONS.lock().unwrap();
-            let contains = lock.contains_key(&key);
-            if contains {
-                // No two remote connections with the same session key, just for ensure.
-                let is_remote = AUTHED_CONNS
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|c| c.conn_id == conn_id && c.conn_type == AuthConnType::Remote);
-                // If there are 2 connections with the same peer_id and session_id, a remote connection and a file transfer or port forward connection,
-                // If any of the connections is closed allowing retry, this will not be called;
-                // If the file transfer/port forward connection is closed with no retry, the session should be kept for remote control menu action;
-                // If the remote connection is closed with no retry, keep the session is not reasonable in case there is a retry button in the remote side, and ignore network fluctuations.
-                let another_remote = AUTHED_CONNS.lock().unwrap().iter().any(|c| {
-                    c.conn_id != conn_id
-                        && c.session_key == key
-                        && c.conn_type == AuthConnType::Remote
-                });
-                if is_remote || !another_remote {
-                    lock.remove(&key);
-                    log::info!("remove session");
-                } else {
-                    // Keep the session if there is another remote connection with same peer_id and session_id.
-                    log::info!("skip remove session");
-                }
+            // 不主动删除 session：让 SESSION_TIMEOUT(30s) 在 is_recent_session 的 retain 中统一清理。
+            // 这样授权成功后断开连接的 30s 内重连，可用最近会话免认证直接连接。
+            if SESSIONS.lock().unwrap().contains_key(&key) {
+                log::info!("check_remove_session: keep session for 30s timeout");
             }
         }
 
