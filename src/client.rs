@@ -422,6 +422,7 @@ impl Client {
         let mut candidates_from_b: Vec<String> = Vec::new();
         let mut rtts_from_b: Vec<i32> = Vec::new();
         let mut relay_test: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async { None });
+        let mut lan_addrs: Vec<SocketAddr> = Vec::new();
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -540,48 +541,23 @@ impl Client {
                                 pick_best_relay_combined(&relay_candidates, &relay_rtts).await
                             });
 
-                            // If same_intranet, try host's LAN addresses first
-                            if is_local {
-                                let lan_addrs: Vec<SocketAddr> = ph.socket_addrs
+                            // Save LAN addresses for post-relay test (after relay is established,
+                            // before Phase3 NAT traversal). This allows VPN interfaces to fully
+                            // initialize before we attempt LAN connections.
+                            lan_addrs = if is_local {
+                                let addrs: Vec<SocketAddr> = ph.socket_addrs
                                     .iter()
                                     .filter_map(|b| {
                                         let addr = AddrMangle::decode(b);
                                         if addr.port() > 0 { Some(addr) } else { None }
                                     })
                                     .collect();
-                                log::info!("Host LAN addresses received ({}/{} valid): {:?}",
-                                    lan_addrs.len(), ph.socket_addrs.len(), lan_addrs);
-                                for &lan_addr in &lan_addrs {
-                                    if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
-                                        lan_addr, 3000
-                                    ).await {
-                                        log::info!("LAN direct connection to {} succeeded!", lan_addr);
-                                        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut lan_stream).await?;
-                                        return Ok((
-                                            (lan_stream, true, pk, None, "LAN"),
-                                            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
-                                            false,
-                                        ));
-                                    }
-                                }
-                                log::info!("All LAN addresses failed, trying direct port {}",
-                                    RENDEZVOUS_PORT + 2);
-                                // Use the original peer address's IP with the direct access port
-                                let direct_port = (RENDEZVOUS_PORT + 2) as u16;
-                                let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
-                                if let Ok(mut direct_stream) = hbb_common::socket_client::connect_tcp(
-                                    direct_addr, 3000
-                                ).await {
-                                    log::info!("Direct port connection to {} succeeded!", direct_addr);
-                                    let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut direct_stream).await?;
-                                    return Ok((
-                                        (direct_stream, true, pk, None, "LAN"),
-                                        (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
-                                        false,
-                                    ));
-                                }
-                                log::info!("Direct port failed, falling back to relay");
-                            }
+                                log::info!("Host LAN addresses received ({}/{} valid, postponed to after relay): {:?}",
+                                    addrs.len(), ph.socket_addrs.len(), addrs);
+                                addrs
+                            } else {
+                                Vec::new()
+                            };
                         }
                     }
                     _ => {}
@@ -593,7 +569,7 @@ impl Client {
             log::info!("A selected relay '{}' with best combined RTT (A+B)", best);
             relay_server = best;
         }
-        // Phase3/ReSTUN will attempt to upgrade to direct connection later.// Phase3/ReSTUN will attempt to upgrade to direct connection later.
+        // Phase3/ReSTUN will attempt to upgrade to direct connection later.
         let secure = !key.is_empty() && !token.is_empty();
         let relay_conn = Self::request_relay(
             &peer,
@@ -607,10 +583,69 @@ impl Client {
         .await?;
         let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
         let mut relay_conn = relay_conn;
-        let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut relay_conn).await?;
+        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut relay_conn).await?;
+
+        // Spawn background LAN test — relay is already established and will return
+        // immediately. The LAN test runs asynchronously and, if successful, pushes the
+        // new direct stream into the upgrade_notify/upgrade_stream channel for seamless
+        // in-session replacement (same mechanism as Phase3). This cuts worst-case
+        // connection time from ~12s (all LAN timeouts) to ~0.5s (relay only).
+        if !lan_addrs.is_empty() {
+            let (upgrade_stream, upgrade_notify) = interface.get_upgrade_channels();
+            if let (Some(upgrade_s), Some(upgrade_n)) = (upgrade_stream, upgrade_notify) {
+                let lan_addrs = lan_addrs; // move into closure
+                let lan_pk = signed_id_pk; // move into closure
+                let lan_key = key.clone();
+                let lan_peer = peer.clone();
+                let direct_peer_addr = peer_addr;
+                tokio::spawn(async move {
+                    log::info!("Post-relay LAN test (async): trying {} address(es)", lan_addrs.len());
+                    for &lan_addr in &lan_addrs {
+                        if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
+                            lan_addr, 3000
+                        ).await {
+                            let lpk = Client::secure_connection(
+                                &lan_peer, lan_pk.clone(), &lan_key, &mut lan_stream
+                            ).await;
+                            if lpk.is_ok() {
+                                log::info!("Post-relay LAN direct connection to {} succeeded! Replacing relay.", lan_addr);
+                                let mut guard = upgrade_s.lock().await;
+                                *guard = Some(lan_stream);
+                                drop(guard);
+                                upgrade_n.notify_one();
+                                return;
+                            }
+                        }
+                    }
+                    // Direct port backup
+                    log::info!("Post-relay LAN test (async): all LAN failed, trying direct port {}",
+                        RENDEZVOUS_PORT + 2);
+                    let direct_port = (RENDEZVOUS_PORT + 2) as u16;
+                    let direct_addr = std::net::SocketAddr::new(direct_peer_addr.ip(), direct_port);
+                    if let Ok(mut direct_stream) = hbb_common::socket_client::connect_tcp(
+                        direct_addr, 3000
+                    ).await {
+                        let lpk = Client::secure_connection(
+                            &lan_peer, lan_pk.clone(), &lan_key, &mut direct_stream
+                        ).await;
+                        if lpk.is_ok() {
+                            log::info!("Post-relay direct port connection to {} succeeded! Replacing relay.", direct_addr);
+                            let mut guard = upgrade_s.lock().await;
+                            *guard = Some(direct_stream);
+                            drop(guard);
+                            upgrade_n.notify_one();
+                            return;
+                        }
+                    }
+                    log::info!("Post-relay LAN test (async): all attempts failed, Phase3 will handle upgrade");
+                });
+            } else {
+                log::info!("Post-relay LAN test: upgrade channels unavailable, staying on relay");
+            }
+        }
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
             false,
         ));
     }
@@ -3748,6 +3783,25 @@ pub trait Interface: Send + Clone + 'static + Sized {
 
     fn update_received(&self, received: bool) {
         self.get_lch().write().unwrap().received = received;
+    }
+
+    /// Set upgrade notification channels for post-relay LAN/Phase3 direct upgrade.
+    /// Called by io_loop before connection start to provide a communication path
+    /// for background LAN test tasks to notify the main loop of a new direct stream.
+    fn set_upgrade_channels(
+        &self,
+        _stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+        _notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
+    ) {
+    }
+    /// Retrieve upgrade notification channels, if previously set via set_upgrade_channels.
+    fn get_upgrade_channels(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
+        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
+    ) {
+        (None, None)
     }
 
     fn on_establish_connection_error(&self, err: String) {

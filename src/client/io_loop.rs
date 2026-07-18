@@ -191,6 +191,16 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        // Initialize upgrade channels BEFORE connection start so that background
+        // LAN test (spawned inside _start_inner) can push direct streams here for
+        // seamless in-session replacement (same mechanism as Phase3 upgrade).
+        let punch_notify = Arc::new(Notify::new());
+        let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
+            Arc::new(hbb_common::tokio::sync::Mutex::new(None));
+        self.punch_notify = Some(punch_notify.clone());
+        self.punch_stream = Some(punch_stream.clone());
+        self.handler.set_upgrade_channels(punch_stream.clone(), punch_notify.clone());
+
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -209,11 +219,8 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
-                // Relay upgrade to direct — merged Phase 3 into relay_upgrade_task
-                let punch_notify = Arc::new(Notify::new());
+                // Phase3-specific channels (punch_stream/punch_notify already initialized before Client::start)
                 let punch_done = Arc::new(Notify::new());
-                let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
-                    Arc::new(hbb_common::tokio::sync::Mutex::new(None));
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Channel for relay_upgrade_task to send our STUN address → io_loop → peer
                 // Buffer 16 — relay_upgrade_task may send multiple candidates (IPv6, TCP,
@@ -229,9 +236,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 // address from the same peer IP is the TCP listener address.
                 let phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
-                // Store for handle_msg_from_peer to access
-                self.punch_stream = Some(punch_stream.clone());
-                self.punch_notify = Some(punch_notify.clone());
+                // Store Phase3-specific channels (punch_stream/punch_notify already stored on self before Client::start)
                 self.punch_peer_addrs = Some(phase3_peer_rx.clone());
                 self.punch_tcp_addrs = Some(phase3_tcp_rx.clone());
                 if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
