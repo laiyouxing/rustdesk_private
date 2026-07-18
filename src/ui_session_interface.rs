@@ -71,6 +71,7 @@ pub struct Session<T: InvokeUiSession> {
     // Indicate whether the session is reconnected.
     // Used to auto start file transfer after reconnection.
     pub reconnect_count: Arc<AtomicUsize>,
+    pub displays_empty_retries: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
     // Upgrade notification channels, set by io_loop for background LAN/Phase3 upgrade.
@@ -1815,16 +1816,29 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             }
         } else if !self.is_port_forward() && !self.is_terminal() {
             if pi.displays.is_empty() {
+                // RDP 连接/断开会切换控制台会话或显示器暂时不可用。
+                // 不立即报错退出，而是发送刷新请求让 B 端重发 PeerInfo。
+                // B 端后续会重新检测显示器并发送新的 handle_peer_info。
+                // 如果连续多次为空才报错。
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                let msg = if self.is_view_camera() {
-                    "No cameras"
-                } else {
-                    "No displays"
-                };
-                self.msgbox("error", "Error", msg, "");
+                let retries = self.displays_empty_retries.fetch_add(1, Ordering::SeqCst);
+                if retries >= 10 {
+                    log::warn!("Peer displays still empty after {} retries, showing error", retries);
+                    let msg = if self.is_view_camera() {
+                        "No cameras"
+                    } else {
+                        "No displays"
+                    };
+                    self.msgbox("error", "Error", msg, "");
+                    return;
+                }
+                log::info!("Peer displays empty (retry {}/10), requesting refresh", retries + 1);
+                self.send_message_query(0);
                 return;
             }
+            // Reset retry counter on successful display capture
+            self.displays_empty_retries.store(0, Ordering::SeqCst);
             self.try_change_init_resolution(pi.current_display);
             let p = self.lc.read().unwrap().should_auto_login();
             if !p.is_empty() {
