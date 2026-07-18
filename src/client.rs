@@ -569,83 +569,82 @@ impl Client {
             log::info!("A selected relay '{}' with best combined RTT (A+B)", best);
             relay_server = best;
         }
-        // Phase3/ReSTUN will attempt to upgrade to direct connection later.
+
+        // Relay + LAN 并行竞速：所有候选连接同时测试，谁先成功用谁。
+        // 5 个 LAN 地址 + 1 直连端口 + relay 建连全部并行，速度优先。
         let secure = !key.is_empty() && !token.is_empty();
-        let relay_conn = Self::request_relay(
-            &peer,
-            relay_server.clone(),
-            &rendezvous_server,
-            secure,
-            &key,
-            &token,
-            conn_type,
-        )
-        .await?;
-        let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
-        let mut relay_conn = relay_conn;
-        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut relay_conn).await?;
+        let mut candidates: Vec<hbb_common::futures::future::BoxFuture<
+            '_, Result<(Stream, Option<Vec<u8>>, bool, &'static str), ()>,
+        >> = Vec::new();
 
-        // Parallel LAN test: all LAN addresses + direct port tried simultaneously.
-        // First success wins. This avoids runtime stream-switching (which breaks TLS
-        // key continuity on the peer side) while keeping worst-case latency to ~4s
-        // instead of ~12s (serial 3× LAN + direct port).
-        // LAN test runs after relay so VPN/Tailscale interfaces have time to initialize.
+        // Relay 建连（后台 pick_best 已先完成选出最优 relay_server）
+        {
+            let p = peer.clone();
+            let rs = relay_server.clone();
+            let rv = rendezvous_server.clone();
+            let k = key.clone();
+            let sk = signed_id_pk.clone();
+            let ct = conn_type;
+            candidates.push(async move {
+                let mut conn = Client::request_relay(&p, rs, &rv, secure, &k, &token, ct)
+                    .await
+                    .map_err(|_| ())?;
+                let pk = Client::secure_connection(&p, sk, &k, &mut conn)
+                    .await
+                    .map_err(|_| ())?;
+                let typ = if use_ws() { "WebSocket" } else { "Relay" };
+                Ok((conn, pk, false, typ))
+            }.boxed());
+        }
+
+        // LAN 地址直连
+        for &addr in &lan_addrs {
+            let p = peer.clone();
+            let k = key.clone();
+            let sk = signed_id_pk.clone();
+            candidates.push(async move {
+                let mut stream = hbb_common::socket_client::connect_tcp(addr, 3000)
+                    .await
+                    .map_err(|_| ())?;
+                let pk = Client::secure_connection(&p, sk, &k, &mut stream)
+                    .await
+                    .map_err(|_| ())?;
+                Ok((stream, pk, true, "LAN"))
+            }.boxed());
+        }
+
+        // Direct access port backup (only when is_local)
         if !lan_addrs.is_empty() {
-            let deadline = Instant::now() + Duration::from_secs(4);
-            let mut attempts: Vec<hbb_common::futures::future::BoxFuture<'_, Result<(Stream, Option<Vec<u8>>), ()>>> = Vec::new();
-
-            for &addr in &lan_addrs {
-                let p = peer.clone();
-                let k = key.clone();
-                let sk = signed_id_pk.clone();
-                attempts.push(async move {
-                    let mut stream = hbb_common::socket_client::connect_tcp(addr, 3000)
-                        .await.map_err(|_| ())?;
-                    let pk = Client::secure_connection(&p, sk, &k, &mut stream)
-                        .await.map_err(|_| ())?;
-                    Ok((stream, pk))
-                }.boxed());
-            }
-            // Direct access port as backup
             let direct_port = (RENDEZVOUS_PORT + 2) as u16;
             let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
-            {
-                let p = peer.clone();
-                let k = key.clone();
-                let sk = signed_id_pk.clone();
-                attempts.push(async move {
-                    let mut stream = hbb_common::socket_client::connect_tcp(direct_addr, 3000)
-                        .await.map_err(|_| ())?;
-                    let pk = Client::secure_connection(&p, sk, &k, &mut stream)
-                        .await.map_err(|_| ())?;
-                    Ok((stream, pk))
-                }.boxed());
-            }
+            let p = peer.clone();
+            let k = key.clone();
+            let sk = signed_id_pk.clone();
+            candidates.push(async move {
+                let mut stream = hbb_common::socket_client::connect_tcp(direct_addr, 3000)
+                    .await
+                    .map_err(|_| ())?;
+                let pk = Client::secure_connection(&p, sk, &k, &mut stream)
+                    .await
+                    .map_err(|_| ())?;
+                Ok((stream, pk, true, "LAN"))
+            }.boxed());
+        }
 
-            match hbb_common::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                select_ok(attempts),
-            )
-            .await
-            {
-                Ok(Ok(((mut stream, lan_pk), _))) => {
-                    log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
-                    return Ok((
-                        (stream, true, lan_pk, None, "LAN"),
-                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
-                        false,
-                    ));
-                }
-                _ => {
-                    log::info!("Parallel LAN test: all attempts failed, staying on relay");
-                }
+        // 全部并行竞速，取最快成功者
+        match select_ok(candidates).await {
+            Ok(((mut stream, conn_pk, direct, typ), _)) => {
+                log::info!("Connection race won by: {} (direct={})", typ, direct);
+                return Ok((
+                    (stream, direct, conn_pk, None, typ),
+                    (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+                    false,
+                ));
+            }
+            Err(_) => {
+                bail!("All connection attempts failed (relay + LAN)");
             }
         }
-        return Ok((
-            (relay_conn, false, pk, None, relay_type),
-            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
-            false,
-        ));
     }
 
     /// Connect to the peer.
