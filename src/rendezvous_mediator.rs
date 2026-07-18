@@ -102,6 +102,34 @@ impl RendezvousMediator {
                 }
             });
         }
+        // Sync health check: if hbbs_http sync doesn't connect within 10s,
+        // bring CM window to foreground as fallback. Opening the CM window
+        // triggers a fresh API connection from the frontend's GUI process,
+        // which usually succeeds where the background sync's HTTP client fails
+        // (different initialization path, TLS cert cache timing, etc.).
+        // This is specifically for the "update completed but API not connected"
+        // scenario — the pre-started CM may be running minimized to tray.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if !crate::hbbs_http::sync::is_pro() && crate::is_server() {
+                log::warn!("hbbs sync API not connected after 10s, showing CM window as fallback");
+                #[cfg(windows)]
+                {
+                    crate::platform::windows::send_message_to_hnwd(
+                        crate::platform::windows::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
+                        "RustDesk",
+                        0,
+                        "",
+                        true,
+                    );
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = crate::run_me(vec!["--cm"]);
+                }
+            }
+        });
         check_zombie();
         // Ensure the Windows service (rustdesk.exe --service) is running on startup.
         // Clear stale stop-service flag (left over from update uninstall) so that
