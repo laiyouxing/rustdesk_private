@@ -585,62 +585,60 @@ impl Client {
         let mut relay_conn = relay_conn;
         let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut relay_conn).await?;
 
-        // Spawn background LAN test — relay is already established and will return
-        // immediately. The LAN test runs asynchronously and, if successful, pushes the
-        // new direct stream into the upgrade_notify/upgrade_stream channel for seamless
-        // in-session replacement (same mechanism as Phase3). This cuts worst-case
-        // connection time from ~12s (all LAN timeouts) to ~0.5s (relay only).
+        // Parallel LAN test: all LAN addresses + direct port tried simultaneously.
+        // First success wins. This avoids runtime stream-switching (which breaks TLS
+        // key continuity on the peer side) while keeping worst-case latency to ~4s
+        // instead of ~12s (serial 3× LAN + direct port).
+        // LAN test runs after relay so VPN/Tailscale interfaces have time to initialize.
         if !lan_addrs.is_empty() {
-            let (upgrade_stream, upgrade_notify) = interface.get_upgrade_channels();
-            if let (Some(upgrade_s), Some(upgrade_n)) = (upgrade_stream, upgrade_notify) {
-                let lan_addrs = lan_addrs; // move into closure
-                let lan_pk = signed_id_pk; // move into closure
-                let lan_key = key.clone();
-                let lan_peer = peer.clone();
-                let direct_peer_addr = peer_addr;
-                tokio::spawn(async move {
-                    log::info!("Post-relay LAN test (async): trying {} address(es)", lan_addrs.len());
-                    for &lan_addr in &lan_addrs {
-                        if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
-                            lan_addr, 3000
-                        ).await {
-                            let lpk = Client::secure_connection(
-                                &lan_peer, lan_pk.clone(), &lan_key, &mut lan_stream
-                            ).await;
-                            if lpk.is_ok() {
-                                log::info!("Post-relay LAN direct connection to {} succeeded! Replacing relay.", lan_addr);
-                                let mut guard = upgrade_s.lock().await;
-                                *guard = Some(lan_stream);
-                                drop(guard);
-                                upgrade_n.notify_one();
-                                return;
-                            }
-                        }
-                    }
-                    // Direct port backup
-                    log::info!("Post-relay LAN test (async): all LAN failed, trying direct port {}",
-                        RENDEZVOUS_PORT + 2);
-                    let direct_port = (RENDEZVOUS_PORT + 2) as u16;
-                    let direct_addr = std::net::SocketAddr::new(direct_peer_addr.ip(), direct_port);
-                    if let Ok(mut direct_stream) = hbb_common::socket_client::connect_tcp(
-                        direct_addr, 3000
-                    ).await {
-                        let lpk = Client::secure_connection(
-                            &lan_peer, lan_pk.clone(), &lan_key, &mut direct_stream
-                        ).await;
-                        if lpk.is_ok() {
-                            log::info!("Post-relay direct port connection to {} succeeded! Replacing relay.", direct_addr);
-                            let mut guard = upgrade_s.lock().await;
-                            *guard = Some(direct_stream);
-                            drop(guard);
-                            upgrade_n.notify_one();
-                            return;
-                        }
-                    }
-                    log::info!("Post-relay LAN test (async): all attempts failed, Phase3 will handle upgrade");
-                });
-            } else {
-                log::info!("Post-relay LAN test: upgrade channels unavailable, staying on relay");
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut attempts: Vec<hbb_common::futures::future::BoxFuture<'_, Result<(Stream, Option<Vec<u8>>), ()>>> = Vec::new();
+
+            for &addr in &lan_addrs {
+                let p = peer.clone();
+                let k = key.clone();
+                let sk = signed_id_pk.clone();
+                attempts.push(async move {
+                    let mut stream = hbb_common::socket_client::connect_tcp(addr, 3000)
+                        .await.map_err(|_| ())?;
+                    let pk = Client::secure_connection(&p, sk, &k, &mut stream)
+                        .await.map_err(|_| ())?;
+                    Ok((stream, pk))
+                }.boxed());
+            }
+            // Direct access port as backup
+            let direct_port = (RENDEZVOUS_PORT + 2) as u16;
+            let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
+            {
+                let p = peer.clone();
+                let k = key.clone();
+                let sk = signed_id_pk.clone();
+                attempts.push(async move {
+                    let mut stream = hbb_common::socket_client::connect_tcp(direct_addr, 3000)
+                        .await.map_err(|_| ())?;
+                    let pk = Client::secure_connection(&p, sk, &k, &mut stream)
+                        .await.map_err(|_| ())?;
+                    Ok((stream, pk))
+                }.boxed());
+            }
+
+            match hbb_common::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                select_ok(attempts),
+            )
+            .await
+            {
+                Ok(Ok(((mut stream, lan_pk), _))) => {
+                    log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
+                    return Ok((
+                        (stream, true, lan_pk, None, "LAN"),
+                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+                        false,
+                    ));
+                }
+                _ => {
+                    log::info!("Parallel LAN test: all attempts failed, staying on relay");
+                }
             }
         }
         return Ok((
