@@ -103,30 +103,53 @@ impl RendezvousMediator {
             });
         }
         // Sync health check: if hbbs_http sync doesn't connect within 10s,
-        // bring CM window to foreground as fallback. Opening the CM window
-        // triggers a fresh API connection from the frontend's GUI process,
-        // which usually succeeds where the background sync's HTTP client fails
-        // (different initialization path, TLS cert cache timing, etc.).
-        // This is specifically for the "update completed but API not connected"
-        // scenario — the pre-started CM may be running minimized to tray.
+        // API connection guard — continuously monitors sync API health and
+        // attempts recovery when the background sync's HTTP client cannot
+        // connect to the API server (e.g. update completed but API not reachable
+        // due to different TLS/HTTP initialization path from the GUI process).
+        //
+        // The guard runs every 5s, and triggers CM window popup every 30s as
+        // a recovery fallback. This is necessary because the Flutter GUI process
+        // has a different HTTP client initialization path that often succeeds
+        // where the background sync's `reqwest`/`ureq` client chain fails.
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         tokio::spawn(async move {
+            let check_interval = Duration::from_secs(5);
+            let cm_fallback_interval = Duration::from_secs(30);
+            // Warmup: give the sync thread time to connect normally
             tokio::time::sleep(Duration::from_secs(10)).await;
-            if !crate::hbbs_http::sync::is_pro() && crate::is_server() {
-                log::warn!("hbbs sync API not connected after 10s, showing CM window as fallback");
-                #[cfg(windows)]
-                {
-                    crate::platform::windows::send_message_to_hnwd(
-                        crate::platform::windows::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
-                        "RustDesk",
-                        0,
-                        "",
-                        true,
-                    );
+            let mut last_cm = Instant::now() - cm_fallback_interval;
+            loop {
+                tokio::time::sleep(check_interval).await;
+                if crate::hbbs_http::sync::is_pro() {
+                    // API is connected and healthy, reset fallback timer
+                    last_cm = Instant::now();
+                    continue;
                 }
-                #[cfg(not(windows))]
-                {
-                    let _ = crate::run_me(vec!["--cm"]);
+                if !crate::is_server() {
+                    continue;
+                }
+                log::debug!("API guard: sync API still not connected");
+                if last_cm.elapsed() >= cm_fallback_interval {
+                    log::warn!(
+                        "API guard: sync API not connected for >{}s, popping CM window as fallback",
+                        cm_fallback_interval.as_secs()
+                    );
+                    last_cm = Instant::now();
+                    #[cfg(windows)]
+                    {
+                        crate::platform::windows::send_message_to_hnwd(
+                            crate::platform::windows::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
+                            "RustDesk",
+                            0,
+                            "",
+                            true,
+                        );
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = crate::run_me(vec!["--cm"]);
+                    }
                 }
             }
         });

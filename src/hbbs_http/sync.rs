@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 const TIME_HEARTBEAT: Duration = Duration::from_secs(15);
 const UPLOAD_SYSINFO_TIMEOUT: Duration = Duration::from_secs(120);
+const UPLOAD_RETRY_ON_FAILURE: Duration = Duration::from_secs(15);
 const TIME_CONN: Duration = Duration::from_secs(3);
 
 #[cfg(not(any(target_os = "ios")))]
@@ -57,6 +58,7 @@ struct InfoUploaded {
     id: String,
     username: Option<String>,
     last_hostname: String,
+    last_failed: Option<Instant>,
 }
 
 impl Default for InfoUploaded {
@@ -68,6 +70,7 @@ impl Default for InfoUploaded {
             id: "".to_owned(),
             username: None,
             last_hostname: "".to_owned(),
+            last_failed: None,
         }
     }
 }
@@ -81,6 +84,7 @@ impl InfoUploaded {
             id,
             username: Some(username),
             last_hostname: hostname,
+            last_failed: None,
         }
     }
 }
@@ -132,8 +136,14 @@ async fn start_hbbs_sync_async() {
                 let hostname_changed = !device_name.is_empty() && device_name != info_uploaded.last_hostname;
                 // Though the username comparison is only necessary on Windows,
                 // we still keep the comparison on other platforms for consistency.
-                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username) || hostname_changed) &&
-                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
+                let upload_ready = if info_uploaded.uploaded {
+                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true)
+                } else {
+                    let normal_ready = info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
+                    let failed_ready = info_uploaded.last_failed.map(|x| x.elapsed() >= UPLOAD_RETRY_ON_FAILURE).unwrap_or(true);
+                    normal_ready || failed_ready
+                };
+                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username) || hostname_changed) && upload_ready;
                 if need_upload {
                     v["version"] = json!(crate::VERSION);
                     v["id"] = json!(id);
@@ -222,14 +232,15 @@ async fn start_hbbs_sync_async() {
                                     config::Status::set("sysinfo_ver", sysinfo_ver.clone());
                                 }
                                 *PRO.lock().unwrap() = true;
+                                info_uploaded.last_failed = None;
                             } else if x == "ID_NOT_FOUND" {
                                 info_uploaded.last_uploaded = None; // next heartbeat will upload sysinfo again
                             } else {
-                                info_uploaded.last_uploaded = Some(Instant::now());
+                                info_uploaded.last_failed = Some(Instant::now());
                             }
                         }
                         _ => {
-                            info_uploaded.last_uploaded = Some(Instant::now());
+                            info_uploaded.last_failed = Some(Instant::now());
                         }
                     }
                 }
