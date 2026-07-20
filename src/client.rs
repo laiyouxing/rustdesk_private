@@ -422,6 +422,7 @@ impl Client {
         let mut candidates_from_b: Vec<String> = Vec::new();
         let mut rtts_from_b: Vec<i32> = Vec::new();
         let mut relay_test: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async { None });
+        let mut lan_addrs: Vec<SocketAddr> = Vec::new();
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -540,48 +541,23 @@ impl Client {
                                 pick_best_relay_combined(&relay_candidates, &relay_rtts).await
                             });
 
-                            // If same_intranet, try host's LAN addresses first
-                            if is_local {
-                                let lan_addrs: Vec<SocketAddr> = ph.socket_addrs
+                            // Save LAN addresses for post-relay test (after relay is established,
+                            // before Phase3 NAT traversal). This allows VPN interfaces to fully
+                            // initialize before we attempt LAN connections.
+                            lan_addrs = if is_local {
+                                let addrs: Vec<SocketAddr> = ph.socket_addrs
                                     .iter()
                                     .filter_map(|b| {
                                         let addr = AddrMangle::decode(b);
                                         if addr.port() > 0 { Some(addr) } else { None }
                                     })
                                     .collect();
-                                log::info!("Host LAN addresses received ({}/{} valid): {:?}",
-                                    lan_addrs.len(), ph.socket_addrs.len(), lan_addrs);
-                                for &lan_addr in &lan_addrs {
-                                    if let Ok(mut lan_stream) = hbb_common::socket_client::connect_tcp(
-                                        lan_addr, 3000
-                                    ).await {
-                                        log::info!("LAN direct connection to {} succeeded!", lan_addr);
-                                        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut lan_stream).await?;
-                                        return Ok((
-                                            (lan_stream, true, pk, None, "LAN"),
-                                            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
-                                            false,
-                                        ));
-                                    }
-                                }
-                                log::info!("All LAN addresses failed, trying direct port {}",
-                                    RENDEZVOUS_PORT + 2);
-                                // Use the original peer address's IP with the direct access port
-                                let direct_port = (RENDEZVOUS_PORT + 2) as u16;
-                                let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
-                                if let Ok(mut direct_stream) = hbb_common::socket_client::connect_tcp(
-                                    direct_addr, 3000
-                                ).await {
-                                    log::info!("Direct port connection to {} succeeded!", direct_addr);
-                                    let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut direct_stream).await?;
-                                    return Ok((
-                                        (direct_stream, true, pk, None, "LAN"),
-                                        (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
-                                        false,
-                                    ));
-                                }
-                                log::info!("Direct port failed, falling back to relay");
-                            }
+                                log::info!("Host LAN addresses received ({}/{} valid, postponed to after relay): {:?}",
+                                    addrs.len(), ph.socket_addrs.len(), addrs);
+                                addrs
+                            } else {
+                                Vec::new()
+                            };
                         }
                     }
                     _ => {}
@@ -593,9 +569,13 @@ impl Client {
             log::info!("A selected relay '{}' with best combined RTT (A+B)", best);
             relay_server = best;
         }
-        // Phase3/ReSTUN will attempt to upgrade to direct connection later.// Phase3/ReSTUN will attempt to upgrade to direct connection later.
+
+        // Relay 先稳定建立（request_relay + secure_connection），保证 B 端无异常。
+        // 如果 relay 建连过程中被 cancel，会触发 relay server 通知 B 端断连，
+        // 导致后续 LAN 直连成功的 Session 也被 B 端关闭（登录中断）。
         let secure = !key.is_empty() && !token.is_empty();
-        let relay_conn = Self::request_relay(
+        let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
+        let mut relay_conn = Self::request_relay(
             &peer,
             relay_server.clone(),
             &rendezvous_server,
@@ -605,12 +585,64 @@ impl Client {
             conn_type,
         )
         .await?;
-        let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
-        let mut relay_conn = relay_conn;
-        let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut relay_conn).await?;
+        let pk = Self::secure_connection(&peer, signed_id_pk.clone(), &key, &mut relay_conn).await?;
+
+        // Parallel LAN test after relay is stable: all LAN addresses simultaneous.
+        // select_ok 取第一个成功的，其他自动取消（此时 relay 已稳定，cancel 无害）。
+        if !lan_addrs.is_empty() {
+            let mut candidates: Vec<hbb_common::futures::future::BoxFuture<
+                '_, Result<(Stream, Option<Vec<u8>>), ()>,
+            >> = Vec::new();
+
+            for &addr in &lan_addrs {
+                let p = peer.clone();
+                let k = key.clone();
+                let sk = signed_id_pk.clone();
+                candidates.push(async move {
+                    let mut stream = hbb_common::socket_client::connect_tcp(addr, 3000)
+                        .await
+                        .map_err(|_| ())?;
+                    let pk = Client::secure_connection(&p, sk, &k, &mut stream)
+                        .await
+                        .map_err(|_| ())?;
+                    Ok((stream, pk))
+                }.boxed());
+            }
+            // Direct access port backup (only when is_local)
+            let direct_port = (RENDEZVOUS_PORT + 2) as u16;
+            let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
+            {
+                let p = peer.clone();
+                let k = key.clone();
+                let sk = signed_id_pk.clone();
+                candidates.push(async move {
+                    let mut stream = hbb_common::socket_client::connect_tcp(direct_addr, 3000)
+                        .await
+                        .map_err(|_| ())?;
+                    let pk = Client::secure_connection(&p, sk, &k, &mut stream)
+                        .await
+                        .map_err(|_| ())?;
+                    Ok((stream, pk))
+                }.boxed());
+            }
+
+            match select_ok(candidates).await {
+                Ok(((mut stream, lan_pk), _)) => {
+                    log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
+                    return Ok((
+                        (stream, true, lan_pk, None, "LAN"),
+                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+                        false,
+                    ));
+                }
+                _ => {
+                    log::info!("Parallel LAN test: all attempts failed, staying on relay");
+                }
+            }
+        }
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (my_nat_type, rendezvous_server, relay_server.clone(), peer_addr, Vec::new(), udp_nat_port),
+            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
             false,
         ));
     }
@@ -3748,6 +3780,25 @@ pub trait Interface: Send + Clone + 'static + Sized {
 
     fn update_received(&self, received: bool) {
         self.get_lch().write().unwrap().received = received;
+    }
+
+    /// Set upgrade notification channels for post-relay LAN/Phase3 direct upgrade.
+    /// Called by io_loop before connection start to provide a communication path
+    /// for background LAN test tasks to notify the main loop of a new direct stream.
+    fn set_upgrade_channels(
+        &self,
+        _stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+        _notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
+    ) {
+    }
+    /// Retrieve upgrade notification channels, if previously set via set_upgrade_channels.
+    fn get_upgrade_channels(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
+        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
+    ) {
+        (None, None)
     }
 
     fn on_establish_connection_error(&self, err: String) {

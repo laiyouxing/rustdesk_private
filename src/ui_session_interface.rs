@@ -71,8 +71,13 @@ pub struct Session<T: InvokeUiSession> {
     // Indicate whether the session is reconnected.
     // Used to auto start file transfer after reconnection.
     pub reconnect_count: Arc<AtomicUsize>,
+    pub displays_empty_retries: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
+    // Upgrade notification channels, set by io_loop for background LAN/Phase3 upgrade.
+    // Shared via Arc/RwLock so the clone passed into Client::start sees the same channels.
+    pub upgrade_stream: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>>>,
+    pub upgrade_notify: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>>>,
 }
 
 #[derive(Clone)]
@@ -1775,6 +1780,26 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         self.ui_handler.set_multiple_windows_session(sessions);
     }
 
+    fn set_upgrade_channels(
+        &self,
+        stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+        notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
+    ) {
+        *self.upgrade_stream.write().unwrap() = Some(stream);
+        *self.upgrade_notify.write().unwrap() = Some(notify);
+    }
+    fn get_upgrade_channels(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
+        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
+    ) {
+        (
+            self.upgrade_stream.read().unwrap().clone(),
+            self.upgrade_notify.read().unwrap().clone(),
+        )
+    }
+
     fn handle_peer_info(&self, mut pi: PeerInfo) {
         log::debug!("handle_peer_info :{:?}", pi);
         self.lc.write().unwrap().peer_info = Some(pi.clone());
@@ -1791,16 +1816,29 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             }
         } else if !self.is_port_forward() && !self.is_terminal() {
             if pi.displays.is_empty() {
+                // RDP 连接/断开会切换控制台会话或显示器暂时不可用。
+                // 不立即报错退出，而是发送刷新请求让 B 端重发 PeerInfo。
+                // B 端后续会重新检测显示器并发送新的 handle_peer_info。
+                // 如果连续多次为空才报错。
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                let msg = if self.is_view_camera() {
-                    "No cameras"
-                } else {
-                    "No displays"
-                };
-                self.msgbox("error", "Error", msg, "");
+                let retries = self.displays_empty_retries.fetch_add(1, Ordering::SeqCst);
+                if retries >= 10 {
+                    log::warn!("Peer displays still empty after {} retries, showing error", retries);
+                    let msg = if self.is_view_camera() {
+                        "No cameras"
+                    } else {
+                        "No displays"
+                    };
+                    self.msgbox("error", "Error", msg, "");
+                    return;
+                }
+                log::info!("Peer displays empty (retry {}/10), requesting refresh", retries + 1);
+                self.send_message_query(0);
                 return;
             }
+            // Reset retry counter on successful display capture
+            self.displays_empty_retries.store(0, Ordering::SeqCst);
             self.try_change_init_resolution(pi.current_display);
             let p = self.lc.read().unwrap().should_auto_login();
             if !p.is_empty() {
@@ -2035,9 +2073,6 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         if remote.sent_close_reason {
             break;
         }
-        // Phase3 熔断重置：每次重连前重置 Phase3 失败计数，
-        // 使新连接能重新尝试 NAT 穿透（而非因上次会话累积 3 次失败后永久跳过）。
-        crate::common::reset_phase3_state();
         // 文件传输会话：重连前落盘当前进度并清空内存任务，
         // 使新连接建立后通过 load_last_jobs 从磁盘按 file_num 自动续传，
         // 避免残留任务向全新的被控端连接发送数据块而被丢弃导致传输失败。
