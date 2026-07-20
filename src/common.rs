@@ -1140,6 +1140,8 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
         "windows"
     } else if cfg!(target_os = "macos") {
         "macos"
+    } else if cfg!(target_os = "android") {
+        "android"
     } else {
         "ubuntu"
     };
