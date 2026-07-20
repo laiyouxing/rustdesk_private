@@ -331,6 +331,22 @@ pub struct Connection {
     // Using the same socket ensures the NAT mapping is consistent, so the
     // STUN-discovered address is valid for subsequent punch attempts.
     punch_socket: Option<Arc<tokio::net::UdpSocket>>,
+    // Phase 3: keep the punched KCP stream alive for the whole session.
+    // The punch task stores the KcpStream here; without this it would be
+    // dropped (and its kcp_io pump stopped) when the task exits.
+    phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
+    // Phase 3: queue of peer addresses for the single punch task to drain.
+    phase3_targets: Option<Arc<hbb_common::tokio::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Phase 3: whether the single punch task has been spawned.
+    phase3_started: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Phase 3: whether the stream has already been switched to direct.
+    phase3_upgraded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Phase 3: TCP listener for simultaneous open, bound at setup time and
+    // kept alive with the connection so the punch task can accept on it.
+    phase3_tcp_listener: Option<Arc<tokio::net::TcpListener>>,
+    // Phase 3: handle of the single punch task, aborted on connection close
+    // to avoid leaking the task (180s budget) across reconnections.
+    phase3_task: Option<hbb_common::tokio::task::JoinHandle<()>>,
 }
 
 impl ConnInner {
@@ -513,6 +529,12 @@ impl Connection {
             punch_stream: None,
             punch_notify: None,
             punch_socket: None,
+            phase3_kcp: None,
+            phase3_targets: Some(Arc::new(hbb_common::tokio::sync::Mutex::new(Vec::new()))),
+            phase3_started: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            phase3_upgraded: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            phase3_tcp_listener: None,
+            phase3_task: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -617,13 +639,17 @@ impl Connection {
                 Err(_) => None,
             };
             conn.punch_socket = punch_socket.clone();
+            // TCP listener 在 spawn 前创建并随 Connection 存活（spawn 结束不 drop），
+            // spawn 内只广播端口，打洞任务之后在这个 listener 上 accept
+            let phase3_tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+                .await
+                .ok()
+                .map(Arc::new);
+            let tcp_port = phase3_tcp_listener.as_ref()
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port());
+            conn.phase3_tcp_listener = phase3_tcp_listener;
             tokio::spawn(async move {
-                // 0. Create TCP listener for TCP simultaneous open before STUN
-                // so we can exchange the TCP port alongside the STUN address.
-                let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
-                let tcp_port = tcp_listener.as_ref()
-                    .and_then(|l| l.local_addr().ok())
-                    .map(|a| a.port());
                 // 1. STUN to discover our public IPv4 address using the persistent socket
                 if let Some(ref socket) = punch_socket {
                     match crate::common::stun_query_with_socket(socket).await {
@@ -959,14 +985,24 @@ impl Connection {
                 _ = punch_notify.notified() => {
                     let mut guard = punch_stream.lock().await;
                     if let Some(new_stream) = guard.take() {
-                        let saved_key = conn.stream.take_key();
-                        log::info!("Phase3(Host): Relay upgraded to direct connection!");
-                        conn.stream = new_stream;
-                        if let Some(enc) = saved_key {
-                            conn.stream.set_encrypt(enc);
-                            log::info!("Phase3(Host): encryption key transferred to new stream");
+                        // 防二次换流：已升级过则丢弃新流
+                        let already_upgraded = conn.phase3_upgraded.as_ref()
+                            .map_or(false, |u| u.swap(true, std::sync::atomic::Ordering::SeqCst));
+                        if already_upgraded {
+                            log::info!("Phase3(Host): already upgraded, drop duplicate stream");
                         } else {
-                            log::warn!("Phase3(Host): no encryption key from old stream!");
+                            let saved_key = conn.stream.take_key();
+                            log::info!("Phase3(Host): Relay upgraded to direct connection!");
+                            conn.stream = new_stream;
+                            if let Some(enc) = saved_key {
+                                // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
+                                // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
+                                // 两侧都在换流时刻归零，新流上序号自洽
+                                conn.stream.set_key(enc.0);
+                                log::info!("Phase3(Host): encryption key transferred to new stream (seq reset)");
+                            } else {
+                                log::warn!("Phase3(Host): no encryption key from old stream!");
+                            }
                         }
                     }
                 },
@@ -2457,28 +2493,54 @@ impl Connection {
                 if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
                 {
                     log::info!("Phase3(Host): received peer address: {}", peer_addr);
-                    let punch_stream = self.punch_stream.clone();
-                    let punch_notify = self.punch_notify.clone();
-                    let punch_socket = self.punch_socket.clone();
-                    let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
-                        Arc::new(std::sync::Mutex::new(None));
-                    tokio::spawn(async move {
-                        match relay_phase3_punch_to_peer(peer_addr, kcp_handle, punch_socket).await {
-                            Ok(stream) => {
-                                if let Some(s) = punch_stream {
-                                    let mut guard = s.lock().await;
-                                    *guard = Some(stream);
-                                }
-                                if let Some(n) = punch_notify {
-                                    n.notify_one();
-                                }
-                                log::info!("Phase3(Host): punch succeeded!");
-                            }
-                            Err(e) => {
-                                log::info!("Phase3(Host): punch to {} failed: {:?}", peer_addr, e);
-                            }
+                    // 忽略不可用地址：0.0.0.0 不可打洞，IPv6 与 v4 punch_socket 不匹配
+                    if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
+                        log::info!("Phase3(Host): ignore unusable address {}", peer_addr);
+                    } else if self.phase3_upgraded.as_ref().map_or(false, |u| {
+                        u.load(std::sync::atomic::Ordering::SeqCst)
+                    }) {
+                        log::info!("Phase3(Host): already upgraded, ignore {}", peer_addr);
+                    } else {
+                        // 地址入队，由唯一打洞任务消费（每条消息 spawn 一个任务会
+                        // 共享 socket 互相 connect 覆盖、抢 recv_from）
+                        if let Some(ref targets) = self.phase3_targets {
+                            targets.lock().await.push(peer_addr);
                         }
-                    });
+                        let already_started = self.phase3_started.as_ref().map_or(true, |s| {
+                            s.swap(true, std::sync::atomic::Ordering::SeqCst)
+                        });
+                        if !already_started {
+                            let punch_stream = self.punch_stream.clone();
+                            let punch_notify = self.punch_notify.clone();
+                            let punch_socket = self.punch_socket.clone();
+                            let targets = self.phase3_targets.clone().unwrap();
+                            let upgraded = self.phase3_upgraded.clone().unwrap();
+                            let tcp_listener = self.phase3_tcp_listener.clone();
+                            let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                                Arc::new(std::sync::Mutex::new(None));
+                            // KcpStream 随 Connection 存活，避免打洞任务结束后被 drop 停掉 kcp_io
+                            self.phase3_kcp = Some(kcp_handle.clone());
+                            self.phase3_task = Some(tokio::spawn(async move {
+                                match relay_phase3_punch_to_peer(
+                                    targets, kcp_handle, punch_socket, tcp_listener, upgraded,
+                                ).await {
+                                    Ok(stream) => {
+                                        if let Some(s) = punch_stream {
+                                            let mut guard = s.lock().await;
+                                            *guard = Some(stream);
+                                        }
+                                        if let Some(n) = punch_notify {
+                                            n.notify_one();
+                                        }
+                                        log::info!("Phase3(Host): punch succeeded!");
+                                    }
+                                    Err(e) => {
+                                        log::info!("Phase3(Host): punch failed: {:?}", e);
+                                    }
+                                }
+                            }));
+                        }
+                    }
                 }
             }
         }
@@ -4532,6 +4594,10 @@ impl Connection {
         let data = ipc::Data::Close;
         self.tx_to_cm.send(data).ok();
         self.port_forward_socket.take();
+        // 连接关闭时终止仍在运行的 Phase3 打洞任务，避免任务泄漏
+        if let Some(t) = self.phase3_task.take() {
+            t.abort();
+        }
     }
 
     // The `reason` should be consistent with `check_if_retry` if not empty
