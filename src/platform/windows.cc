@@ -200,8 +200,6 @@ static DWORD GetFallbackUserPid(DWORD dwSessionId)
 // START the app as system
 extern "C"
 {
-    // if should try WTSQueryUserToken?
-    // https://stackoverflow.com/questions/7285666/example-code-a-service-calls-createprocessasuser-i-want-the-process-to-run-in
     BOOL GetSessionUserTokenWin(OUT LPHANDLE lphUserToken, DWORD dwSessionId, BOOL as_user, DWORD *pDwTokenPid)
     {
         BOOL bResult = FALSE;
@@ -216,6 +214,17 @@ extern "C"
         {
             bResult = OpenProcessToken(hProcess, TOKEN_ALL_ACCESS, lphUserToken);
             CloseHandle(hProcess);
+        }
+        // When process-based token retrieval fails (e.g., winlogon/sihost not found
+        // in user session on Windows Server x86), fallback to WTSQueryUserToken.
+        // This is the standard method for services (session 0) to obtain a user
+        // session token, and works reliably on all Windows Vista+ systems.
+        // https://stackoverflow.com/questions/7285666/example-code-a-service-calls-createprocessasuser-i-want-the-process-to-run-in
+        if (!bResult)
+        {
+            bResult = WTSQueryUserToken(dwSessionId, lphUserToken);
+            if (bResult && pDwTokenPid)
+                *pDwTokenPid = 0;
         }
         return bResult;
     }
