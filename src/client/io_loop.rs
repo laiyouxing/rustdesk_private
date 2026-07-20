@@ -162,6 +162,10 @@ impl<T: InvokeUiSession> Remote<T> {
         // must clear it here to avoid stale feature-detection flags during
         // the brief window before LoginResponse arrives on the new connection.
         self.peer_info = Default::default();
+        // 每个新连接轮次递增代数，使上一轮可能存在的"空显示器兜底定时器"失效
+        self.handler
+            .displays_empty_retries
+            .fetch_add(1, Ordering::SeqCst);
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -2386,8 +2390,35 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 Some(message::Union::PeerInfo(pi)) => {
-                    self.handler.set_displays(&pi.displays);
-                    self.handler.set_platform_additions(&pi.platform_additions);
+                    // 登录时 B 端显示器为空（如 RDP 会话切换）会使 handle_peer_info
+                    // 进入等待分支，flutter 一直停在"正在连接"。B 端显示器恢复后
+                    // 通过该同步消息补发 displays：此时用登录时保存的完整 peer_info
+                    // 合并新 displays 补跑 handle_peer_info，完成连接建立。
+                    let need_resume = !pi.displays.is_empty()
+                        && self
+                            .handler
+                            .lc
+                            .read()
+                            .unwrap()
+                            .peer_info
+                            .as_ref()
+                            .map_or(false, |p| p.displays.is_empty());
+                    if need_resume {
+                        let mut merged =
+                            self.handler.lc.read().unwrap().peer_info.clone().unwrap();
+                        merged.displays = pi.displays.clone();
+                        if !pi.platform_additions.is_empty() {
+                            merged.platform_additions = pi.platform_additions.clone();
+                        }
+                        log::info!(
+                            "Peer displays recovered ({}), resuming deferred peer info",
+                            merged.displays.len()
+                        );
+                        self.handler.handle_peer_info(merged);
+                    } else {
+                        self.handler.set_displays(&pi.displays);
+                        self.handler.set_platform_additions(&pi.platform_additions);
+                    }
                 }
                 Some(message::Union::ScreenshotResponse(response)) => {
                     crate::client::screenshot::set_screenshot(response.data);
