@@ -1075,6 +1075,10 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
           # temporary use debug sign config
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          # Override flutter version to match BUILD_VERSION (same as Windows/Linux via build.py)
+          flutter_ver=$(echo "${{ env.VERSION }}" | cut -d. -f1-3)
+          sed -i "s/^version:.*/version: ${flutter_ver}+64/" flutter/pubspec.yaml
+          echo "Overrode flutter version to ${flutter_ver}+64"
           case ${{ matrix.job.target }} in
             aarch64-linux-android)
               mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
