@@ -1444,7 +1444,7 @@ fn get_after_install(
 }
 
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
-    let uninstall_str = get_uninstall(false, false);
+    let mut uninstall_str = get_uninstall(false, false);
     let mut path = path.trim_end_matches('\\').to_owned();
     let (subkey, _path, start_menu, exe) = get_default_install_info();
     let mut exe = exe;
@@ -1452,6 +1452,11 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
         path = _path;
     } else {
         exe = exe.replace(&_path, &path);
+    }
+    // 快速安装版：检测到已安装时走升级路径，仅停服杀进程，不卸载重装
+    let is_upgrade = std::fs::metadata(&exe).is_ok();
+    if is_upgrade {
+        uninstall_str = get_upgrade_prefix();
     }
     let mut version_major = "0";
     let mut version_minor = "0";
@@ -1636,6 +1641,13 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
+    // 升级路径：前置脚本停了服务，安装完成后重启
+    if is_upgrade {
+        let app_name = crate::get_app_name();
+        allow_err!(std::process::Command::new("sc")
+            .args(&["start", &app_name])
+            .spawn());
+    }
     run_after_run_cmds(silent);
     Ok(())
 }
@@ -1720,6 +1732,19 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
         before_uninstall=get_before_uninstall(kill_self),
         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
         app_name = crate::get_app_name(),
+    )
+}
+
+/// 快速安装版：升级前置脚本，仅停服务+杀进程，不删除目录和注册表
+fn get_upgrade_prefix() -> String {
+    let app_name = crate::get_app_name();
+    format!(
+        "
+chcp 65001
+sc stop {app_name}
+taskkill /F /IM {app_name}.exe
+",
+        app_name = app_name,
     )
 }
 

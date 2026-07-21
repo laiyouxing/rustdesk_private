@@ -38,6 +38,10 @@ pub fn core_main() -> Option<Vec<String>> {
         // return None to terminate the process
         return None;
     }
+    // 后台进程/端口监控：集中下发规则，检测后带 Bearer 鉴权上报
+    // 安卓端不编译该模块（见 hbbs_http.rs），此处仅在非安卓平台启动。
+    #[cfg(not(target_os = "android"))]
+    crate::hbbs_http::process_monitor::run();
     let mut args = Vec::new();
     let mut flutter_args = Vec::new();
     let mut i = 0;

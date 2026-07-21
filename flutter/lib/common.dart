@@ -3802,15 +3802,21 @@ Widget _buildSymmetricNatWarning() {
   if (nat == 0 && publicAddr.isEmpty) {
     return SizedBox.shrink();
   }
+  // NAT types: 0=UNKNOWN_NAT, 1=ASYMMETRIC(cone), 2=SYMMETRIC
+  final natLabels = {
+    0: translate('nat_type_unknown'),
+    1: translate('nat_type_asymmetric'),
+    2: translate('nat_type_symmetric'),
+  };
+  final natStr = natLabels[nat] ?? 'NAT${nat}';
   final color = nat == 2 ? Colors.orange : Colors.green;
   final icon = nat == 2
       ? Icons.warning_amber_rounded
       : Icons.language;
-  final natTypeStr = nat == 2 ? translate('symmetric_nat') : translate('cone_nat');
-  final message = nat == 2
-      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natTypeStr'
-      : '${translate('NAT')}: $natTypeStr\n${translate('Public Address')}: $publicAddr';
-  final subtitle = '';
+  final shortLabel = natStr;
+  final fullTip = nat == 2
+      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natStr'
+      : '${translate('NAT')}: $natStr\n${translate('Public Address')}: $publicAddr';
 
   return Container(
     color: color.shade100,
@@ -3818,11 +3824,14 @@ Widget _buildSymmetricNatWarning() {
       children: [
         Icon(icon, color: color.shade800, size: 20).paddingOnly(right: 8),
         Expanded(
-          child: Text(
-            message + subtitle,
-            style: TextStyle(color: color.shade900, fontSize: 13),
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
+          child: Tooltip(
+            message: fullTip,
+            child: Text(
+              shortLabel,
+              style: TextStyle(color: color.shade900, fontSize: 13),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ),
       ],
@@ -4022,18 +4031,18 @@ void earlyAssert() {
 
 void checkUpdate() {
   if (!isWeb) {
-    if (!bind.isCustomClient()) {
-      platformFFI.registerEventHandler(
-          kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
-          (Map<String, dynamic> evt) async {
-        if (evt['url'] is String) {
-          stateGlobal.updateUrl.value = evt['url'];
-        }
-      });
-      Timer(const Duration(seconds: 1), () async {
-        bind.mainGetSoftwareUpdateUrl();
-      });
-    }
+    // 修复：custom 客户端同样需要检查自建 api-server 的版本更新，
+    // 故移除原 `if (!bind.isCustomClient())` 守卫，使更新检查对所有客户端生效。
+    platformFFI.registerEventHandler(
+        kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
+        (Map<String, dynamic> evt) async {
+      if (evt['url'] is String) {
+        stateGlobal.updateUrl.value = evt['url'];
+      }
+    });
+    Timer(const Duration(seconds: 1), () async {
+      bind.mainGetSoftwareUpdateUrl();
+    });
   }
 }
 

@@ -3,6 +3,7 @@
 import os
 import pathlib
 import platform
+import re
 import zipfile
 import urllib.request
 import shutil
@@ -55,6 +56,19 @@ def get_version():
             if line.startswith("version"):
                 return line.replace("version", "").replace("=", "").replace('"', '').strip()
     return ''
+
+
+def override_flutter_version(version):
+    """用 BUILD_VERSION 覆写 flutter/pubspec.yaml 的版本号（Flutter 要求三位 SemVer）"""
+    parts = version.split('.')
+    flutter_ver = '.'.join(parts[:3]) if len(parts) >= 3 else version
+    pubspec = 'flutter/pubspec.yaml'
+    with open(pubspec, encoding='utf-8') as f:
+        content = f.read()
+    content = re.sub(r'^version:.*', f'version: {flutter_ver}+64', content, flags=re.MULTILINE)
+    with open(pubspec, 'w', encoding='utf-8') as f:
+        f.write(content)
+    print(f'Overrode flutter version to {flutter_ver}+64')
 
 
 def parse_rc_features(feature):
@@ -476,8 +490,10 @@ def main():
     if os.path.isfile('/usr/bin/pacman'):
         system2('git checkout src/ui/common.tis')
     version = get_version()
-    features = ','.join(get_features(args))
     flutter = args.flutter
+    if flutter:
+        override_flutter_version(version)
+    features = ','.join(get_features(args))
     if not flutter:
         system2('python3 res/inline-sciter.py')
     print(args.skip_cargo)

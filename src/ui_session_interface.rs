@@ -53,6 +53,9 @@ use crate::keyboard;
 use crate::{client::Data, client::Interface};
 
 const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
+// 登录时 B 端显示器为空（如 RDP 会话切换）的最长等待时间，
+// 超时后向用户报 "No displays" 错误，避免 UI 永远停在"正在连接"。
+const DISPLAYS_EMPTY_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
@@ -71,8 +74,13 @@ pub struct Session<T: InvokeUiSession> {
     // Indicate whether the session is reconnected.
     // Used to auto start file transfer after reconnection.
     pub reconnect_count: Arc<AtomicUsize>,
+    pub displays_empty_retries: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
+    // Upgrade notification channels, set by io_loop for background LAN/Phase3 upgrade.
+    // Shared via Arc/RwLock so the clone passed into Client::start sees the same channels.
+    pub upgrade_stream: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>>>,
+    pub upgrade_notify: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>>>,
 }
 
 #[derive(Clone)]
@@ -1775,6 +1783,26 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         self.ui_handler.set_multiple_windows_session(sessions);
     }
 
+    fn set_upgrade_channels(
+        &self,
+        stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+        notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
+    ) {
+        *self.upgrade_stream.write().unwrap() = Some(stream);
+        *self.upgrade_notify.write().unwrap() = Some(notify);
+    }
+    fn get_upgrade_channels(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
+        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
+    ) {
+        (
+            self.upgrade_stream.read().unwrap().clone(),
+            self.upgrade_notify.read().unwrap().clone(),
+        )
+    }
+
     fn handle_peer_info(&self, mut pi: PeerInfo) {
         log::debug!("handle_peer_info :{:?}", pi);
         self.lc.write().unwrap().peer_info = Some(pi.clone());
@@ -1791,16 +1819,51 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             }
         } else if !self.is_port_forward() && !self.is_terminal() {
             if pi.displays.is_empty() {
+                // RDP 连接/断开会切换控制台会话，B 端显示器可能暂时不可用。
+                // 不立即报错退出：保留连接并请求刷新；B 端显示器恢复后会通过
+                // displays 同步消息补发，io_loop 的 message::Union::PeerInfo 分支
+                // 会合并登录时保存的原始 peer_info 补跑本函数完成连接。
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                let msg = if self.is_view_camera() {
-                    "No cameras"
-                } else {
-                    "No displays"
-                };
-                self.msgbox("error", "Error", msg, "");
+                // 时间兜底：B 端不会重发 LoginResponse，若显示器一直不恢复，
+                // 超时后报错，避免 UI 永远停在"正在连接"。
+                // displays_empty_retries 在此用作代数标记：每次进入空显示器等待、
+                // 显示器就绪、开启新连接轮次都递增，仅最新一代的定时器允许报错。
+                let gen = self.displays_empty_retries.fetch_add(1, Ordering::SeqCst) + 1;
+                let handler = self.clone();
+                tokio::spawn(async move {
+                    sleep(DISPLAYS_EMPTY_TIMEOUT_SECS as f32).await;
+                    let still_empty = handler
+                        .lc
+                        .read()
+                        .unwrap()
+                        .peer_info
+                        .as_ref()
+                        .map_or(false, |p| p.displays.is_empty());
+                    if still_empty
+                        && handler.displays_empty_retries.load(Ordering::SeqCst) == gen
+                    {
+                        log::warn!(
+                            "Peer displays still empty after {}s, showing error",
+                            DISPLAYS_EMPTY_TIMEOUT_SECS
+                        );
+                        let msg = if handler.is_view_camera() {
+                            "No cameras"
+                        } else {
+                            "No displays"
+                        };
+                        handler.msgbox("error", "Error", msg, "");
+                    }
+                });
+                log::info!(
+                    "Peer displays empty, waiting for recovery (timeout {}s)",
+                    DISPLAYS_EMPTY_TIMEOUT_SECS
+                );
+                self.send_message_query(0);
                 return;
             }
+            // 显示器就绪（或恢复）：递增代数使兜底定时器失效
+            self.displays_empty_retries.fetch_add(1, Ordering::SeqCst);
             self.try_change_init_resolution(pi.current_display);
             let p = self.lc.read().unwrap().should_auto_login();
             if !p.is_empty() {
@@ -2035,6 +2098,11 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         if remote.sent_close_reason {
             break;
         }
+        // 文件传输会话：重连前落盘当前进度并清空内存任务，
+        // 使新连接建立后通过 load_last_jobs 从磁盘按 file_num 自动续传，
+        // 避免残留任务向全新的被控端连接发送数据块而被丢弃导致传输失败。
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        remote.prepare_file_jobs_for_reconnect().await;
     }
     let _ = remote.sync_jobs_status_to_local().await;
 }

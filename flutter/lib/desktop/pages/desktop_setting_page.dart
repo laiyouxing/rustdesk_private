@@ -2028,15 +2028,21 @@ class _AccountState extends State<_Account> {
   }
 
   Widget accountAction() {
-    return Obx(() => _Button(
-        gFFI.userModel.userName.value.isEmpty
-            ? 'Login'
-            : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
-        () => {
-              gFFI.userModel.userName.value.isEmpty
-                  ? loginDialog()
-                  : logOutConfirmDialog()
-            }));
+    return Obx(() {
+      if (gFFI.userModel.userName.value.isEmpty) {
+        return _Button('Login', () => loginDialog());
+      }
+      return Row(children: [
+        _Button(
+            '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
+            () => logOutConfirmDialog()),
+        SizedBox(width: 8),
+        _Button('管理后台', () {
+          launchUrl(Uri.parse('https://183.24.70.210:21120/'),
+              mode: LaunchMode.externalApplication);
+        }),
+      ]);
+    });
   }
 
   Widget useInfo() {
@@ -2185,15 +2191,21 @@ class _PluginState extends State<_Plugin> {
   }
 
   Widget accountAction() {
-    return Obx(() => _Button(
-        gFFI.userModel.userName.value.isEmpty
-            ? 'Login'
-            : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
-        () => {
-              gFFI.userModel.userName.value.isEmpty
-                  ? loginDialog()
-                  : logOutConfirmDialog()
-            }));
+    return Obx(() {
+      if (gFFI.userModel.userName.value.isEmpty) {
+        return _Button('Login', () => loginDialog());
+      }
+      return Row(children: [
+        _Button(
+            '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
+            () => logOutConfirmDialog()),
+        SizedBox(width: 8),
+        _Button('管理后台', () {
+          launchUrl(Uri.parse('https://183.24.70.210:21120/'),
+              mode: LaunchMode.externalApplication);
+        }),
+      ]);
+    });
   }
 }
 

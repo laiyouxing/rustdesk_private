@@ -86,8 +86,12 @@ pub struct Remote<T: InvokeUiSession> {
     punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
     // Phase 3 TCP: separate vec for peer TCP listener addresses (TCP simultaneous open)
     punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
-    // Handle to cancel the previous Phase3 task on reconnection
-    phase3_handle: Option<tokio::task::JoinHandle<bool>>,
+    // Phase3 取消令牌：重连/断连时取消旧打洞线程，避免线程累积泄漏
+    phase3_cancel: Option<hbb_common::tokio_util::sync::CancellationToken>,
+    // Phase 3: keep the punched KCP stream alive for the whole session.
+    // relay_upgrade_task stores the KcpStream here; without this the stream
+    // would be dropped (and its kcp_io pump stopped) when the task exits.
+    phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
     // Inactivity timeout: track last user input for auto-disconnect
     last_input_time: Instant,
     inactivity_warning_remaining: Option<u32>,
@@ -144,13 +148,24 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_notify: None,
             punch_peer_addrs: None,
             punch_tcp_addrs: None,
-            phase3_handle: None,
+            phase3_cancel: None,
+            phase3_kcp: None,
             last_input_time: Instant::now(),
             inactivity_warning_remaining: None,
         }
     }
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
+        // Reset per-connection state for auto-reconnect path.
+        // User-initiated reconnect() clears peer_info via LoginConfigHandler,
+        // but the auto-reconnect loop reuses the same Remote struct, so we
+        // must clear it here to avoid stale feature-detection flags during
+        // the brief window before LoginResponse arrives on the new connection.
+        self.peer_info = Default::default();
+        // 每个新连接轮次递增代数，使上一轮可能存在的"空显示器兜底定时器"失效
+        self.handler
+            .displays_empty_retries
+            .fetch_add(1, Ordering::SeqCst);
         #[cfg(target_os = "windows")]
         let _file_clip_context_holder = {
             // `is_port_forward()` will not reach here, but we still check it for clarity.
@@ -185,6 +200,18 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        // Initialize upgrade channels BEFORE connection start so that background
+        // LAN test (spawned inside _start_inner) can push direct streams here for
+        // seamless in-session replacement (same mechanism as Phase3 upgrade).
+        let punch_notify = Arc::new(Notify::new());
+        let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
+            Arc::new(hbb_common::tokio::sync::Mutex::new(None));
+        self.punch_notify = Some(punch_notify.clone());
+        self.punch_stream = Some(punch_stream.clone());
+        self.handler.set_upgrade_channels(punch_stream.clone(), punch_notify.clone());
+        // 重连时丢弃上一会话的 KcpStream（其 kcp_io 泵随 drop 停止）
+        self.phase3_kcp = None;
+
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -194,7 +221,7 @@ impl<T: InvokeUiSession> Remote<T> {
         )
         .await
         {
-            Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port))) => {
+            Ok(((mut peer, direct, pk, mut kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port))) => {
                 self.handler
                     .connection_round_state
                     .lock()
@@ -203,14 +230,14 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
-                // Relay upgrade to direct — merged Phase 3 into relay_upgrade_task
-                let punch_notify = Arc::new(Notify::new());
+                // Phase3-specific channels (punch_stream/punch_notify already initialized before Client::start)
                 let punch_done = Arc::new(Notify::new());
-                let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
-                    Arc::new(hbb_common::tokio::sync::Mutex::new(None));
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Channel for relay_upgrade_task to send our STUN address → io_loop → peer
-                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+                // Buffer 16 — relay_upgrade_task may send multiple candidates (IPv6, TCP,
+                // main STUN addr, symmetric predicted addr, TCP timing).  Capacity 1 caused
+                // try_send to silently drop later candidates, losing TCP/symmetric fallback.
+                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(16);
                 // Shared state for handle_msg_from_peer to push peer Phase 3 addresses
                 // into relay_upgrade_task's target list (same socket, no duplicate)
                 let phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
@@ -220,12 +247,13 @@ impl<T: InvokeUiSession> Remote<T> {
                 // address from the same peer IP is the TCP listener address.
                 let phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
-                // Store for handle_msg_from_peer to access
-                self.punch_stream = Some(punch_stream.clone());
-                self.punch_notify = Some(punch_notify.clone());
+                // Store Phase3-specific channels (punch_stream/punch_notify already stored on self before Client::start)
                 self.punch_peer_addrs = Some(phase3_peer_rx.clone());
                 self.punch_tcp_addrs = Some(phase3_tcp_rx.clone());
-                if !direct && (stream_type == "Relay" || stream_type == "WebSocket") {
+                // 只有桌面控制/摄像头查看的 Relay/WebSocket 连接才做 Phase3 升级
+                if !direct && (stream_type == "Relay" || stream_type == "WebSocket")
+                    && (conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA)
+                {
                     // Skip Phase3 if it failed on a previous attempt (reconnection path).
                     // Only app restart or a successful Phase3 will reset this.
                     if crate::common::should_skip_phase3() {
@@ -235,20 +263,24 @@ impl<T: InvokeUiSession> Remote<T> {
                         let d = punch_done.clone();
                         let s = punch_stream.clone();
                         let succ = punch_success.clone();
-                        let mut p2p_addrs = peer_addrs.clone();
-                        if !p2p_addrs.contains(&peer_addr) {
+                        // 过滤无效地址（0.0.0.0 / 端口 0 不可打洞）
+                        let mut p2p_addrs: Vec<std::net::SocketAddr> = peer_addrs
+                            .iter()
+                            .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
+                            .cloned()
+                            .collect();
+                        if !peer_addr.ip().is_unspecified() && peer_addr.port() != 0
+                            && !p2p_addrs.contains(&peer_addr)
+                        {
                             p2p_addrs.push(peer_addr);
                         }
                         let phase3_peer = phase3_peer_rx.clone();
                         let phase3_tcp = phase3_tcp_rx.clone();
                         let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
                             Arc::new(std::sync::Mutex::new(None));
+                        // KcpStream 随 Remote 存活，避免打洞线程结束后被 drop 停掉 kcp_io
+                        self.phase3_kcp = Some(kcp_handle.clone());
                         self.handler.set_punch_status("trying", "");
-                        // Cancel any previous Phase3 task to avoid parallel instances
-                        if let Some(old) = self.phase3_handle.take() {
-                            old.abort();
-                            log::info!("Phase3: cancelled previous punch task on reconnection");
-                        }
                         // Prefer UPnP local port so UDP socket uses the mapped port
                         let punch_port = {
                             let upnp_local = crate::common::get_upnp_local_port();
@@ -259,15 +291,28 @@ impl<T: InvokeUiSession> Remote<T> {
                                 udp_nat_port
                             }
                         };
-                        self.phase3_handle = Some(tokio::spawn(async move {
-                            let ok = relay_upgrade_task(
-                            p2p_addrs, n, s, kcp_handle, punch_port,
-                            phase3_out_tx, phase3_peer, phase3_tcp,
-                        ).await;
-                        succ.store(ok, std::sync::atomic::Ordering::SeqCst);
-                        d.notify_one();
-                        ok
-                    }));
+                        // Phase3 在独立线程的 tokio 运行时中运行，避免与 io_loop 抢资源
+                        // （主 tokio 运行时 flavor=current_thread，不能共用以防卡顿）
+                        // 重连时先取消上一轮打洞线程，避免线程累积（每个 180s 预算）
+                        if let Some(t) = &self.phase3_cancel {
+                            t.cancel();
+                        }
+                        let cancel = hbb_common::tokio_util::sync::CancellationToken::new();
+                        self.phase3_cancel = Some(cancel.clone());
+                        std::thread::spawn(move || {
+                            let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("Phase3 runtime");
+                            rt.block_on(async move {
+                                let ok = relay_upgrade_task(
+                                    p2p_addrs, n, s, kcp_handle, punch_port,
+                                    phase3_out_tx, phase3_peer, phase3_tcp, cancel,
+                                ).await;
+                                succ.store(ok, std::sync::atomic::Ordering::SeqCst);
+                                d.notify_one();
+                            });
+                        });
                     } // end else
                 } // end if !direct
                 if conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA {
@@ -301,6 +346,11 @@ impl<T: InvokeUiSession> Remote<T> {
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 let mut rx_clip_client = rx_clip_client_holder.0.lock().await;
 
+                // 中继保活定时器：每 20 秒检查，如果通过中继且无数据超过 15 秒则发空包，
+                // 防止 hbbr 30 秒空闲超时导致中继连接被断开。
+                let mut keepalive_timer =
+                    crate::rustdesk_interval(time::interval(Duration::new(20, 0)));
+
                 let mut status_timer =
                     crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
                 let mut fps_instant = Instant::now();
@@ -315,10 +365,10 @@ impl<T: InvokeUiSession> Remote<T> {
                                     Err(err) => {
                                         if received {
                                             log::info!("Connection lost, reconnecting...");
-                                            self.handler.set_punch_status("reconnecting", "");
                                         } else {
-                                            self.handler.on_establish_connection_error(err.to_string());
+                                            log::info!("Connection lost during establishment: {}, reconnecting...", err);
                                         }
+                                        self.handler.set_punch_status("reconnecting", "");
                                         break;
                                     }
                                     Ok(ref bytes) => {
@@ -341,8 +391,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                     log::info!("Reset by the peer, reconnecting...");
                                     self.handler.set_punch_status("reconnecting", "");
                                 } else {
-                                    log::info!("Reset by the peer");
-                                    self.handler.msgbox("error", "Connection Error", "Reset by the peer", "");
+                                    log::info!("Reset by the peer during establishment, reconnecting...");
+                                    self.handler.set_punch_status("reconnecting", "");
                                 }
                                 break;
                             }
@@ -362,36 +412,41 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut guard = punch_stream.lock().await;
                             if let Some(new_peer) = guard.take() {
                                 log::info!("Relay upgraded to direct connection!");
+                                // 先让 relay 刷新挂起的消息，减少切流丢包
+                                allow_err!(peer.send(&Message::new()).await);
                                 let saved_key = peer.take_key();
                                 peer = new_peer;
                                 if let Some(enc) = saved_key {
-                                    peer.set_encrypt(enc);
-                                    log::info!("Phase3: encryption key transferred to new stream");
+                                    // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
+                                    // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
+                                    // 两侧都在换流时刻归零，新流上序号自洽
+                                    peer.set_key(enc.0);
+                                    log::info!("Phase3: encryption key transferred to new stream (seq reset)");
                                 } else {
                                     log::warn!("Phase3: no encryption key from old stream!");
                                 }
+                                // 给新流 50ms 稳定时间
+                                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
                                 crate::common::record_phase3_success();
                                 self.handler.update_direct(Some(true));
                                 self.handler.set_connection_type(
                                     peer.is_secured(), true, "UDP", &relay_server
                                 );
                                 self.handler.set_punch_status("succeeded", "UDP");
+                                // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start
+                                // 返回的 kcp 恒为 None，不更新的话断连时不会发 close_reason，
+                                // 对端要等 60s KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
+                                kcp = self
+                                    .phase3_kcp
+                                    .as_ref()
+                                    .and_then(|h| h.lock().ok().and_then(|mut g| g.take()));
                             }
                         }
                         _ = punch_done.notified() => {
+                            // 单一换流路径在 punch_notify 分支；这里只处理打洞任务结束
                             if punch_success.load(std::sync::atomic::Ordering::SeqCst) {
-                                let mut guard = punch_stream.lock().await;
-                                if let Some(new_stream) = guard.take() {
-                                    log::info!("RelayUpgrade: punch succeeded, replacing relay stream");
-                                    let saved_key = peer.take_key();
-                                    peer = new_stream;
-                                    if let Some(enc) = saved_key {
-                                        peer.set_encrypt(enc);
-                                        log::info!("Phase3: encryption key transferred to new stream");
-                                    } else {
-                                        log::warn!("Phase3: no encryption key from old stream!");
-                                    }
-                                }
+                                // 流已由 punch_notify 分支换上（guard.take() 为 None 属正常）
+                                log::info!("RelayUpgrade: punch task finished with success");
                             } else {
                                 crate::common::record_phase3_failure();
                                 log::info!("RelayUpgrade: punch failed, staying on relay");
@@ -484,9 +539,24 @@ impl<T: InvokeUiSession> Remote<T> {
                                 }
                             }
                         }
+                        _ = keepalive_timer.tick() => {
+                            // 中继保活：20s 检测一次，当通过中继且 15s 内无数据时，
+                            // 发一个空 protobuf Message 保持中继连接活跃，
+                            // 防止 hbbr 30 秒空闲超时中断会话。
+                            if !direct && last_recv_time.elapsed().as_secs() > 15 {
+                                log::info!("keepalive: sending keep-alive on relay (idle {}s)", last_recv_time.elapsed().as_secs());
+                                if let Err(e) = peer.send(&Message::new()).await {
+                                    log::info!("keepalive send failed: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
+                // io_loop 退出（重连/断连）时取消仍在运行的 Phase3 打洞线程
+                if let Some(t) = &self.phase3_cancel {
+                    t.cancel();
+                }
                 // Stop client audio server.
                 if let Some(s) = self.stop_voice_call_sender.take() {
                     s.send(()).ok();
@@ -544,13 +614,17 @@ impl<T: InvokeUiSession> Remote<T> {
                     let file_transfer_enabled =
                         self.handler.lc.read().unwrap().enable_file_copy_paste.v;
                     let view_only = self.handler.lc.read().unwrap().view_only.v;
-                    let stop = is_stopping_allowed
+                    // Bugfix: 在连接未建立(is_connected=false)时不触发 set_is_stopped()，
+                    // 否则 CM 握手阶段发送的 MonitorReady 会被 stop 拦截并永久停止 CM，
+                    // 导致文件剪贴板永远无法工作（文字剪贴板走 arboard 不受影响）。
+                    // 详见 https://github.com/rustdesk/rustdesk/issues/9977
+                    let stop = self.is_connected
+                        && is_stopping_allowed
                         && (view_only
-                            || !self.is_connected
                             || !(server_file_transfer_enabled && file_transfer_enabled));
                     log::debug!(
                         "Process clipboard message from system, stop: {}, is_stopping_allowed: {}, view_only: {}, server_file_transfer_enabled: {}, file_transfer_enabled: {}",
-                        view_only, stop, is_stopping_allowed, server_file_transfer_enabled, file_transfer_enabled
+                        stop, is_stopping_allowed, view_only, server_file_transfer_enabled, file_transfer_enabled
                     );
                     if stop {
                         #[cfg(target_os = "windows")]
@@ -1256,6 +1330,38 @@ impl<T: InvokeUiSession> Remote<T> {
             self.handler.save_config(config);
         }
         true
+    }
+
+    /// 文件传输会话在自动重连前的准备工作。
+    ///
+    /// 背景：自动重连循环复用同一个 `Remote`，其内存中的 `read_jobs`/`write_jobs`
+    /// 会跨重连保留。但重连后被控端是一个全新的连接，并不知道旧连接上的传输任务，
+    /// 若继续用残留的内存任务发送数据块，被控端因没有对应任务而丢弃，导致
+    /// "重连后无法传输文件"。同时 `sync_jobs_status_to_local` 原本只在整个重连
+    /// 循环结束后才落盘一次，重连时 `load_last_jobs` 读到的是过期/为空的续传信息。
+    ///
+    /// 处理：重连前先把当前进度（`file_num`）落盘、标记为重连（使 `load_last_jobs`
+    /// 恢复的任务带 `auto_start` 自动续传），再清空内存任务，避免与重连后由
+    /// `load_last_jobs` → `AddJob`/`ResumeJob` 重新下发的任务重复/错位。
+    /// `ResumeJob` 会按落盘的 `file_num` 重新向被控端发起 `new_send`/`new_receive`
+    /// 握手，从而在新连接上正确续传。
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub async fn prepare_file_jobs_for_reconnect(&mut self) {
+        if !self.handler.is_file_transfer() {
+            return;
+        }
+        // 1. 落盘当前传输进度，供重连后按 file_num 续传
+        let _ = self.sync_jobs_status_to_local().await;
+        // 2. 标记为重连，使 load_last_jobs 恢复的任务 auto_start 自动续传
+        self.handler
+            .reconnect_count
+            .fetch_add(1, Ordering::SeqCst);
+        // 3. 清空内存中的残留任务，避免与重连后重新下发的任务重复/错位
+        self.read_jobs.clear();
+        self.write_jobs.clear();
+        self.remove_jobs.clear();
+        // 4. 重置定时器，避免残留 read 任务的 1ms 定时器空转
+        self.timer = crate::rustdesk_interval(time::interval(SEC30));
     }
 
     async fn send_toggle_virtual_display_msg(&self, peer: &mut Stream) {
@@ -2157,27 +2263,32 @@ impl<T: InvokeUiSession> Remote<T> {
                         // Heuristic: if we already have addresses from this peer IP in
                         // punch_peer_addrs, the new address with a different port is TCP.
                         if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
-                            log::info!("Phase3: received peer address: {}", peer_addr);
-                            let is_tcp = self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
-                                ppa_ref.lock().map(|addrs| {
-                                    addrs.iter().any(|a| a.ip() == peer_addr.ip() && a.port() != peer_addr.port())
-                                }).unwrap_or(false)
-                            });
-                            if is_tcp {
-                                if let Some(ref punch_tcp) = self.punch_tcp_addrs {
-                                    if let Ok(mut addrs) = punch_tcp.lock() {
-                                        if !addrs.contains(&peer_addr) {
-                                            addrs.push(peer_addr);
-                                            log::info!("Phase3: added TCP peer address: {}", peer_addr);
+                            // 忽略无效地址（0.0.0.0 不可打洞；早前的时间戳同步机制已移除）
+                            if peer_addr.ip().is_unspecified() {
+                                log::info!("Phase3: ignore unspecified peer address: {}", peer_addr);
+                            } else {
+                                log::info!("Phase3: received peer address: {}", peer_addr);
+                                let is_tcp = self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
+                                    ppa_ref.lock().map(|addrs| {
+                                        addrs.iter().any(|a| a.ip() == peer_addr.ip() && a.port() != peer_addr.port())
+                                    }).unwrap_or(false)
+                                });
+                                if is_tcp {
+                                    if let Some(ref punch_tcp) = self.punch_tcp_addrs {
+                                        if let Ok(mut addrs) = punch_tcp.lock() {
+                                            if !addrs.contains(&peer_addr) {
+                                                addrs.push(peer_addr);
+                                                log::info!("Phase3: added TCP peer address: {}", peer_addr);
+                                            }
                                         }
                                     }
-                                }
-                            } else {
-                                if let Some(ref punch_peer) = self.punch_peer_addrs {
-                                    if let Ok(mut addrs) = punch_peer.lock() {
-                                        if !addrs.contains(&peer_addr) {
-                                            addrs.push(peer_addr);
-                                            log::info!("Phase3: added KCP peer address: {}", peer_addr);
+                                } else {
+                                    if let Some(ref punch_peer) = self.punch_peer_addrs {
+                                        if let Ok(mut addrs) = punch_peer.lock() {
+                                            if !addrs.contains(&peer_addr) {
+                                                addrs.push(peer_addr);
+                                                log::info!("Phase3: added KCP peer address: {}", peer_addr);
+                                            }
                                         }
                                     }
                                 }
@@ -2279,8 +2390,35 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 Some(message::Union::PeerInfo(pi)) => {
-                    self.handler.set_displays(&pi.displays);
-                    self.handler.set_platform_additions(&pi.platform_additions);
+                    // 登录时 B 端显示器为空（如 RDP 会话切换）会使 handle_peer_info
+                    // 进入等待分支，flutter 一直停在"正在连接"。B 端显示器恢复后
+                    // 通过该同步消息补发 displays：此时用登录时保存的完整 peer_info
+                    // 合并新 displays 补跑 handle_peer_info，完成连接建立。
+                    let need_resume = !pi.displays.is_empty()
+                        && self
+                            .handler
+                            .lc
+                            .read()
+                            .unwrap()
+                            .peer_info
+                            .as_ref()
+                            .map_or(false, |p| p.displays.is_empty());
+                    if need_resume {
+                        let mut merged =
+                            self.handler.lc.read().unwrap().peer_info.clone().unwrap();
+                        merged.displays = pi.displays.clone();
+                        if !pi.platform_additions.is_empty() {
+                            merged.platform_additions = pi.platform_additions.clone();
+                        }
+                        log::info!(
+                            "Peer displays recovered ({}), resuming deferred peer info",
+                            merged.displays.len()
+                        );
+                        self.handler.handle_peer_info(merged);
+                    } else {
+                        self.handler.set_displays(&pi.displays);
+                        self.handler.set_platform_additions(&pi.platform_additions);
+                    }
                 }
                 Some(message::Union::ScreenshotResponse(response)) => {
                     crate::client::screenshot::set_screenshot(response.data);

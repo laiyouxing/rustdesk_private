@@ -186,10 +186,6 @@ impl OidcSession {
             &[("code", code), ("id", id), ("uuid", uuid)],
         )?;
         Self::ensure_client(api_server);
-        #[derive(Deserialize)]
-        struct HttpResponseBody {
-            body: String,
-        }
 
         let resp = crate::http_request_sync(
             url.to_string(),
@@ -197,8 +193,13 @@ impl OidcSession {
             None,
             "{}".to_owned(),
         )?;
-        let resp = serde_json::from_str::<HttpResponseBody>(&resp)?;
-        HbbHttpResponse::parse(&resp.body)
+        // http_request_sync 返回的响应体被包裹在 {"status_code":..., "headers":..., "body":"..."} 中，
+        // 需要先提取 body 字段才能传给 HbbHttpResponse::parse。body 本身是 JSON 字符串。
+        let inner_body: String = serde_json::from_str(&resp)
+            .ok()
+            .and_then(|v: serde_json::Value| v.get("body").and_then(|b| b.as_str().map(|s| s.to_owned())))
+            .unwrap_or(resp);
+        HbbHttpResponse::parse(&inner_body)
     }
 
     fn reset(&mut self) {

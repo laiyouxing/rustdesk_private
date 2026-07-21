@@ -21,7 +21,7 @@ use hbb_common::{
     protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
-    socket_client::{self, connect_tcp, is_ipv4, new_direct_udp_for, new_udp_for},
+    socket_client::{self, connect_tcp, is_ipv4, new_udp_for},
     timeout,
     tokio::{self, select, sync::Mutex, time::interval},
     udp::FramedSocket,
@@ -40,7 +40,7 @@ lazy_static::lazy_static! {
     // (encoded_socket_addr_bytes, decoded_addr, timestamp)
     // Using encoded bytes + decoded addr as key to prevent false dedup
     // when different peers happen to have the same decoded addr (extremely rare).
-    static ref LAST_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    static ref LAST_INTRANET_MSG: Mutex<(Vec<u8>, SocketAddr, Instant)> = Mutex::new((Vec::new(), SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -74,6 +74,81 @@ impl RendezvousMediator {
         if crate::platform::is_installed() && crate::is_server() {
             crate::updater::start_auto_update();
         }
+        // 预启动 CM（完整UI模式），提前加载 Flutter 引擎
+        // 引擎常驻内存，连接进来时立即弹窗，无需等待加载
+        // 同时拉起右下角 tray 图标（原在 start_ipc 中触发，现提前启动）
+        #[cfg(windows)]
+        if crate::is_server() && !config::is_outgoing_only() {
+            std::thread::spawn(move || {
+                if !crate::check_process("--cm", false) {
+                    log::info!("Pre-starting CM");
+                    if crate::platform::is_root() {
+                        let _ = crate::platform::run_as_user(vec!["--cm"]);
+                    } else {
+                        let _ = crate::run_me(vec!["--cm"]);
+                    }
+                }
+                // 同时拉起 tray 图标
+                if !crate::check_process("--tray", false) {
+                    if crate::platform::is_root() {
+                        let _ = crate::platform::run_as_user(vec!["--tray"]);
+                    } else {
+                        let _ = crate::run_me(vec!["--tray"]);
+                    }
+                }
+            });
+        }
+        // Sync health check: if hbbs_http sync doesn't connect within 10s,
+        // API connection guard — continuously monitors sync API health and
+        // attempts recovery when the background sync's HTTP client cannot
+        // connect to the API server (e.g. update completed but API not reachable
+        // due to different TLS/HTTP initialization path from the GUI process).
+        //
+        // The guard runs every 5s, and triggers CM window popup every 30s as
+        // a recovery fallback. This is necessary because the Flutter GUI process
+        // has a different HTTP client initialization path that often succeeds
+        // where the background sync's `reqwest`/`ureq` client chain fails.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        tokio::spawn(async move {
+            let check_interval = Duration::from_secs(5);
+            let cm_fallback_interval = Duration::from_secs(30);
+            // Warmup: give the sync thread time to connect normally
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut last_cm = Instant::now() - cm_fallback_interval;
+            loop {
+                tokio::time::sleep(check_interval).await;
+                if crate::hbbs_http::sync::is_pro() {
+                    // API is connected and healthy, reset fallback timer
+                    last_cm = Instant::now();
+                    continue;
+                }
+                if !crate::is_server() {
+                    continue;
+                }
+                log::debug!("API guard: sync API still not connected");
+                if last_cm.elapsed() >= cm_fallback_interval {
+                    log::warn!(
+                        "API guard: sync API not connected for >{}s, popping CM window as fallback",
+                        cm_fallback_interval.as_secs()
+                    );
+                    last_cm = Instant::now();
+                    #[cfg(windows)]
+                    {
+                        crate::platform::windows::send_message_to_hnwd(
+                            crate::platform::windows::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
+                            "RustDesk",
+                            0,
+                            "",
+                            true,
+                        );
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = crate::run_me(vec!["--cm"]);
+                    }
+                }
+            }
+        });
         check_zombie();
         // Ensure the Windows service (rustdesk.exe --service) is running on startup.
         // Clear stale stop-service flag (left over from update uninstall) so that
@@ -567,7 +642,7 @@ impl RendezvousMediator {
 
     async fn handle_intranet(&self, fla: FetchLocalAddr, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&fla.socket_addr);
-        let mut last = LAST_MSG.lock().await;
+        let mut last = LAST_INTRANET_MSG.lock().await;
         // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
         if last.0 == fla.socket_addr.as_ref() && last.1 == addr && last.2.elapsed().as_millis() < 100 {
             return Ok(());
@@ -674,198 +749,6 @@ impl RendezvousMediator {
             )
             .await?;
         }
-        Ok(())
-    }
-
-    async fn handle_punch_hole(&self, ph: PunchHole, server: ServerPtr) -> ResultType<()> {
-        // Verify the connecting peer is also running our custom fork.
-        let expected_tag = crate::common::CUSTOM_TAG.as_bytes();
-        if ph.custom_tag.as_ref() != expected_tag {
-            log::warn!(
-                "Rejecting punch hole from {:?}: custom_tag mismatch (got {:?}, expected {:?})",
-                AddrMangle::decode(&ph.socket_addr),
-                String::from_utf8_lossy(ph.custom_tag.as_ref()),
-                crate::common::CUSTOM_TAG,
-            );
-            return Ok(());
-        }
-        let mut peer_addr = AddrMangle::decode(&ph.socket_addr);
-        let mut last = LAST_MSG.lock().await;
-        // skip duplicate punch hole messages (encoded bytes + decoded addr as composite key)
-        if last.0 == ph.socket_addr.as_ref() && last.1 == peer_addr && last.2.elapsed().as_millis() < 100 {
-            return Ok(());
-        }
-        *last = (ph.socket_addr.to_vec(), peer_addr, Instant::now());
-        drop(last);
-        let peer_addr_v6 = hbb_common::AddrMangle::decode(&ph.socket_addr_v6);
-        let relay = use_ws() || Config::is_proxy() || ph.force_relay;
-        let mut socket_addr_v6 = Default::default();
-        let control_permissions = ph.control_permissions.into_option();
-
-        // Host-side: always start background punching when receiving punch hole
-        // so that both sides punch simultaneously, enabling NAT traversal
-        // host_peer_addr: target connector's public address. Note that PunchHole.socket_addr
-        // carries the connector's TCP address (port), so we must override the port with
-        // ph.udp_port (connector's UDP port) to reach the connector's UDP socket.
-        // Host does NOT need to bind a specific local port — its NAT will allocate
-        // an external port. The earlier code mistakenly used ph.udp_port (connector's
-        // port) as host's bind port, which is wrong.
-        //
-        // Asymmetric: connector uses KcpStream::connect (in relay_upgrade_task),
-        // host uses KcpStream::accept here. Both first send empty packets to
-        // establish NAT mappings, but only the host LISTENS for KCP.
-        {
-            let host_peer_addr = if ph.udp_port > 0 {
-                let mut addr = peer_addr;
-                addr.set_port(ph.udp_port as u16);
-                addr
-            } else {
-                peer_addr
-            };
-            let host_server = server.clone();
-            let host_cp = control_permissions.clone();
-            tokio::spawn(async move {
-                for _round in 0..5 {
-                    // Bind to any free local port; NAT will assign external port.
-                    let bind_addr = SocketAddr::from(([0u8; 4], 0u16));
-                    let socket = match hbb_common::tokio::net::UdpSocket::bind(bind_addr).await {
-                        Ok(s) => Arc::new(s),
-                        Err(_) => {
-                            sleep(2.0).await;
-                            continue;
-                        }
-                    };
-                    if socket.connect(host_peer_addr).await.is_err() {
-                        sleep(2.0).await;
-                        continue;
-                    }
-                    // Send empty packet to establish our NAT mapping for the
-                    // connector's address, then listen for KCP handshake.
-                    if let Ok(Some(data)) =
-                        crate::common::punch_udp(socket.clone(), true).await
-                    {
-                        log::info!("Host-side punching succeeded! Setting up KCP accept...");
-                        if let Ok((_kcp, stream)) = crate::kcp_stream::KcpStream::accept(
-                            socket.clone(),
-                            Duration::from_millis(CONNECT_TIMEOUT as _),
-                            Some(data),
-                        )
-                        .await
-                        {
-                            let _ = crate::server::create_tcp_connection(
-                                host_server.clone(),
-                                stream,
-                                host_peer_addr,
-                                true,
-                                host_cp.clone(),
-                                false,
-                            )
-                            .await;
-                        }
-                        return;
-                    }
-                    let delay = std::cmp::min(30, 2 + _round * 2) as u64;
-                    sleep(delay as f32).await;
-                }
-                log::info!("Host-side punching finished without success");
-            });
-        }
-
-        if peer_addr_v6.port() > 0 && !relay {
-            socket_addr_v6 = start_ipv6(
-                peer_addr_v6,
-                peer_addr,
-                server.clone(),
-                control_permissions.clone(),
-            )
-            .await;
-        }
-        let relay_server = self.get_relay_server(ph.relay_server);
-        // for ensure, websocket go relay directly
-        if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
-            || Config::get_nat_type() == NatType::SYMMETRIC as i32
-            || relay
-            || (config::is_disable_tcp_listen() && ph.udp_port <= 0)
-        {
-            let uuid = Uuid::new_v4().to_string();
-            return self
-                .create_relay(
-                    ph.socket_addr.into(),
-                    relay_server,
-                    uuid,
-                    server,
-                    true,
-                    true,
-                    socket_addr_v6.clone(),
-                    control_permissions,
-                )
-                .await;
-        }
-        use hbb_common::protobuf::Enum;
-        let nat_type = NatType::from_i32(Config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
-        let msg_punch = PunchHoleSent {
-            socket_addr: ph.socket_addr,
-            id: Config::get_id(),
-            relay_server,
-            nat_type: nat_type.into(),
-            version: crate::VERSION.to_owned(),
-            upnp_port: crate::common::get_upnp_port() as _,
-            socket_addr_v6,
-            ..Default::default()
-        };
-        if ph.udp_port > 0 {
-            peer_addr.set_port(ph.udp_port as u16);
-            self.punch_udp_hole(peer_addr, server, msg_punch, control_permissions)
-                .await?;
-            return Ok(());
-        }
-        log::debug!("Punch tcp hole to {:?}", peer_addr);
-        let mut socket = {
-            let socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
-            let local_addr = socket.local_addr();
-            // key important here for punch hole to tell my gateway incoming peer is safe.
-            // it can not be async here, because local_addr can not be reused, we must close the connection before use it again.
-            // TCP simultaneous open: 2s timeout gives the peer's SYN time to cross with ours
-            allow_err!(socket_client::connect_tcp_local(peer_addr, Some(local_addr), 2000).await);
-            socket
-        };
-        let mut msg_out = Message::new();
-        msg_out.set_punch_hole_sent(msg_punch);
-        let bytes = msg_out.write_to_bytes()?;
-        socket.send_raw(bytes).await?;
-        crate::accept_connection(server.clone(), socket, peer_addr, true, control_permissions)
-            .await;
-        Ok(())
-    }
-
-    async fn punch_udp_hole(
-        &self,
-        peer_addr: SocketAddr,
-        server: ServerPtr,
-        msg_punch: PunchHoleSent,
-        control_permissions: Option<ControlPermissions>,
-    ) -> ResultType<()> {
-        let mut msg_out = Message::new();
-        msg_out.set_punch_hole_sent(msg_punch);
-        let (socket, addr) = new_direct_udp_for(&self.host).await?;
-        let data = msg_out.write_to_bytes()?;
-        socket.send_to(&data, addr).await?;
-        let socket_cloned = socket.clone();
-        tokio::spawn(async move {
-            for _ in 0..2 {
-                let tm = (hbb_common::time_based_rand() % 20 + 10) as f32 / 1000.;
-                hbb_common::sleep(tm).await;
-                socket.send_to(&data, addr).await.ok();
-            }
-        });
-        udp_nat_listen(
-            socket_cloned.clone(),
-            peer_addr,
-            peer_addr,
-            server,
-            control_permissions,
-        )
-        .await?;
         Ok(())
     }
 

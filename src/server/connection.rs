@@ -327,6 +327,26 @@ pub struct Connection {
     // Phase 3 relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>>>,
     punch_notify: Option<Arc<hbb_common::tokio::sync::Notify>>,
+    // Persistent UDP socket shared between STUN query and hole punching.
+    // Using the same socket ensures the NAT mapping is consistent, so the
+    // STUN-discovered address is valid for subsequent punch attempts.
+    punch_socket: Option<Arc<tokio::net::UdpSocket>>,
+    // Phase 3: keep the punched KCP stream alive for the whole session.
+    // The punch task stores the KcpStream here; without this it would be
+    // dropped (and its kcp_io pump stopped) when the task exits.
+    phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
+    // Phase 3: queue of peer addresses for the single punch task to drain.
+    phase3_targets: Option<Arc<hbb_common::tokio::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Phase 3: whether the single punch task has been spawned.
+    phase3_started: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Phase 3: whether the stream has already been switched to direct.
+    phase3_upgraded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Phase 3: TCP listener for simultaneous open, bound at setup time and
+    // kept alive with the connection so the punch task can accept on it.
+    phase3_tcp_listener: Option<Arc<tokio::net::TcpListener>>,
+    // Phase 3: handle of the single punch task, aborted on connection close
+    // to avoid leaking the task (180s budget) across reconnections.
+    phase3_task: Option<hbb_common::tokio::task::JoinHandle<()>>,
 }
 
 impl ConnInner {
@@ -508,6 +528,13 @@ impl Connection {
             terminal_generic_service: None,
             punch_stream: None,
             punch_notify: None,
+            punch_socket: None,
+            phase3_kcp: None,
+            phase3_targets: Some(Arc::new(hbb_common::tokio::sync::Mutex::new(Vec::new()))),
+            phase3_started: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            phase3_upgraded: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            phase3_tcp_listener: None,
+            phase3_task: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -588,27 +615,44 @@ impl Connection {
         let punch_notify = Arc::new(hbb_common::tokio::sync::Notify::new());
         let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>> =
             Arc::new(hbb_common::tokio::sync::Mutex::new(None));
-        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(1);
+        // Buffer 16 — host Phase3 may send up to 3 addresses (STUN, TCP, IPv6).
+        // Capacity 1 risked blocking .send() if io_loop is temporarily busy; 16
+        // provides safe headroom and aligns with the connector-side channel.
+        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(16);
         conn.punch_stream = Some(punch_stream.clone());
         conn.punch_notify = Some(punch_notify.clone());
         // Phase3 (Host-side): discover our public address via STUN and send it
         // to the peer so both sides can punch through NAT concurrently.
         // Run for ALL connections (relay + direct punch), not just relay,
         // because the host also needs to exchange its public address.
+        //
+        // Create a persistent UDP socket that is shared between the STUN query
+        // and subsequent hole punching. This ensures the NAT mapping discovered
+        // by STUN is valid for punch attempts (same source socket → same
+        // external port).
         {
             let phase3_tx = phase3_out_tx;
             let tx_to_cm = conn.tx_to_cm.clone();
+            // Create persistent socket before spawn so both STUN and punch share it
+            let punch_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => Some(Arc::new(s)),
+                Err(_) => None,
+            };
+            conn.punch_socket = punch_socket.clone();
+            // TCP listener 在 spawn 前创建并随 Connection 存活（spawn 结束不 drop），
+            // spawn 内只广播端口，打洞任务之后在这个 listener 上 accept
+            let phase3_tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+                .await
+                .ok()
+                .map(Arc::new);
+            let tcp_port = phase3_tcp_listener.as_ref()
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port());
+            conn.phase3_tcp_listener = phase3_tcp_listener;
             tokio::spawn(async move {
-                // 0. Create TCP listener for TCP simultaneous open before STUN
-                // so we can exchange the TCP port alongside the STUN address.
-                let tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
-                let tcp_port = tcp_listener.as_ref()
-                    .and_then(|l| l.local_addr().ok())
-                    .map(|a| a.port());
-                // 1. STUN to discover our public IPv4 address
-                if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                    let socket = Arc::new(socket);
-                    match crate::common::stun_query_with_socket(&socket).await {
+                // 1. STUN to discover our public IPv4 address using the persistent socket
+                if let Some(ref socket) = punch_socket {
+                    match crate::common::stun_query_with_socket(socket).await {
                         Ok((stun_addr, _)) => {
                             log::info!("Phase3(Host): our public address via STUN: {}", stun_addr);
                             let nat = if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
@@ -803,6 +847,7 @@ impl Connection {
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
+                            log::info!("[文件传输] CM返回数据转发到客户端, bytes_len={}", bytes.len());
                             allow_err!(conn.stream.send_raw(bytes).await);
                         }
                         #[cfg(target_os = "windows")]
@@ -940,14 +985,24 @@ impl Connection {
                 _ = punch_notify.notified() => {
                     let mut guard = punch_stream.lock().await;
                     if let Some(new_stream) = guard.take() {
-                        let saved_key = conn.stream.take_key();
-                        log::info!("Phase3(Host): Relay upgraded to direct connection!");
-                        conn.stream = new_stream;
-                        if let Some(enc) = saved_key {
-                            conn.stream.set_encrypt(enc);
-                            log::info!("Phase3(Host): encryption key transferred to new stream");
+                        // 防二次换流：已升级过则丢弃新流
+                        let already_upgraded = conn.phase3_upgraded.as_ref()
+                            .map_or(false, |u| u.swap(true, std::sync::atomic::Ordering::SeqCst));
+                        if already_upgraded {
+                            log::info!("Phase3(Host): already upgraded, drop duplicate stream");
                         } else {
-                            log::warn!("Phase3(Host): no encryption key from old stream!");
+                            let saved_key = conn.stream.take_key();
+                            log::info!("Phase3(Host): Relay upgraded to direct connection!");
+                            conn.stream = new_stream;
+                            if let Some(enc) = saved_key {
+                                // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
+                                // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
+                                // 两侧都在换流时刻归零，新流上序号自洽
+                                conn.stream.set_key(enc.0);
+                                log::info!("Phase3(Host): encryption key transferred to new stream (seq reset)");
+                            } else {
+                                log::warn!("Phase3(Host): no encryption key from old stream!");
+                            }
                         }
                     }
                 },
@@ -1344,7 +1399,7 @@ impl Connection {
 
     async fn check_privacy_mode_on(&mut self) -> bool {
         if privacy_mode::is_in_privacy_mode() {
-            self.send_login_error("Someone turns on privacy mode, exit")
+            self.send_login_error("对方开启了隐私模式，已断开连接")
                 .await;
             false
         } else {
@@ -1370,7 +1425,7 @@ impl Connection {
                 .next()
                 .is_none()
         {
-            self.send_login_error("Your ip is blocked by the peer")
+            self.send_login_error("你的IP已被对端屏蔽")
                 .await;
             Self::post_alarm_audit(
                 AlarmAuditType::IpWhitelist, //"ip whitelist",
@@ -1389,7 +1444,7 @@ impl Connection {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if crate::is_server() && Config::get_option("allow-only-conn-window-open") == "Y" {
             if !crate::check_process("", !crate::platform::is_root()) {
-                self.send_login_error("The main window is not open").await;
+                self.send_login_error("主窗口未打开").await;
                 return false;
             }
         }
@@ -1540,7 +1595,7 @@ impl Connection {
                     addr = "RDP".to_owned();
                 }
                 self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
+                    "无法访问远程{}. 请确保该服务可达/已打开。",
                     addr
                 ))
                 .await;
@@ -1552,7 +1607,7 @@ impl Connection {
                     addr = "RDP".to_owned();
                 }
                 self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
+                    "无法访问远程{}. 请确保该服务可达/已打开。",
                     addr
                 ))
                 .await;
@@ -1881,8 +1936,10 @@ impl Connection {
                 ""
             };
             if !wait_session_id_confirm {
+                log::info!("[文件传输] 立即发送 ReadDir 到 CM: dir={}", dir);
                 self.read_dir(dir, show_hidden);
             } else {
+                log::info!("[文件传输] 延迟 ReadDir (等待session确认): dir={}, show_hidden={}", dir, show_hidden);
                 self.delayed_read_dir = Some((dir.to_owned(), show_hidden));
             }
         } else if self.terminal {
@@ -2282,9 +2339,11 @@ impl Connection {
             .map(|s| s.to_owned());
         // last_recv_time is a mutex variable shared with connection, can be updated lively.
         if let Some(session) = session {
-            if !self.lr.password.is_empty()
-                && (tfa && session.tfa
-                    || !tfa && self.validate_password_plain(&session.random_password))
+            // 密码为空（Click 模式）：仅凭 session_key（peer_id+name+session_id）匹配即可放行
+            // 密码非空：还需校验密码匹配，确保密码认证场景安全
+            if self.lr.password.is_empty()
+                || tfa && session.tfa
+                || !tfa && self.validate_password_plain(&session.random_password)
             {
                 log::info!("is recent session");
                 return true;
@@ -2434,27 +2493,54 @@ impl Connection {
                 if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
                 {
                     log::info!("Phase3(Host): received peer address: {}", peer_addr);
-                    let punch_stream = self.punch_stream.clone();
-                    let punch_notify = self.punch_notify.clone();
-                    let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
-                        Arc::new(std::sync::Mutex::new(None));
-                    tokio::spawn(async move {
-                        match relay_phase3_punch_to_peer(peer_addr, kcp_handle).await {
-                            Ok(stream) => {
-                                if let Some(s) = punch_stream {
-                                    let mut guard = s.lock().await;
-                                    *guard = Some(stream);
-                                }
-                                if let Some(n) = punch_notify {
-                                    n.notify_one();
-                                }
-                                log::info!("Phase3(Host): punch succeeded!");
-                            }
-                            Err(e) => {
-                                log::info!("Phase3(Host): punch to {} failed: {:?}", peer_addr, e);
-                            }
+                    // 忽略不可用地址：0.0.0.0 不可打洞，IPv6 与 v4 punch_socket 不匹配
+                    if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
+                        log::info!("Phase3(Host): ignore unusable address {}", peer_addr);
+                    } else if self.phase3_upgraded.as_ref().map_or(false, |u| {
+                        u.load(std::sync::atomic::Ordering::SeqCst)
+                    }) {
+                        log::info!("Phase3(Host): already upgraded, ignore {}", peer_addr);
+                    } else {
+                        // 地址入队，由唯一打洞任务消费（每条消息 spawn 一个任务会
+                        // 共享 socket 互相 connect 覆盖、抢 recv_from）
+                        if let Some(ref targets) = self.phase3_targets {
+                            targets.lock().await.push(peer_addr);
                         }
-                    });
+                        let already_started = self.phase3_started.as_ref().map_or(true, |s| {
+                            s.swap(true, std::sync::atomic::Ordering::SeqCst)
+                        });
+                        if !already_started {
+                            let punch_stream = self.punch_stream.clone();
+                            let punch_notify = self.punch_notify.clone();
+                            let punch_socket = self.punch_socket.clone();
+                            let targets = self.phase3_targets.clone().unwrap();
+                            let upgraded = self.phase3_upgraded.clone().unwrap();
+                            let tcp_listener = self.phase3_tcp_listener.clone();
+                            let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
+                                Arc::new(std::sync::Mutex::new(None));
+                            // KcpStream 随 Connection 存活，避免打洞任务结束后被 drop 停掉 kcp_io
+                            self.phase3_kcp = Some(kcp_handle.clone());
+                            self.phase3_task = Some(tokio::spawn(async move {
+                                match relay_phase3_punch_to_peer(
+                                    targets, kcp_handle, punch_socket, tcp_listener, upgraded,
+                                ).await {
+                                    Ok(stream) => {
+                                        if let Some(s) = punch_stream {
+                                            let mut guard = s.lock().await;
+                                            *guard = Some(stream);
+                                        }
+                                        if let Some(n) = punch_notify {
+                                            n.notify_one();
+                                        }
+                                        log::info!("Phase3(Host): punch succeeded!");
+                                    }
+                                    Err(e) => {
+                                        log::info!("Phase3(Host): punch failed: {:?}", e);
+                                    }
+                                }
+                            }));
+                        }
+                    }
                 }
             }
         }
@@ -2470,16 +2556,18 @@ impl Connection {
                         keys::OPTION_ENABLE_FILE_TRANSFER,
                         &self.control_permissions,
                     ) {
-                        self.send_login_error("No permission of file transfer")
+                        log::info!("[文件传输] 权限被拒绝");
+                        self.send_login_error("没有文件传输权限")
                             .await;
                         sleep(1.).await;
                         return false;
                     }
+                    log::info!("[文件传输] 登录请求接收: dir={:?}, show_hidden={}", &ft.dir, ft.show_hidden);
                     self.file_transfer = Some((ft.dir, ft.show_hidden));
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
                     if !Self::permission(keys::OPTION_ENABLE_CAMERA, &self.control_permissions) {
-                        self.send_login_error("No permission of viewing camera")
+                        self.send_login_error("没有摄像头查看权限")
                             .await;
                         sleep(1.).await;
                         return false;
@@ -2488,13 +2576,13 @@ impl Connection {
                 }
                 Some(login_request::Union::Terminal(terminal)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
-                        self.send_login_error("No permission of terminal").await;
+                        self.send_login_error("没有终端权限").await;
                         sleep(1.).await;
                         return false;
                     }
                     #[cfg(target_os = "windows")]
                     if !lr.os_login.username.is_empty() && !crate::platform::is_installed() {
-                        self.send_login_error("Supported only in the installed version.")
+                        self.send_login_error("仅支持已安装版本.")
                             .await;
                         sleep(1.).await;
                         return false;
@@ -2536,7 +2624,7 @@ impl Connection {
                 }
                 Some(login_request::Union::PortForward(mut pf)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TUNNEL, &self.control_permissions) {
-                        self.send_login_error("No permission of IP tunneling").await;
+                        self.send_login_error("没有IP隧道权限").await;
                         sleep(1.).await;
                         return false;
                     }
@@ -2598,6 +2686,17 @@ impl Connection {
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;
                 return false;
+            } else if self.is_recent_session(false) {
+                if err_msg.is_empty() {
+                    #[cfg(target_os = "linux")]
+                    self.linux_headless_handle.wait_desktop_cm_ready().await;
+                    if !self.send_logon_response_and_keep_alive().await {
+                        return false;
+                    }
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                } else {
+                    self.send_login_error(err_msg).await;
+                }
             } else if (password::approve_mode() == ApproveMode::Click
                 && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
@@ -2610,17 +2709,6 @@ impl Connection {
                         .await;
                 }
                 return true;
-            } else if self.is_recent_session(false) {
-                if err_msg.is_empty() {
-                    #[cfg(target_os = "linux")]
-                    self.linux_headless_handle.wait_desktop_cm_ready().await;
-                    if !self.send_logon_response_and_keep_alive().await {
-                        return false;
-                    }
-                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
-                } else {
-                    self.send_login_error(err_msg).await;
-                }
             } else if lr.password.is_empty() {
                 if err_msg.is_empty() {
                     self.try_start_cm(lr.my_id, lr.my_name, false);
@@ -3065,6 +3153,7 @@ impl Connection {
                     if handle_fa {
                         if self.delayed_read_dir.is_some() {
                             if let Some(file_action::Union::ReadDir(rd)) = fa.union {
+                                log::info!("[文件传输] delayed_read_dir还在等待中, 收到新ReadDir (覆盖): path={}", rd.path);
                                 self.delayed_read_dir = Some((rd.path, rd.include_hidden));
                             }
                             return true;
@@ -3097,9 +3186,11 @@ impl Connection {
                         }
                         match fa.union {
                             Some(file_action::Union::ReadEmptyDirs(rd)) => {
+                                log::info!("[文件传输] ReadEmptyDirs 消息接收: path={}", rd.path);
                                 self.read_empty_dirs(&rd.path, rd.include_hidden);
                             }
                             Some(file_action::Union::ReadDir(rd)) => {
+                                log::info!("[文件传输] ReadDir 消息接收: path={}, include_hidden={}", rd.path, rd.include_hidden);
                                 self.read_dir(&rd.path, rd.include_hidden);
                             }
                             Some(file_action::Union::AllFiles(f)) => {
@@ -3135,7 +3226,8 @@ impl Connection {
                                 }
                             }
                             Some(file_action::Union::Send(s)) => {
-                                // server to client
+                                // server to client (下载/接收文件)
+                                log::info!("[文件传输] Send 消息接收: path={}, id={}, file_num={}", s.path, s.id, s.file_num);
                                 let id = s.id;
                                 let path = s.path.clone();
                                 let job_type = JobType::from_proto(s.file_type);
@@ -3203,7 +3295,8 @@ impl Connection {
                                 self.file_transferred = true;
                             }
                             Some(file_action::Union::Receive(r)) => {
-                                // client to server
+                                // client to server (上传/发送文件到被控)
+                                log::info!("[文件传输] Receive 消息接收: path={}, id={}, file_num={}", r.path, r.id, r.file_num);
                                 // note: 1.1.10 introduced identical file detection, which breaks original logic of send/recv files
                                 // whenever got send/recv request, check peer version to ensure old version of rustdesk
                                 let od = can_enable_overwrite_detection(get_version_number(
@@ -3325,6 +3418,7 @@ impl Connection {
                         });
                     }
                     Some(file_response::Union::Done(d)) => {
+                        log::info!("[文件传输] FileResponse::Done 接收: id={}, file_num={}", d.id, d.file_num);
                         self.send_fs(ipc::FS::WriteDone {
                             id: d.id,
                             file_num: d.file_num,
@@ -3339,6 +3433,7 @@ impl Connection {
                         is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
+                        log::info!("[文件传输] FileResponse::Error 接收: id={}, file_num={}, err={}", e.id, e.file_num, e.error);
                         self.send_fs(ipc::FS::WriteError {
                             id: e.id,
                             file_num: e.file_num,
@@ -3490,6 +3585,7 @@ impl Connection {
                             }
                             if self.file_transfer.is_some() {
                                 if let Some((dir, show_hidden)) = self.delayed_read_dir.take() {
+                                    log::info!("[文件传输] session确认后执行延迟的ReadDir: dir={}, show_hidden={}", dir, show_hidden);
                                     self.read_dir(&dir, show_hidden);
                                 }
                             } else if self.view_camera {
@@ -3745,7 +3841,7 @@ impl Connection {
 
         if failure_prefix.2 > thresh {
             self.send_login_error(format!(
-                "Too many wrong attempts for IPv6 prefix /{}",
+                "IPv6前缀/{}尝试次数过多",
                 prefix_num
             ))
             .await;
@@ -3788,7 +3884,7 @@ impl Connection {
             .unwrap_or((0, 0, 0));
 
         let res = if failure.2 > 30 {
-            self.send_login_error("Too many wrong attempts").await;
+            self.send_login_error("尝试次数过多").await;
             Self::post_alarm_audit(
                 AlarmAuditType::ExceedThirtyAttempts,
                 json!({
@@ -3799,7 +3895,7 @@ impl Connection {
             );
             false
         } else if time == failure.0 && failure.1 > 6 {
-            self.send_login_error("Please try 1 minute later").await;
+            self.send_login_error("请1分钟后再试").await;
             Self::post_alarm_audit(
                 AlarmAuditType::SixAttemptsWithinOneMinute,
                 json!({
@@ -4498,6 +4594,10 @@ impl Connection {
         let data = ipc::Data::Close;
         self.tx_to_cm.send(data).ok();
         self.port_forward_socket.take();
+        // 连接关闭时终止仍在运行的 Phase3 打洞任务，避免任务泄漏
+        if let Some(t) = self.phase3_task.take() {
+            t.abort();
+        }
     }
 
     // The `reason` should be consistent with `check_if_retry` if not empty
@@ -4521,6 +4621,7 @@ impl Connection {
         _include_hidden: bool,
         result: Result<Vec<u8>, String>,
     ) {
+        log::info!("[文件传输] handle_read_job_init_result: id={}, result_is_ok={}", id, result.is_ok());
         // Check if this response is still expected (not stale/cancelled)
         if !self.cm_read_job_ids.contains(&id) {
             log::warn!(
@@ -4728,6 +4829,7 @@ impl Connection {
     }
 
     fn read_empty_dirs(&mut self, dir: &str, include_hidden: bool) {
+        log::info!("[文件传输] read_empty_dirs 发送到CM: dir={}, include_hidden={}", dir, include_hidden);
         let dir = dir.to_string();
         self.send_fs(ipc::FS::ReadEmptyDirs {
             dir,
@@ -4736,6 +4838,7 @@ impl Connection {
     }
 
     fn read_dir(&mut self, dir: &str, include_hidden: bool) {
+        log::info!("[文件传输] ReadDir 发送到 CM: dir={}, include_hidden={}", dir, include_hidden);
         let dir = dir.to_string();
         self.send_fs(ipc::FS::ReadDir {
             dir,
@@ -5196,15 +5299,24 @@ async fn start_ipc(
                 .unwrap()
                 .push(crate::run_me(args)?);
         }
-        for _ in 0..20 {
-            sleep(0.3).await;
-            if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
+        loop {
+            sleep(1.).await;
+            if let Ok(s) = crate::ipc::connect(2000, "_cm").await {
                 stream = Some(s);
                 break;
             }
-        }
-        if stream.is_none() {
-            bail!("Failed to connect to connection manager");
+            // CM 可能因系统延迟/杀软/防病毒未就绪，持续重试，不 bail。
+            // 否则 start_cm_ipc_para 被消费后连接再无 CM 服务，弹窗永远出不来。
+            if stream.is_none() {
+                log::info!("Waiting for cm ...");
+            }
+            // CM 进程已退出（崩溃/被杀/窗口关闭），重新启动
+            if !crate::check_process("--cm", false) {
+                log::info!("CM process not found, restarting...");
+                if let Ok(task) = crate::run_me(vec!["--cm"]) {
+                    super::CHILD_PROCESS.lock().unwrap().push(task);
+                }
+            }
         }
     }
 
@@ -5761,31 +5873,10 @@ mod raii {
         }
 
         pub fn check_remove_session(conn_id: i32, key: SessionKey) {
-            let mut lock = SESSIONS.lock().unwrap();
-            let contains = lock.contains_key(&key);
-            if contains {
-                // No two remote connections with the same session key, just for ensure.
-                let is_remote = AUTHED_CONNS
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|c| c.conn_id == conn_id && c.conn_type == AuthConnType::Remote);
-                // If there are 2 connections with the same peer_id and session_id, a remote connection and a file transfer or port forward connection,
-                // If any of the connections is closed allowing retry, this will not be called;
-                // If the file transfer/port forward connection is closed with no retry, the session should be kept for remote control menu action;
-                // If the remote connection is closed with no retry, keep the session is not reasonable in case there is a retry button in the remote side, and ignore network fluctuations.
-                let another_remote = AUTHED_CONNS.lock().unwrap().iter().any(|c| {
-                    c.conn_id != conn_id
-                        && c.session_key == key
-                        && c.conn_type == AuthConnType::Remote
-                });
-                if is_remote || !another_remote {
-                    lock.remove(&key);
-                    log::info!("remove session");
-                } else {
-                    // Keep the session if there is another remote connection with same peer_id and session_id.
-                    log::info!("skip remove session");
-                }
+            // 不主动删除 session：让 SESSION_TIMEOUT(30s) 在 is_recent_session 的 retain 中统一清理。
+            // 这样授权成功后断开连接的 30s 内重连，可用最近会话免认证直接连接。
+            if SESSIONS.lock().unwrap().contains_key(&key) {
+                log::info!("check_remove_session: keep session for 30s timeout");
             }
         }
 
@@ -5904,6 +5995,17 @@ mod raii {
             }
         }
     }
+}
+
+/// Number of currently authorized *remote desktop* connections (real-time).
+/// Used by the UPnP renew task to decide whether to keep the port mapping alive.
+pub fn active_remote_conn_count() -> usize {
+    AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| matches!(c.conn_type, AuthConnType::Remote))
+        .count()
 }
 
 mod test {

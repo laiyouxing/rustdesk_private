@@ -1,6 +1,9 @@
 name: Build the flutter version of the RustDesk
 
 on:
+  push:
+    tags:
+      - '*'
   workflow_call:
     inputs:
       upload-artifact:
@@ -62,6 +65,7 @@ on:
 # in this file!
 
 env:
+  TZ: Asia/Shanghai
   SCITER_RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503, also 1.78 has ABI change which causes our sciter version not working, https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
   RUST_VERSION: "1.75" # sciter failed on m1 with 1.78 because of https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
   MAC_RUST_VERSION: "1.81" # 1.81 is requred for macos, because of https://github.com/yury/cidre requires 1.81
@@ -83,8 +87,8 @@ env:
   # 2. Update the `VCPKG_COMMIT_ID` in `ci.yml` and `playground.yml`.
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836" # 2025.01.13, got "/opt/artifacts/vcpkg/vcpkg: No such file or directory" with latest version
-  VERSION: ${{ (inputs.upload-tag != 'nightly') && inputs.upload-tag || '1.4.8.1' }}
-  BUILD_VERSION: ${{ (inputs.upload-tag != 'nightly') && inputs.upload-tag || '1.4.8.1' }}
+  VERSION: ${{ (github.event_name == 'push') && github.ref_name || (inputs.upload-tag != 'nightly') && inputs.upload-tag || '1.5.4' }}
+  BUILD_VERSION: ${{ (github.event_name == 'push') && github.ref_name || (inputs.upload-tag != 'nightly') && inputs.upload-tag || '1.5.4' }}
   NDK_VERSION: "r28c"
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
@@ -619,13 +623,6 @@ jobs:
       matrix:
         job:
           - {
-              target: x86_64-apple-darwin,
-              os: macos-15-intel, #macos-latest or macos-14 use M1 now, https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#:~:text=14%20GB-,macos%2Dlatest%20or%20macos%2D14,-The%20macos%2Dlatestlabel
-              extra-build-args: "",
-              arch: x86_64,
-              vcpkg-triplet: x64-osx,
-            }
-          - {
               target: aarch64-apple-darwin,
               os: macos-14,
               # extra-build-args: "--disable-flutter-texture-render", # disable this for mac, because we see a lot of users reporting flickering both on arm and x64, and we can not confirm if texture rendering has better performance if htere is no vram, https://github.com/rustdesk/rustdesk/issues/6296
@@ -842,17 +839,12 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ inputs.upload-artifact }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@master
-        with:
-          name: rustdesk-unsigned-macos-x86_64
-          path: ./
-
       - name: Download Artifacts
         uses: actions/download-artifact@master
         with:
           name: rustdesk-unsigned-macos-aarch64
           path: ./
+
 
       - name: Download Artifacts
         uses: actions/download-artifact@master
@@ -1083,6 +1075,10 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
           # temporary use debug sign config
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          # Override flutter version to match BUILD_VERSION (same as Windows/Linux via build.py)
+          flutter_ver=$(echo "${{ env.VERSION }}" | cut -d. -f1-3)
+          sed -i "s/^version:.*/version: ${flutter_ver}+64/" flutter/pubspec.yaml
+          echo "Overrode flutter version to ${flutter_ver}+64"
           case ${{ matrix.job.target }} in
             aarch64-linux-android)
               mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
@@ -1380,7 +1376,7 @@ jobs:
               arch: aarch64,
               target: aarch64-unknown-linux-gnu,
               distro: ubuntu18.04,
-              on: ubuntu-22.04-arm,
+              on: ubuntu-24.04-arm,
               deb_arch: arm64,
               vcpkg-triplet: arm64-linux,
             }
@@ -1720,7 +1716,7 @@ jobs:
           - {
               arch: armv7,
               target: armv7-unknown-linux-gnueabihf,
-              on: ubuntu-22.04-arm,
+              on: ubuntu-24.04-arm,
               distro: ubuntu18.04-rustdesk,
               deb_arch: armhf,
               sciter_arch: arm32,
@@ -2011,7 +2007,7 @@ jobs:
               target: aarch64-unknown-linux-gnu,
               # try out newer flatpak since error of "error: Nothing matches org.freedesktop.Platform in remote flathub"
               distro: ubuntu22.04,
-              on: ubuntu-22.04-arm,
+              on: ubuntu-24.04-arm,
               arch: aarch64,
               suffix: "",
             }

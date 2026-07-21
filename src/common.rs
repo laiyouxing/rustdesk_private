@@ -68,43 +68,36 @@ pub static PUBLIC_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String:
 /// this custom fork (not stock RustDesk).  Set in PunchHoleRequest.custom_tag.
 pub const CUSTOM_TAG: &str = "rustdesk-custom";
 
-/// Timestamp of the last Phase3 punch failure.
-/// Used to skip Phase3 on reconnection if it recently failed.
-static LAST_PHASE3_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
+/// Phase3 punch failure retry counter.
+/// Up to 3 retries are allowed with exponential backoff (via auto-reconnect).
+static PHASE3_RETRY_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+const PHASE3_MAX_RETRIES: u32 = 3;
 
-/// Record that Phase3 succeeded, clearing any previous failure record.
+/// Record that Phase3 succeeded, clearing the retry counter.
 /// On subsequent reconnections, Phase3 will be attempted again.
 pub fn record_phase3_success() {
-    if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
-        guard.take();
-    }
+    PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Record that Phase3 failed. On subsequent reconnections,
-/// Phase3 will be skipped (stay on relay) to avoid repeated failure.
-/// Reset only on app restart or when Phase3 succeeds again.
+/// Record that Phase3 failed. Increments retry counter; after
+/// PHASE3_MAX_RETRIES failures, Phase3 is permanently skipped until
+/// user actively disconnects (reset) or Phase3 succeeds.
 pub fn record_phase3_failure() {
-    if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
-        *guard = Some(std::time::Instant::now());
-    }
+    PHASE3_RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Returns true if Phase3 should be skipped (failed on a previous attempt).
+/// Returns true if Phase3 should be skipped.
+/// Allows up to PHASE3_MAX_RETRIES attempts; auto-reconnect exponential
+/// backoff provides natural spacing between retries (1s→1.5s→2.3s→…).
 pub fn should_skip_phase3() -> bool {
-    if let Ok(guard) = LAST_PHASE3_FAIL_AT.lock() {
-        guard.is_some()
-    } else {
-        false
-    }
+    PHASE3_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= PHASE3_MAX_RETRIES
 }
 
 /// Reset Phase3 state so the next connection will try punching again.
 /// Called when the user explicitly closes the connection.
 pub fn reset_phase3_state() {
-    if let Ok(mut guard) = LAST_PHASE3_FAIL_AT.lock() {
-        guard.take();
-    }
+    PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
@@ -173,6 +166,9 @@ impl Drop for SimpleCallOnReturn {
 static UPNP_MAPPING: std::sync::Mutex<Option<crate::upnp::UpnpMapping>> =
     std::sync::Mutex::new(None);
 
+/// Local port reserved for the UPnP mapping (set at startup, read by the renew task).
+pub static UPNP_LOCAL_PORT: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
+
 /// Reservation socket that keeps the UPnP local port occupied until Phase3 uses it.
 /// Prevents TOCTOU race: port is reserved between UPnP discovery and socket creation.
 static UPNP_RESERVATION: std::sync::Mutex<Option<std::net::UdpSocket>> =
@@ -218,9 +214,11 @@ pub fn global_init() -> bool {
                     if let Ok(mut rguard) = UPNP_RESERVATION.lock() {
                         *rguard = Some(reservation);
                     }
+                    *UPNP_LOCAL_PORT.lock().unwrap() = Some(local_port);
                     if let Ok(mut guard) = UPNP_MAPPING.lock() {
                         *guard = crate::upnp::try_add_port_mapping_with_port(local_port);
                     }
+                    start_upnp_renew_task();
                 }
             }
         }
@@ -235,6 +233,48 @@ pub fn global_clean() {
             crate::upnp::try_remove_mapping(mapping.external_port);
         }
     }
+}
+
+/// Background task: keep the UPnP mapping alive only while a remote desktop
+/// connection is active. Renews the lease (and re-probes LAN IP) when in use;
+/// lets the mapping expire when idle; re-maps on LAN IP change.
+fn start_upnp_renew_task() {
+    std::thread::spawn(|| {
+        const RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800); // 30 min, < 1h lease
+        let mut last_lan: Option<std::net::Ipv4Addr> = None;
+        loop {
+            std::thread::sleep(RENEW_INTERVAL);
+            let local_port = match *UPNP_LOCAL_PORT.lock().unwrap() {
+                Some(p) => p,
+                None => break,
+            };
+            let active = crate::server::active_remote_conn_count();
+            let lan = crate::upnp::local_ipv4();
+            if last_lan.is_none() {
+                // 首探仅记录当前 LAN IP，不误判为"IP 变化"导致空闲期误续期
+                last_lan = lan;
+                continue;
+            }
+            let should_remap = match (active > 0, lan != last_lan) {
+                (true, _) => true,       // in use -> renew (also re-probes LAN IP)
+                (false, true) => true,   // idle but LAN IP changed -> re-map so next connect works
+                (false, false) => false, // idle and IP stable -> let lease expire
+            };
+            last_lan = lan;
+            if !should_remap {
+                log::debug!("UPnP: idle, skipping renew (mapping will expire naturally)");
+                continue;
+            }
+            match crate::upnp::try_add_port_mapping_with_port(local_port) {
+                Some(m) => {
+                    let external_port = m.external_port;
+                    *UPNP_MAPPING.lock().unwrap() = Some(m);
+                    log::info!("UPnP: renewed external port {} -> local {}", external_port, local_port);
+                }
+                None => log::warn!("UPnP: renew failed (will retry next cycle)"),
+            }
+        }
+    });
 }
 
 #[inline]
@@ -747,6 +787,22 @@ async fn test_nat_type_() -> ResultType<bool> {
         }
     }
 
+    // Prefer UDP STUN-based NAT detection (reflects actual UDP hole-punch
+    // behavior). Many NATs treat TCP and UDP differently — a device may be
+    // "cone" for TCP but "symmetric" for UDP. The TCP-only detection below
+    // (querying two hbbs ports) is kept as a fallback.
+    //
+    // Only use STUN to confirm SYMMETRIC (high confidence). For ASYMMETRIC /
+    // inconclusive results, fall through to TCP-based detection to avoid
+    // misclassifying due to STUN server unavailability.
+    if let Ok(true) = detect_symmetric_nat().await {
+        Config::set_nat_type(NatType::SYMMETRIC as _);
+        log::info!("Tested nat type: SYMMETRIC (UDP STUN) in {:?}", start.elapsed());
+        return Ok(true);
+    }
+
+    // Fallback: TCP-based NAT detection via hbbs (two different server ports).
+    // This is less reliable for UDP hole-punching but works when UDP is blocked.
     let server1 = Config::get_rendezvous_server();
     let server2 = crate::increase_port(&server1, -1);
     let mut msg_out = RendezvousMessage::new();
@@ -1084,6 +1140,8 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
         "windows"
     } else if cfg!(target_os = "macos") {
         "macos"
+    } else if cfg!(target_os = "android") {
+        "android"
     } else {
         "ubuntu"
     };
@@ -1114,6 +1172,7 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
         if force_update {
             // Force update: auto-download and install without user prompt
             log::info!("Force update to version {} from {}", latest_version, download_url);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
                 // Download using the same HTTP client
                 if let Ok(resp) = client.get(&download_url).send().await {
@@ -2571,16 +2630,26 @@ async fn stun_ipv4_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
     })
 }
 
-static STUNS_V4_DEFAULT: [&str; 3] = [
+static STUNS_V4_DEFAULT: [&str; 8] = [
+    "stun.qq.com:3478",
+    "stun.miwifi.com:3478",
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
     "stun.nextcloud.com:3478",
+    "stun.voipstunt.com:3478",
+    "stun.hot-chilli.net:3478",
+    "stun.fitauto.ru:3478",
 ];
 
-static STUNS_V6: [&str; 3] = [
+static STUNS_V6: [&str; 8] = [
+    "stun.qq.com:3478",
+    "stun.miwifi.com:3478",
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
     "stun.nextcloud.com:3478",
+    "stun.voipstunt.com:3478",
+    "stun.hot-chilli.net:3478",
+    "stun.fitauto.ru:3478",
 ];
 
 /// Returns the list of STUN servers to use for IPv4.
@@ -2949,6 +3018,26 @@ pub async fn stun_query_single_server(
     bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
 }
 
+/// Accept loop for TCP simultaneous open: only accept a connection whose
+/// source IP matches `ip`; discard others and keep accepting. Returns None
+/// on accept error. Meant to be wrapped in an outer timeout by the caller.
+async fn accept_from_ip(
+    listener: &tokio::net::TcpListener,
+    ip: std::net::IpAddr,
+) -> Option<tokio::net::TcpStream> {
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                if addr.ip() == ip {
+                    return Some(stream);
+                }
+                log::debug!("Phase3 TCP: discard connection from unexpected {}", addr);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 
 
 
@@ -2960,6 +3049,7 @@ pub async fn stun_query_single_server(
 /// `phase3_out_tx` so io_loop can forward it to the peer via relay.
 /// Receives peer's Phase 3 addresses through `phase3_peer_rx` and adds
 /// them to the target list, so both sides punch through the same socket.
+/// `cancel` 用于重连/断连时取消本任务：各打洞循环开头检查，已取消则立即退出。
 pub async fn relay_upgrade_task(
     peer_addrs: Vec<SocketAddr>,
     notify: Arc<hbb_common::tokio::sync::Notify>,
@@ -2969,22 +3059,38 @@ pub async fn relay_upgrade_task(
     phase3_out_tx: mpsc::Sender<std::net::SocketAddr>,
     phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
     phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
+    cancel: hbb_common::tokio_util::sync::CancellationToken,
 ) -> bool {
     use crate::kcp_stream::KcpStream;
 
+    // 先等 relay 稳定再启动任何网络操作，避免与中继抢 tokio 运行时资源
+    hbb_common::tokio::time::sleep(Duration::from_secs(3)).await;
+
     // #2: if we haven't determined NAT type yet, try STUN-based detection.
     if Config::get_nat_type() == 0 {
-        if let Ok(true) = detect_symmetric_nat().await {
-            log::info!("relay_upgrade_task: detected SYMMETRIC NAT, switching to relay-only");
-            Config::set_nat_type(NatType::SYMMETRIC as _);
-            return false;
-        } else if Config::get_nat_type() == 0 {
-            Config::set_nat_type(NatType::ASYMMETRIC as _);
+        match detect_symmetric_nat().await {
+            Ok(true) => {
+                log::info!("relay_upgrade_task: detected SYMMETRIC NAT, switching to relay-only");
+                Config::set_nat_type(NatType::SYMMETRIC as _);
+                return false;
+            }
+            Ok(false) => {
+                Config::set_nat_type(NatType::ASYMMETRIC as _);
+            }
+            Err(e) => {
+                // 检测失败不写配置（保持未知，下次连接重测），按"未知"继续尝试打洞
+                log::info!(
+                    "relay_upgrade_task: NAT type detection inconclusive ({:?}), keep unknown and continue punching",
+                    e
+                );
+            }
         }
     }
 
-    const TOTAL_BUDGET: Duration = Duration::from_secs(30);
-    const PREDICTED_SCAN_RANGE: u16 = 10;
+    // "以时间换资源"：中继已建立，不急。拉长总预算到 3 分钟，每个目标间隔 1s，
+    // 空包只发 2-3 个，让 Phase3 几乎不影响中继操作。
+    const TOTAL_BUDGET: Duration = Duration::from_secs(180);
+    const PREDICTED_SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
@@ -3001,9 +3107,6 @@ pub async fn relay_upgrade_task(
     if tcp_listener.is_some() {
         log::info!("RelayUpgrade: created TCP listener for simultaneous open");
     }
-
-    // Brief initial wait for relay to stabilize (reduced from 2s→0.5s)
-    hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Create persistent sockets for all rounds.
     let socket_v4 = {
@@ -3035,62 +3138,154 @@ pub async fn relay_upgrade_task(
         log::info!("RelayUpgrade: created IPv6 socket for dual-stack punching");
     }
 
-    // Multi-STUN: query multiple times to detect port increment pattern
-    // for Symmetric NAT port prediction.
+    // Fresh hbbs TestNatRequest using OUR OWN socket. This replaces the
+    // old approach of relying on the pre-connection test socket (which goes
+    // stale on auto-reconnect). Each Phase3 invocation gets its own fresh
+    // address discovery, accurate for this specific socket, right now.
     let mut targets = peer_addrs.clone();
     let mut our_addr: Option<std::net::SocketAddr> = None;
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
 
-    for i in 0..5 {
-        let result = if let Some(ref server) = selected_server {
-            // Queries 2-5: use the SAME server for consistent delta on Symmetric NAT
-            stun_query_single_server(&socket, server).await
-        } else {
-            // Query 1: race all servers, pick the best
-            stun_query_with_socket(&socket).await
-        };
-        match result {
-            Ok((addr, srv)) => {
-                if our_addr.is_none() {
-                    selected_server = Some(srv.clone());
-                    our_addr = Some(addr);
-                    log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
-                        i + 1, addr, addr.port(), srv);
-                    if let Ok(mut public) = PUBLIC_ADDR.lock() {
-                        *public = addr.to_string();
+    // Send TestNatRequest to hbbs using Phase3's own socket, get the
+    // real NAT mapping for THIS socket (not a stale one from minutes ago).
+    let hbbs_host = Config::get_rendezvous_server();
+    if !hbbs_host.is_empty() {
+        if let Some(hbbs_addr) = hbbs_host
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut i| i.find(|a| a.is_ipv4()))
+        {
+            let mut msg = RendezvousMessage::new();
+            msg.set_test_nat_request(TestNatRequest::default());
+            if let Ok(data) = msg.write_to_bytes() {
+                socket.send_to(&data, hbbs_addr).await.ok();
+                let mut buf = vec![0u8; 1024];
+                if let Ok(Ok((n, _))) = hbb_common::tokio::time::timeout(
+                    Duration::from_secs(3), socket.recv_from(&mut buf)
+                ).await {
+                    if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
+                        if let Some(rendezvous_message::Union::TestNatResponse(resp)) = msg_in.union {
+                            let port = resp.port as u16;
+                            // Extract IP from response (new server) or from sender addr
+                            let ip = if !resp.ip.is_empty() {
+                                String::from_utf8(resp.ip.to_vec()).unwrap_or_default()
+                            } else {
+                                hbbs_addr.ip().to_string()
+                            };
+                            if let Ok(addr) = format!("{}:{}", ip, port).parse::<std::net::SocketAddr>() {
+                                our_addr = Some(addr);
+                                stun_ports.push(addr.port());
+                                log::info!("[NAT穿透] Phase3 hbbs-inline: {} (skip STUN)", addr);
+                            }
+                        }
                     }
-                } else {
-                    log::info!("RelayUpgrade STUN #{}: port {} via {}",
-                        i + 1, addr.port(), srv);
-                }
-                stun_ports.push(addr.port());
-                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => {
-                if our_addr.is_none() {
-                    log::info!("RelayUpgrade STUN #{} failed: {:?}", i + 1, e);
-                    break;
-                } else {
-                    log::info!("RelayUpgrade STUN #{} failed, stopping prediction: {:?}", i + 1, e);
-                    break;
                 }
             }
         }
     }
 
-    // Phase 3: send our public address to peer through relay
-    if let Some(addr) = our_addr {
-        let _ = phase3_out_tx.try_send(addr);
-        log::info!("Phase3: sent our address to relay loop: {}", addr);
+    // Only run STUN if hbbs didn't already provide the address
+    if our_addr.is_none() {
+
+    for i in 0..5 {
+        // P1: retry up to 2 times with exponential backoff (200ms, 400ms)
+        let mut retries: u32 = 2;
+        loop {
+            let result = if let Some(ref server) = selected_server {
+                // Queries 2-5: prefer locked server for consistent delta on Symmetric NAT
+                stun_query_single_server(&socket, server).await
+            } else {
+                // Query 1: race all servers, pick the best
+                stun_query_with_socket(&socket).await
+            };
+            match result {
+                Ok((addr, srv)) => {
+                    if our_addr.is_none() {
+                        selected_server = Some(srv.clone());
+                        our_addr = Some(addr);
+                        log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
+                            i + 1, addr, addr.port(), srv);
+                        if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                            *public = addr.to_string();
+                        }
+                    } else {
+                        log::info!("RelayUpgrade STUN #{}: port {} via {}",
+                            i + 1, addr.port(), srv);
+                    }
+                    stun_ports.push(addr.port());
+                    break; // success, exit retry loop
+                }
+                Err(e) => {
+                    if retries > 0 {
+                        let delay = Duration::from_millis(200 * (3 - retries) as u64);
+                        log::info!("RelayUpgrade STUN #{} retrying in {:?} ({}/2): {:?}",
+                            i + 1, delay, 3 - retries, e);
+                        retries -= 1;
+                        hbb_common::tokio::time::sleep(delay).await;
+                        // P0: if locked server exhausted retries, try other servers one by one.
+                        // Cannot use stun_query_with_socket (concurrent send_to) because
+                        // the socket may be connected (Windows WSAEISCONN on send_to mismatch).
+                        if retries == 0 && selected_server.is_some() {
+                            log::info!("RelayUpgrade STUN #{} locked server unresponsive, trying other servers one by one", i + 1);
+                            let alt_servers = get_stun_servers_v4();
+                            let mut fallback_ok = false;
+                            for alt_srv in alt_servers.iter() {
+                                if selected_server.as_ref().map_or(false, |s| s == alt_srv) {
+                                    continue; // skip the already-failed locked server
+                                }
+                                match stun_query_single_server(&socket, alt_srv).await {
+                                    Ok((fb_addr, fb_srv)) => {
+                                        log::info!("RelayUpgrade STUN #{} fallback OK via {} (port {})",
+                                            i + 1, fb_srv, fb_addr.port());
+                                        selected_server = Some(fb_srv);
+                                        stun_ports.push(fb_addr.port());
+                                        fallback_ok = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        log::info!("RelayUpgrade STUN #{} fallback vs {} failed: {:?}",
+                                            i + 1, alt_srv, e);
+                                    }
+                                }
+                            }
+                            if !fallback_ok {
+                                log::info!("RelayUpgrade STUN #{} all fallback servers failed", i + 1);
+                            }
+                        }
+                        continue;
+                    }
+                    // All retries exhausted, no locked server to fall back from
+                    if our_addr.is_none() {
+                        log::info!("RelayUpgrade STUN #{} failed after retries: {:?}", i + 1, e);
+                    } else {
+                        log::info!("RelayUpgrade STUN #{} failed, stopping prediction: {:?}", i + 1, e);
+                    }
+                    break;
+                }
+            }
+        }
+        // If very first query completely failed (no our_addr yet), exit early
+        if our_addr.is_none() && selected_server.is_none() {
+            break;
+        }
+        hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Also send IPv6 address if available (for dual-stack peers)
+    } // end if our_addr.is_none() (skip STUN when hbbs already provided addr)
+
+    // Phase 3: send our public address to peer through relay.
+    // We delay this until AFTER delta measurement so we can include
+    // the predicted port for symmetric NAT (BUGFIX: on symmetric NAT,
+    // the STUN-discovered port differs from the port the peer must punch to).
+    // IPv6 and TCP listener are sent immediately (they don't need delta).
     if crate::get_ipv6_punch_enabled() {
         if let Some(ipv6_addr) = get_cached_ipv6_addr() {
             let _ = phase3_out_tx.try_send(ipv6_addr);
             log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
         }
     }
+    // If hbbs-discovered address differs from STUN (symmetric NAT), send it
+    // first as the primary target so the peer starts punching immediately.
     // Send TCP listener address for TCP simultaneous open fallback.
     if let Some(tcp_port) = tcp_listener_port {
         let tcp_addr = std::net::SocketAddr::new(
@@ -3101,45 +3296,93 @@ pub async fn relay_upgrade_task(
         log::info!("Phase3: sent TCP listener address: {}", tcp_addr);
     }
 
-    // Measure our symmetric NAT delta by querying a different STUN server.
+    // Measure our symmetric NAT delta by querying different STUN servers.
     // On symmetric NAT, the mapped port changes for each different destination.
-    // This delta helps us predict the peer's port offset.
-    let our_delta: i16 = if stun_ports.len() >= 2 && our_addr.is_some() {
-        let base_port = stun_ports[0] as i16;
+    // P2: Try multiple alternative servers and take the consensus delta
+    // (most common non-zero value) instead of relying on a single server.
+    let our_delta: i32 = if stun_ports.len() >= 2 && our_addr.is_some() {
+        let base_port = stun_ports[0] as i32;
         let alt_servers = get_stun_servers_v4();
-        let alt_server = selected_server.as_ref().and_then(|s| {
-            alt_servers.iter().find(|a| *a != s)
-        }).or_else(|| alt_servers.first());
-        match alt_server {
-            Some(srv) => {
-                if let Some(alt) = srv.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
-                    let _ = socket.connect(alt).await;
-                    socket.send(&[]).await.ok();
-                    if let Ok((alt_addr, _)) = stun_query_single_server(&socket, srv).await {
-                        let delta = alt_addr.port() as i16 - base_port;
-                        log::info!("RelayUpgrade: symmetric delta measured: {} (port {} vs {})",
-                            delta, base_port, alt_addr.port());
-                        delta
-                    } else {
-                        log::info!("RelayUpgrade: no symmetric delta (alt STUN failed)");
-                        0
-                    }
-                } else {
-                    0
-                }
+        let mut deltas: Vec<i32> = Vec::new();
+        // Try up to 4 different servers, collect all non-zero deltas
+        for alt in alt_servers.iter() {
+            // Skip the primary server (delta to self is always 0)
+            if selected_server.as_ref().map_or(false, |s| s == alt) {
+                continue;
             }
-            None => 0,
+            if let Some(alt_addr) = alt.to_socket_addrs().ok()
+                .and_then(|mut i| i.find(|a| a.is_ipv4()))
+            {
+                let _ = socket.connect(alt_addr).await;
+                socket.send(&[]).await.ok();
+                match stun_query_single_server(&socket, alt).await {
+                    Ok((alt_result, _)) => {
+                        let delta = alt_result.port() as i32 - base_port;
+                        log::info!("RelayUpgrade: delta vs {}: {} (port {} vs {})",
+                            alt, delta, base_port, alt_result.port());
+                        if delta != 0 {
+                            deltas.push(delta);
+                        }
+                    }
+                    Err(e) => {
+                        log::info!("RelayUpgrade: delta vs {} failed: {:?}", alt, e);
+                    }
+                }
+                hbb_common::tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            // Collect up to 4 deltas for consensus
+            if deltas.len() >= 4 {
+                break;
+            }
+        }
+        // P2 consensus: pick the most frequent non-zero delta
+        if deltas.is_empty() {
+            log::info!("RelayUpgrade: no symmetric delta (all alt STUN failed or returned 0)");
+            0
+        } else if deltas.len() == 1 {
+            log::info!("RelayUpgrade: symmetric delta = {} (only 1 server worked)", deltas[0]);
+            deltas[0]
+        } else {
+            // Find most common delta value
+            let mut freq: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            for &d in &deltas {
+                *freq.entry(d).or_insert(0) += 1;
+            }
+            let best = freq.into_iter().max_by_key(|&(_, count)| count).unwrap();
+            log::info!("RelayUpgrade: symmetric delta = {} (consensus from {} servers, freq {})",
+                best.0, deltas.len(), best.1);
+            best.0
         }
     } else {
         0
     };
-    // Restore socket connection to the peer's first target for punching.
-    // We disconnected it during delta measurement. Reconnect is not critical
-    // since we reconnect to each target in the loop below.
+    // BUGFIX: Send our address NOW (after delta measurement) so we can include
+    // the predicted port for symmetric NAT. On cone NAT both ports are the same.
+    // On symmetric NAT the peer needs to try: STUN_port (for our us→STUN mapping)
+    // AND STUN_port+our_delta (for our us→peer mapping).
+    if let Some(addr) = our_addr {
+        let _ = phase3_out_tx.try_send(addr);
+        log::info!("Phase3: sent our address to relay loop: {}", addr);
+        if our_delta != 0 {
+            // i32 域计算后检查 1..=65535，越界则跳过，避免 u16 回绕
+            let predicted_port = addr.port() as i32 + our_delta;
+            if (1..=65535).contains(&predicted_port) && predicted_port != addr.port() as i32 {
+                let predicted_addr = std::net::SocketAddr::new(addr.ip(), predicted_port as u16);
+                let _ = phase3_out_tx.try_send(predicted_addr);
+                log::info!("Phase3: sent predicted our address for symmetric NAT: {}", predicted_addr);
+            }
+        }
+    }
 
-    for _round in 0..10 {
+    // TCP simultaneous open 目标列表：每轮从 phase3_tcp_rx drain 累积，限量保新
+    let mut tcp_targets: Vec<std::net::SocketAddr> = Vec::new();
+    for _round in 0..6 {
+        if cancel.is_cancelled() {
+            log::info!("[NAT穿透] Phase3 已取消（重连/断连）, 退出打洞");
+            return false;
+        }
         if started.elapsed() >= TOTAL_BUDGET {
-            log::info!("RelayUpgrade: total budget ({}s) exceeded, giving up", TOTAL_BUDGET.as_secs());
+            log::info!("[NAT穿透] 穿透总预算({}s)超时, 放弃", TOTAL_BUDGET.as_secs());
             return false;
         }
 
@@ -3157,11 +3400,12 @@ pub async fn relay_upgrade_task(
                     log::info!("Phase3: added peer address {} to targets", addr);
                 }
                 // 2) Predicted port: base_port + our_delta (symmetric NAT heuristic)
+                // i32 域计算后检查 1..=65535，越界则跳过，避免 u16 回绕
                 if our_delta != 0 {
-                    let predicted = base_port.wrapping_add(our_delta as u16);
-                    if predicted > 0 && predicted != base_port {
+                    let predicted = base_port as i32 + our_delta;
+                    if (1..=65535).contains(&predicted) && predicted != base_port as i32 {
                         let mut scan_addr = addr;
-                        scan_addr.set_port(predicted);
+                        scan_addr.set_port(predicted as u16);
                         if !targets.contains(&scan_addr) {
                             targets.push(scan_addr);
                         }
@@ -3169,12 +3413,13 @@ pub async fn relay_upgrade_task(
                     log::info!("Phase3: predicted port {} (base {} + delta {})",
                         predicted, base_port, our_delta);
                 }
-                // 3) Narrow scan range around base port
+                // 3) Narrow scan range around base port (i32 域计算，越界跳过)
                 for offset in 1..=PREDICTED_SCAN_RANGE {
-                    for &p in &[base_port.wrapping_add(offset), base_port.wrapping_sub(offset)] {
-                        if p > 0 && p != base_port {
+                    for &d in &[offset as i32, -(offset as i32)] {
+                        let p = base_port as i32 + d;
+                        if (1..=65535).contains(&p) && p != base_port as i32 {
                             let mut scan_addr = addr;
-                            scan_addr.set_port(p);
+                            scan_addr.set_port(p as u16);
                             if !targets.contains(&scan_addr) {
                                 targets.push(scan_addr);
                             }
@@ -3186,9 +3431,14 @@ pub async fn relay_upgrade_task(
             }
         }
         // Try each target address with KCP (UDP) hole punching.
+        // Inter-target delay prevents flooding the network and impacting relay traffic.
         for &target in &targets {
-            if started.elapsed() >= TOTAL_BUDGET {
+            if cancel.is_cancelled() {
                 return false;
+            }
+            if started.elapsed() >= TOTAL_BUDGET {
+                // 预算耗尽也要 break 到轮末的 TCP fallback，而不是直接放弃
+                break;
             }
             let socket = if target.is_ipv6() {
                 match socket_v6.as_ref() {
@@ -3201,92 +3451,82 @@ pub async fn relay_upgrade_task(
             if socket.connect(target).await.is_err() {
                 continue;
             }
+            // Send an initial empty packet immediately after connect to establish
+            // the NAT mapping. Without this, aggressive NATs may drop the mapping
+            // during the 1s sleep gap, causing all subsequent packets to fail.
+            socket.send(&[]).await.ok();
+            // 串行慢慢试：每个目标间隔 1s，让中继操作不被干扰
+            hbb_common::tokio::time::sleep(Duration::from_millis(1000)).await;
 
-            // Empty packet burst: 20 packets at 5ms spacing
-            for _ in 0..20 {
+            // Minimal burst: 2 packets at 5ms spacing (relay already established, no rush)
+            for _ in 0..2 {
                 if started.elapsed() >= TOTAL_BUDGET {
-                    return false;
+                    break;
                 }
                 socket.send(&[]).await.ok();
                 hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
             }
 
-            // Race KCP connect vs accept
-            let socket_for_accept = socket.clone();
-            let mut connect_fut = Box::pin(
-                KcpStream::connect(socket.clone(), Duration::from_secs(3)));
-            let mut accept_fut = Box::pin(async move {
-                KcpStream::accept(socket_for_accept, Duration::from_secs(3), None).await
-            });
-            let punched = tokio::select! {
-                res = &mut connect_fut => {
-                    match res {
-                        Ok((kcp, stream)) => {
-                            if let Ok(mut h) = kcp_handle.lock() {
-                                *h = Some(kcp);
-                            }
-                            let mut guard = direct_stream.lock().await;
-                            *guard = Some(stream);
-                            notify.notify_one();
-                            true
-                        }
-                        Err(_) => false,
-                    }
+            // 单 endpoint 上竞速 connect/accept（控制端优先 connect），
+            // 避免两个 endpoint 在同一 UDP socket 上抢 recv_from 吃掉握手包
+            if let Ok((kcp, stream)) =
+                KcpStream::race(socket.clone(), Duration::from_secs(3), true).await
+            {
+                if let Ok(mut h) = kcp_handle.lock() {
+                    *h = Some(kcp);
                 }
-                res = &mut accept_fut => {
-                    match res {
-                        Ok((kcp, stream)) => {
-                            if let Ok(mut h) = kcp_handle.lock() {
-                                *h = Some(kcp);
-                            }
-                            let mut guard = direct_stream.lock().await;
-                            *guard = Some(stream);
-                            notify.notify_one();
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                }
-            };
-            if punched {
-                log::info!("RelayUpgrade: KCP punch succeeded after {:?}", started.elapsed());
+                let mut guard = direct_stream.lock().await;
+                *guard = Some(stream);
+                notify.notify_one();
+                log::info!("[NAT穿透] Phase3 KCP 打洞成功, 耗时={:?}", started.elapsed());
                 return true;
             }
         }
 
         // If KCP failed this round, try TCP simultaneous open on the peer's
-        // dedicated TCP listener port (exchanged via PunchPeerAddr). This is
-        // far more reliable than trying TCP on KCP/UDP ports.
-        // Also try WebSocket (WS/WSS) connect as some firewalls allow HTTP
-        // upgrade traffic while blocking raw TCP on non-standard ports.
+        // dedicated TCP listener port (exchanged via PunchPeerAddr). Race an
+        // outbound connect against a source-validated accept on our listener;
+        // both sides bounded to 3s so each target costs at most ~3s.
         if let Some(ref listener) = tcp_listener {
-            let tcp_targets: Vec<std::net::SocketAddr> = if let Ok(addrs) = phase3_tcp_rx.lock() {
-                addrs.clone()
-            } else { Vec::new() };
+            // drain 本轮到达的 TCP 目标，本地累积去重，只保留最新 8 条，
+            // 避免无限增长和陈旧 target（原来只 clone 不 drain）
+            if let Ok(mut addrs) = phase3_tcp_rx.lock() {
+                for addr in addrs.drain(..) {
+                    if !tcp_targets.contains(&addr) {
+                        tcp_targets.push(addr);
+                    }
+                }
+                if tcp_targets.len() > 8 {
+                    let excess = tcp_targets.len() - 8;
+                    tcp_targets.drain(..excess);
+                }
+            }
             for &tcp_target in &tcp_targets {
+                if cancel.is_cancelled() { return false; }
                 if started.elapsed() >= TOTAL_BUDGET { break; }
                 if tcp_target.is_ipv6() { continue; }
-                let ports = [0, 1, -1, 2, -2, 5, -5];
+                let ports = [0i32, 1, -1, 2, -2, 5, -5];
                 for &port_offset in &ports {
                     if started.elapsed() >= TOTAL_BUDGET { break; }
+                    // i32 域计算端口，越界跳过，避免 u16 回绕
+                    let p = tcp_target.port() as i32 + port_offset;
+                    if !(1..=65535).contains(&p) { continue; }
                     let mut target = tcp_target;
-                    target.set_port(tcp_target.port().wrapping_add_signed(port_offset));
-                    if target.port() == 0 { continue; }
-                    let listener_clone = listener;
-                    let ws_url = format!("ws://{}:{}", target.ip(), target.port());
+                    target.set_port(p as u16);
                     let tcp_res: Option<tokio::net::TcpStream> = tokio::select! {
-                        // Accept raw TCP connection from peer
-                        res = listener_clone.accept() => {
+                        // Accept 只接受来自目标 IP 的连接，其余丢弃继续等直到 3s 超时
+                        res = tokio::time::timeout(Duration::from_secs(3),
+                            accept_from_ip(listener, target.ip())) => {
                             match res {
-                                Ok((stream, _)) => {
+                                Ok(Some(stream)) => {
                                     log::info!("RelayUpgrade TCP: accept from {}", target);
                                     Some(stream)
                                 }
-                                Err(_) => None,
+                                _ => None,
                             }
                         }
                         // Connect to peer via raw TCP
-                        res = tokio::time::timeout(Duration::from_secs(2),
+                        res = tokio::time::timeout(Duration::from_secs(3),
                             tokio::net::TcpStream::connect(target)) => {
                             match res {
                                 Ok(Ok(stream)) => {
@@ -3297,24 +3537,13 @@ pub async fn relay_upgrade_task(
                                 _ => None,
                             }
                         }
-                        // Connect to peer via WebSocket (bypasses firewalls that block raw TCP)
-                        res = tokio::time::timeout(Duration::from_secs(2),
-                            tokio_tungstenite::connect_async(&ws_url)) => {
-                            match res {
-                                Ok(Ok((_ws, _))) => {
-                                    log::info!("RelayUpgrade WS: connect to {} succeeded!", target);
-                                    tokio::net::TcpStream::connect(target).await.ok()
-                                }
-                                _ => None,
-                            }
-                        }
                     };
                     if let Some(stream) = tcp_res {
                         stream.set_nodelay(true).ok();
                         let mut guard = direct_stream.lock().await;
                         *guard = Some(Stream::from(stream, target));
                         notify.notify_one();
-                        log::info!("RelayUpgrade: punch succeeded via TCP/WS to {} after {:?}",
+                        log::info!("[NAT穿透] Phase3 TCP 打洞成功: {}, 耗时={:?}",
                             target, started.elapsed());
                         return true;
                     }
@@ -3322,18 +3551,8 @@ pub async fn relay_upgrade_task(
             }
         }
 
-        // Keep-alive: send empty packets during inter-round gap to prevent
-        // NAT mapping from expiring. NAT mappings typically time out after
-        // 30-60s of inactivity.
-        let gap_budget = Duration::from_millis(500);
-        let gap_start = std::time::Instant::now();
-        while gap_start.elapsed() < gap_budget {
-            if started.elapsed() >= TOTAL_BUDGET {
-                return false;
-            }
-            socket.send(&[]).await.ok();
-            hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // 轮间休息 2s，让中继操作不被 Phase3 干扰
+        hbb_common::tokio::time::sleep(Duration::from_millis(2000)).await;
         // Also check for new Phase 3 addresses during gap
         if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
             for addr in peer_addrs.drain(..) {
@@ -3343,14 +3562,12 @@ pub async fn relay_upgrade_task(
                 }
                 let base_port = addr.port();
                 for offset in 1..=PREDICTED_SCAN_RANGE {
-                    let ports = [
-                        base_port.wrapping_add(offset),
-                        base_port.wrapping_sub(offset),
-                    ];
-                    for &p in &ports {
-                        if p > 0 && p != base_port {
+                    // i32 域计算，越界跳过，避免 u16 回绕
+                    for &d in &[offset as i32, -(offset as i32)] {
+                        let p = base_port as i32 + d;
+                        if (1..=65535).contains(&p) && p != base_port as i32 {
                             let mut scan_addr = addr;
-                            scan_addr.set_port(p);
+                            scan_addr.set_port(p as u16);
                             if !targets.contains(&scan_addr) {
                                 targets.push(scan_addr);
                             }
@@ -3360,60 +3577,66 @@ pub async fn relay_upgrade_task(
             }
         }
     }
-    log::info!("RelayUpgrade finished without success in {:?}", started.elapsed());
+    log::info!("[NAT穿透] 穿透未成功, 耗时={:?}", started.elapsed());
     false
 }
 
 
-/// Host-side Phase 3 punch: called when the host receives PunchPeerAddr
-/// through the relay connection. Uses the same optimizations as
-/// relay_upgrade_task (burst + connect/accept race + keep-alive).
+/// Host-side Phase 3 punch: single task per connection. on_message queues
+/// the connector's public addresses (received via PunchPeerAddr on the relay)
+/// into `targets`; each round drains newly queued addresses, then tries every
+/// known target with an empty-packet burst + KCP connect/accept race on a
+/// single endpoint (host prefers accept), falling back to TCP simultaneous
+/// open (connect raced against a source-validated accept on `tcp_listener`).
+/// Exits when the punch succeeds, `upgraded` is set, or the 180s budget
+/// (aligned with the connector's TOTAL_BUDGET) is exhausted.
+///
+/// `punch_socket` is an optional persistent UDP socket created before the
+/// STUN query. When provided, STUN discovery and hole punching share the
+/// same socket, so the NAT mapping is consistent. When `None`, a new socket
+/// is created internally (fallback for edge cases).
 pub async fn relay_phase3_punch_to_peer(
-    peer_addr: std::net::SocketAddr,
+    targets: Arc<hbb_common::tokio::sync::Mutex<Vec<std::net::SocketAddr>>>,
     kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
+    punch_socket: Option<Arc<tokio::net::UdpSocket>>,
+    tcp_listener: Option<Arc<tokio::net::TcpListener>>,
+    upgraded: Arc<std::sync::atomic::AtomicBool>,
 ) -> ResultType<Stream> {
     use crate::kcp_stream::KcpStream;
 
-    // Use UPnP local port if available so the mapped port is active
-    let upnp_local = crate::common::get_upnp_local_port();
-    let bind_addr = if peer_addr.is_ipv6() {
-        SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16))
-    } else if upnp_local > 0 {
-        SocketAddr::from(([0u8; 4], upnp_local))
+    // Use the persistent punch socket if available, otherwise create a new one.
+    let socket = if let Some(s) = punch_socket {
+        s
     } else {
-        SocketAddr::from(([0u8; 4], 0u16))
-    };
-    let socket = UdpSocket::bind(bind_addr).await?;
-    let socket = Arc::new(socket);
-
-    // Create TCP listener for TCP simultaneous open fallback.
-    // Use UPnP local port if available.
-    let upnp_local = crate::common::get_upnp_local_port();
-    let tcp_listener = if upnp_local > 0 {
-        tokio::net::TcpListener::bind(format!("0.0.0.0:{}", upnp_local)).await.ok()
-    } else {
-        tokio::net::TcpListener::bind("0.0.0.0:0").await.ok()
+        let upnp_local = crate::common::get_upnp_local_port();
+        let bind_addr = if upnp_local > 0 {
+            SocketAddr::from(([0u8; 4], upnp_local))
+        } else {
+            SocketAddr::from(([0u8; 4], 0u16))
+        };
+        Arc::new(UdpSocket::bind(bind_addr).await?)
     };
 
-    const MAX_TIME: Duration = Duration::from_secs(30);
+    // 与控制端 TOTAL_BUDGET(180s) 对齐：主机任务死了控制端单方面不可能成功
+    const MAX_TIME: Duration = Duration::from_secs(180);
     let started = std::time::Instant::now();
 
     // Measure our symmetric NAT delta to predict peer's port offset.
-    let our_delta: i16 = {
+    let our_delta: i32 = {
         let servers_v4 = get_stun_servers_v4();
         if servers_v4.is_empty() {
             0
         } else {
             // STUN to first server to get base port
             if let Ok((base_addr, _)) = stun_query_single_server(&socket, &servers_v4[0]).await {
-                let base_port = base_addr.port() as i16;
+                let base_port = base_addr.port() as i32;
                 // Try a different server to measure delta
                 let alt = servers_v4.get(1).unwrap_or(&servers_v4[0]);
                 if let Some(alt_addr) = alt.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
                     let _ = socket.connect(alt_addr).await;
                     socket.send(&[]).await.ok();
                     if let Ok((alt_addr, _)) = stun_query_single_server(&socket, alt).await {
-                        let delta = alt_addr.port() as i16 - base_port;
+                        let delta = alt_addr.port() as i32 - base_port;
                         log::info!("Phase3(Host): symmetric delta measured: {} (base {}, alt {})",
                             delta, base_port, alt_addr.port());
                         delta
@@ -3428,103 +3651,125 @@ pub async fn relay_phase3_punch_to_peer(
     // - our_delta: prediction for symmetric NAT
     // - ±1, ±2, ±3: small drift
     // - ±5, ±10, ±20: larger drift
-    let mut port_offsets: Vec<i16> = vec![0];
+    // Extended to ±50 to match the connector-side scan range (PREDICTED_SCAN_RANGE=50),
+    // improving hit rate on symmetric NAT where per-destination port increment can be large.
+    let mut port_offsets: Vec<i32> = vec![0];
     if our_delta != 0 && !port_offsets.contains(&our_delta) {
         port_offsets.push(our_delta);
     }
-    for d in [1i16, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20] {
+    for d in [1i32, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20, 30, -30, 40, -40, 50, -50] {
         if !port_offsets.contains(&d) {
             port_offsets.push(d);
         }
     }
 
-    for round in 0..5 {
+    let mut round_targets: Vec<std::net::SocketAddr> = Vec::new();
+    let mut round = 0usize;
+    loop {
+        if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("Phase3(Host) stop punch: already upgraded");
+        }
         if started.elapsed() >= MAX_TIME {
             bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
 
-        let offsets: &[i16] = if round == 0 { &port_offsets[..5.min(port_offsets.len())] } else { &port_offsets };
-
-        for &offset in offsets {
-            if started.elapsed() >= MAX_TIME {
-                bail!("Phase3(Host) punch timed out");
-            }
-            let mut target = peer_addr;
-            let new_port = (target.port() as i32 + offset as i32) as u16;
-            if new_port == 0 { continue; }
-            target.set_port(new_port);
-
-            if socket.connect(target).await.is_err() { continue; }
-
-            for _ in 0..20 {
-                socket.send(&[]).await.ok();
-                hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-
-            let socket_for_accept = socket.clone();
-            let mut connect_fut = Box::pin(
-                KcpStream::connect(socket.clone(), Duration::from_secs(3)));
-            let mut accept_fut = Box::pin(async move {
-                KcpStream::accept(socket_for_accept, Duration::from_secs(3), None).await
-            });
-            let result = tokio::select! {
-                res = &mut connect_fut => {
-                    match res {
-                        Ok((kcp, stream)) => {
-                            if let Ok(mut h) = kcp_handle.lock() {
-                                *h = Some(kcp);
-                            }
-                            log::info!("Phase3(Host) KCP succeeded via connect after {:?}", started.elapsed());
-                            Some(stream)
-                        }
-                        Err(_) => None,
-                    }
+        // Drain newly arrived peer addresses from the queue.
+        {
+            let mut q = targets.lock().await;
+            for addr in q.drain(..) {
+                if !round_targets.contains(&addr) {
+                    round_targets.push(addr);
+                    log::info!("Phase3(Host): added peer address {} to targets", addr);
                 }
-                res = &mut accept_fut => {
-                    match res {
-                        Ok((kcp, stream)) => {
-                            if let Ok(mut h) = kcp_handle.lock() {
-                                *h = Some(kcp);
-                            }
-                            log::info!("Phase3(Host) KCP succeeded via accept after {:?}", started.elapsed());
-                            Some(stream)
-                        }
-                        Err(_) => None,
-                    }
+            }
+        }
+        if round_targets.is_empty() {
+            // 队列暂空，500ms 后看是否有新地址
+            hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        round += 1;
+        let offsets: &[i32] = if round == 1 { &port_offsets[..5.min(port_offsets.len())] } else { &port_offsets };
+
+        for &peer_addr in &round_targets {
+            for &offset in offsets {
+                if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
+                    bail!("Phase3(Host) stop punch: already upgraded");
                 }
-            };
-            if let Some(stream) = result {
-                return Ok(stream);
+                if started.elapsed() >= MAX_TIME {
+                    bail!("Phase3(Host) punch timed out");
+                }
+                // i32 域计算端口，越界跳过，避免 u16 回绕
+                let new_port = peer_addr.port() as i32 + offset;
+                if !(1..=65535).contains(&new_port) { continue; }
+                let mut target = peer_addr;
+                target.set_port(new_port as u16);
+
+                if socket.connect(target).await.is_err() { continue; }
+
+                // 空包 burst 打开 NAT 映射
+                for _ in 0..20 {
+                    socket.send(&[]).await.ok();
+                    hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+
+                // 单 endpoint 上竞速 connect/accept（主机优先 accept），
+                // 避免两个 endpoint 在同一 UDP socket 上抢 recv_from 吃掉握手包
+                if let Ok((kcp, stream)) =
+                    KcpStream::race(socket.clone(), Duration::from_secs(3), false).await
+                {
+                    if let Ok(mut h) = kcp_handle.lock() {
+                        *h = Some(kcp);
+                    }
+                    log::info!("Phase3(Host) KCP punch to {} succeeded after {:?}", target, started.elapsed());
+                    return Ok(stream);
+                }
             }
         }
 
         // After KCP rounds, try TCP simultaneous open on remaining budget.
-        if let Some(ref listener) = tcp_listener {
-            if started.elapsed() >= MAX_TIME { break; }
-            const TCP_SCAN_MAX: i16 = 20;
-            let tcp_offsets: &[i16] = if round == 0 { &[0] }
+        {
+            const TCP_SCAN_MAX: i32 = 20;
+            let tcp_offsets: &[i32] = if round == 1 { &[0] }
                 else { &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX] };
-            for &offset in tcp_offsets {
-                if started.elapsed() >= MAX_TIME { break; }
-                let mut tcp_target = peer_addr;
-                let new_port = (tcp_target.port() as i32 + offset as i32) as u16;
-                if new_port == 0 { continue; }
-                tcp_target.set_port(new_port);
+            for &peer_addr in &round_targets {
+                for &offset in tcp_offsets {
+                    if started.elapsed() >= MAX_TIME { break; }
+                    // i32 域计算端口，越界跳过，避免 u16 回绕
+                    let new_port = peer_addr.port() as i32 + offset;
+                    if !(1..=65535).contains(&new_port) { continue; }
+                    let mut tcp_target = peer_addr;
+                    tcp_target.set_port(new_port as u16);
 
-                let ws_url = format!("ws://{}:{}", tcp_target.ip(), tcp_target.port());
-                let result: Option<tokio::net::TcpStream> = tokio::select! {
-                    res = listener.accept() => {
-                        match res {
-                            Ok((stream, _)) => {
-                                log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
-                                Some(stream)
+                    let result: Option<tokio::net::TcpStream> = if let Some(ref listener) = tcp_listener {
+                        tokio::select! {
+                            // Accept 只接受来自目标 IP 的连接，其余丢弃继续等直到 3s 超时
+                            res = tokio::time::timeout(Duration::from_secs(3),
+                                accept_from_ip(listener, tcp_target.ip())) => {
+                                match res {
+                                    Ok(Some(stream)) => {
+                                        log::info!("Phase3(Host) TCP: accept from {}", tcp_target);
+                                        Some(stream)
+                                    }
+                                    _ => None,
+                                }
                             }
-                            Err(_) => None,
+                            res = tokio::time::timeout(Duration::from_secs(3),
+                                tokio::net::TcpStream::connect(tcp_target)) => {
+                                match res {
+                                    Ok(Ok(stream)) => {
+                                        stream.set_nodelay(true).ok();
+                                        log::info!("Phase3(Host) TCP: connect to {} succeeded!", tcp_target);
+                                        Some(stream)
+                                    }
+                                    _ => None,
+                                }
+                            }
                         }
-                    }
-                    res = tokio::time::timeout(Duration::from_secs(3),
-                        tokio::net::TcpStream::connect(tcp_target)) => {
-                        match res {
+                    } else {
+                        // 无 listener 时只做 connect
+                        match tokio::time::timeout(Duration::from_secs(3),
+                            tokio::net::TcpStream::connect(tcp_target)).await {
                             Ok(Ok(stream)) => {
                                 stream.set_nodelay(true).ok();
                                 log::info!("Phase3(Host) TCP: connect to {} succeeded!", tcp_target);
@@ -3532,27 +3777,22 @@ pub async fn relay_phase3_punch_to_peer(
                             }
                             _ => None,
                         }
+                    };
+                    if let Some(stream) = result {
+                        log::info!("Phase3(Host) TCP simultaneous open succeeded to {} after {:?}!",
+                            tcp_target, started.elapsed());
+                        return Ok(Stream::from(stream, tcp_target));
                     }
-                    res = tokio::time::timeout(Duration::from_secs(3),
-                        tokio_tungstenite::connect_async(&ws_url)) => {
-                        match res {
-                            Ok(Ok((_ws, _))) => {
-                                log::info!("Phase3(Host) WS: connect to {} succeeded!", tcp_target);
-                                tokio::net::TcpStream::connect(tcp_target).await.ok()
-                            }
-                            _ => None,
-                        }
-                    }
-                };
-                if let Some(stream) = result {
-                    log::info!("Phase3(Host) TCP/WS simultaneous open succeeded to {}!", tcp_target);
-                    return Ok(Stream::from(stream, tcp_target));
                 }
             }
         }
-    }
 
-    bail!("Phase3(Host) punch finished without success");
+        // 每轮结束若队列为空 sleep 500ms 等新地址（已有目标会继续重试到预算耗尽）
+        let queue_empty = targets.lock().await.is_empty();
+        if queue_empty {
+            hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 }
 
 /// Detect NAT type by sending two STUN binding requests from the same socket
@@ -3562,6 +3802,9 @@ pub async fn relay_phase3_punch_to_peer(
 /// #2 enhancement: when only one STUN server is reachable, send two requests
 /// to the same server and compare the mapped ports. The server may NAT the
 /// response from different source ports, which can still differentiate symmetric.
+///
+/// 失败时返回 Err（不确定），而不是误判为 Cone：调用处只在 Ok(...) 有明确
+/// 结论时才写 Config::set_nat_type，Err 保持未知以便下次连接重测。
 pub async fn detect_symmetric_nat() -> ResultType<bool> {
 
     // Create a single socket for both queries so we can compare port mappings.
@@ -3572,11 +3815,11 @@ pub async fn detect_symmetric_nat() -> ResultType<bool> {
     let servers_v4 = get_stun_servers_v4();
     let stun_str = match servers_v4.first() {
         Some(s) => s.clone(),
-        None => return Ok(false),
+        None => bail!("no STUN server available"),
     };
     let base_addr: SocketAddr = match stun_str.to_socket_addrs()?.find(|x| x.is_ipv4()) {
         Some(a) => a,
-        None => return Ok(false),
+        None => bail!("STUN server {} has no IPv4 address", stun_str),
     };
 
     // Helper: send a STUN binding request and return the XOR-mapped port.
@@ -3629,8 +3872,9 @@ pub async fn detect_symmetric_nat() -> ResultType<bool> {
     let p1 = match query(&socket, base_addr).await {
         Ok(p) => p,
         Err(e) => {
+            // 失败 = 不确定，返回 Err 而不是误判 Cone
             log::warn!("detect_symmetric_nat: first query failed: {:?}", e);
-            return Ok(false);
+            return Err(e);
         }
     };
 
@@ -3658,7 +3902,11 @@ pub async fn detect_symmetric_nat() -> ResultType<bool> {
 
     let p2 = match query(&socket, target2).await {
         Ok(p) => p,
-        Err(_) => p1, // second query failed; assume cone
+        Err(e) => {
+            // 第二次查询失败无法下结论，返回 Err（保持未知，下次重测）
+            log::warn!("detect_symmetric_nat: second query failed: {:?}", e);
+            return Err(e);
+        }
     };
 
     Ok(p1 != p2)

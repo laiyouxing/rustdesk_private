@@ -575,7 +575,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             ),
             KeyHelpTools(
                 keyboardIsVisible: keyboardIsVisible,
-                showGestureHelp: _showGestureHelp),
+                showGestureHelp: _showGestureHelp,
+                showBar: _showBar),
             SizedBox(
               width: 0,
               height: 0,
@@ -825,12 +826,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 class KeyHelpTools extends StatefulWidget {
   final bool keyboardIsVisible;
   final bool showGestureHelp;
+  final bool showBar;
 
   /// need to show by external request, etc [keyboardIsVisible] or [changeTouchMode]
   bool get requestShow => keyboardIsVisible || showGestureHelp;
 
   KeyHelpTools(
-      {required this.keyboardIsVisible, required this.showGestureHelp});
+      {required this.keyboardIsVisible,
+      required this.showGestureHelp,
+      required this.showBar});
 
   @override
   State<KeyHelpTools> createState() => _KeyHelpToolsState();
@@ -887,7 +891,7 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
         inputModel.shift ||
         inputModel.command;
 
-    if (!_pin && !hasModifierOn && !widget.requestShow) {
+    if (!widget.showBar && !_pin && !hasModifierOn && !widget.requestShow) {
       gFFI.cursorModel
           .keyHelpToolsVisibilityChanged(null, widget.keyboardIsVisible);
       return Offstage();
