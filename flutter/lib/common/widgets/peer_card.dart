@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:math' as math;
+
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,15 +9,9 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:get/get.dart';
+import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
-
-import '../../common.dart';
-import '../../common/formatter/id_formatter.dart';
-import '../../models/peer_model.dart';
-import '../../models/platform_model.dart';
-import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
-import '../../desktop/widgets/popup_menu.dart';
-import 'dart:math' as math;
+import 'package:url_launcher/url_launcher.dart';
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
     Function(BuildContext);
@@ -1544,6 +1541,14 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
     bool isTcpTunneling = false,
     bool isRDP = false,
     bool isTerminal = false}) async {
+  // 订阅过期检查：非文件传输/摄像头/TCP隧道/RDP时，检查订阅状态
+  if (!isFileTransfer && !isViewCamera && !isTcpTunneling && !isRDP && !isTerminal) {
+    final expired = await checkSubscriptionExpired(context);
+    if (expired) {
+      _showRenewDialog(context);
+      return;
+    }
+  }
   var password = '';
   bool isSharedPassword = false;
   if (tab == PeerTabIndex.ab) {
@@ -1578,4 +1583,58 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       isViewCamera: isViewCamera,
       isTcpTunneling: isTcpTunneling,
       isRDP: isRDP);
+}
+
+/// 检查订阅是否过期，返回 true 表示已过期
+Future<bool> checkSubscriptionExpired(BuildContext context) async {
+  try {
+    final api = '${await bind.mainGetApiServer()}/api/subscribe/mine';
+    final headers = getHttpHeaders();
+    final resp = await http.get(Uri.parse(api), headers: headers)
+        .timeout(const Duration(seconds: 5));
+    if (resp.statusCode == 200) {
+      final body = jsonDecode(resp.body);
+      if (body is Map && body['data'] is Map) {
+        final data = body['data'];
+        final status = data['status'] ?? 'none';
+        return status != 'active';
+      }
+    }
+  } catch (_) {
+    // 网络错误等，放行（允许离线使用）
+  }
+  return false;
+}
+
+/// 显示续费弹窗
+void _showRenewDialog(BuildContext context) {
+  showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(translate('Subscription Expired')),
+      content: Text(translate('Your subscription has expired. Please renew to continue using remote desktop.')),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text(translate('Cancel')),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            Navigator.pop(ctx);
+            // 打开后台订阅页面（在浏览器中）
+            _openRenewPage(context);
+          },
+          child: Text(translate('Renew')),
+        ),
+      ],
+    ),
+  );
+}
+
+/// 打开续费页面
+void _openRenewPage(BuildContext context) async {
+  final api = await bind.mainGetApiServer();
+  // 跳转到用户个人订阅页面续费
+  final url = '$api/admin/#/my/subscription';
+  await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
 }
