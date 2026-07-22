@@ -1541,13 +1541,11 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
     bool isTcpTunneling = false,
     bool isRDP = false,
     bool isTerminal = false}) async {
-  // 订阅过期检查：非文件传输/摄像头/TCP隧道/RDP时，检查订阅状态
-  if (!isFileTransfer && !isViewCamera && !isTcpTunneling && !isRDP && !isTerminal) {
-    final expired = await checkSubscriptionExpired(context);
-    if (expired) {
-      _showRenewDialog(context);
-      return;
-    }
+  // 订阅过期检查：所有连接类型均需校验
+  final expired = await checkSubscriptionExpired(context);
+  if (expired) {
+    _showRenewDialog(context);
+    return;
   }
   var password = '';
   bool isSharedPassword = false;
@@ -1585,7 +1583,7 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       isRDP: isRDP);
 }
 
-/// 检查订阅是否过期，返回 true 表示已过期
+/// 检查订阅是否过期，返回 true 表示已过期或无法验证（拒绝连接）
 Future<bool> checkSubscriptionExpired(BuildContext context) async {
   try {
     final api = '${await bind.mainGetApiServer()}/api/subscribe/mine';
@@ -1601,9 +1599,9 @@ Future<bool> checkSubscriptionExpired(BuildContext context) async {
       }
     }
   } catch (_) {
-    // 网络错误等，放行（允许离线使用）
+    // 连不上 API → 拒绝连接
   }
-  return false;
+  return true;
 }
 
 /// 显示续费弹窗
@@ -1612,7 +1610,7 @@ void _showRenewDialog(BuildContext context) {
     context: context,
     builder: (ctx) => AlertDialog(
       title: Text(translate('Subscription Expired')),
-      content: Text(translate('Your subscription has expired. Please renew to continue using remote desktop.')),
+      content: Text(translate('Service unavailable. Please check your subscription status and renew if needed.')),
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(ctx),
