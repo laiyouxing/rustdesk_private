@@ -17,6 +17,7 @@ import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/plugin/ui_manager.dart';
+import 'package:flutter_hbb/utils/http_service.dart' as http;
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/platform_channel.dart';
 import 'package:get/get.dart';
@@ -50,6 +51,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
+  final RxList<Map<String, dynamic>> _announcements = <Map<String, dynamic>>[].obs;
+  bool _announcementsLoaded = false;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -432,31 +435,70 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
-    if (!bind.isCustomClient() &&
-        updateUrl.isNotEmpty &&
-        !isCardClosed &&
-        bind.mainUriPrefixSync().contains('rustdesk')) {
-      final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
-      String btnText = isToUpdate ? 'Update' : 'Download';
-      GestureTapCallback onPressed = () async {
-        final Uri url = Uri.parse('https://rustdesk.com/download');
-        await launchUrl(url);
-      };
-      if (isToUpdate) {
-        onPressed = () {
-          handleUpdate(updateUrl);
-        };
+    // 自定义客户端：优先显示 API 公告，再显示版本更新
+    if (bind.isCustomClient()) {
+      final cards = <Widget>[];
+      // 公告（优先展示）
+      if (_announcementsLoaded) {
+        cards.add(_buildAnnouncementWidget());
       }
-      return buildInstallCard(
-          "Status",
-          "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
-          btnText,
-          onPressed,
-          closeButton: true,
-          help: isToUpdate ? 'Changelog' : null,
-          link: isToUpdate
-              ? 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}'
-              : null);
+      // 版本更新（在公告下方）
+      if (updateUrl.isNotEmpty && !isCardClosed) {
+        final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
+        String btnText = isToUpdate ? 'Update' : 'Download';
+        GestureTapCallback onPressed = () async {
+          final apiServer = await bind.mainGetApiServer();
+          final url = apiServer.isNotEmpty
+              ? Uri.parse(apiServer + '/downloads')
+              : Uri.parse('https://rustdesk.com/download');
+          await launchUrl(url);
+        };
+        if (isToUpdate) {
+          onPressed = () {
+            handleUpdate(updateUrl);
+          };
+        }
+        cards.add(buildInstallCard(
+            "Status",
+            "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
+            btnText,
+            onPressed,
+            closeButton: true,
+            help: isToUpdate ? 'Changelog' : null,
+            link: isToUpdate
+                ? 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}'
+                : null));
+      }
+      if (cards.isNotEmpty) {
+        return Column(children: cards);
+      }
+      // 没有公告和更新，继续检查系统错误和权限
+    } else {
+      if (updateUrl.isNotEmpty &&
+          !isCardClosed &&
+          bind.mainUriPrefixSync().contains('rustdesk')) {
+        final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
+        String btnText = isToUpdate ? 'Update' : 'Download';
+        GestureTapCallback onPressed = () async {
+          final Uri url = Uri.parse('https://rustdesk.com/download');
+          await launchUrl(url);
+        };
+        if (isToUpdate) {
+          onPressed = () {
+            handleUpdate(updateUrl);
+          };
+        }
+        return buildInstallCard(
+            "Status",
+            "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
+            btnText,
+            onPressed,
+            closeButton: true,
+            help: isToUpdate ? 'Changelog' : null,
+            link: isToUpdate
+                ? 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}'
+                : null);
+      }
     }
     if (systemError.isNotEmpty) {
       return buildInstallCard("", systemError, "", () {});
@@ -750,6 +792,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     });
     Get.put<RxBool>(svcStopped, tag: 'stop-service');
     rustDeskWinManager.registerActiveWindowListener(onActiveWindowChanged);
+    _fetchAnnouncements();
 
     screenToMap(window_size.Screen screen) => {
           'frame': {
@@ -891,6 +934,77 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     if (state == AppLifecycleState.resumed) {
       shouldBeBlocked(_block, canBeBlocked);
     }
+  }
+
+  Future<void> _fetchAnnouncements() async {
+    try {
+      final apiServer = await bind.mainGetApiServer();
+      if (apiServer.trim().isEmpty) return;
+      final resp = await http.get(Uri.parse('$apiServer/api/announcements'));
+      if (resp.statusCode == 200) {
+        final data = json.decode(resp.body);
+        if (data['data'] != null && data['data']['announcements'] != null) {
+          final list = data['data']['announcements'] as List;
+          _announcements.value = list.cast<Map<String, dynamic>>();
+          _announcementsLoaded = true;
+        }
+      }
+    } catch (_) {
+      // 静默失败，不影响客户端使用
+    }
+  }
+
+  Widget _buildAnnouncementWidget() {
+    if (!bind.isCustomClient() || !_announcementsLoaded || _announcements.isEmpty) {
+      return const Offstage();
+    }
+    final announcements = _announcements.take(3).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: announcements.map((a) {
+        return Container(
+          width: double.infinity,
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFE8F0FE),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFF2F65BA).withOpacity(0.3)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.campaign, size: 16, color: const Color(0xFF2F65BA)),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      a['title'] ?? '',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                        color: Color(0xFF2F65BA),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              if ((a['content'] ?? '') != '')
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    a['content'],
+                    style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+            ],
+          ),
+        );
+      }).toList(),
+    );
   }
 
   Widget buildPluginEntry() {

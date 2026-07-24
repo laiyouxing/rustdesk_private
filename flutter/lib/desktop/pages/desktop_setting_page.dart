@@ -2412,8 +2412,12 @@ class _AboutState extends State<_About> {
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
-                  onTap: () {
-                    launchUrlString('https://rustdesk.com');
+                  onTap: () async {
+                    final apiServer = await bind.mainGetApiServer();
+                    final url = apiServer.isNotEmpty
+                        ? apiServer
+                        : 'https://rustdesk.com';
+                    launchUrlString(url);
                   },
                   child: Text(
                     translate('Website'),
