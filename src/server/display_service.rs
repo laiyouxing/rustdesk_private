@@ -477,10 +477,37 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
 
     let no_displays_v = no_displays(&displays);
     if no_displays_v {
+        // RDP 会话切换（mstsc 断开）期间无显示器是暂时的：
+        // 1. plug_in_headless() 内部有 3s 节流，会话切换中首次插入可能失败；
+        // 2. 失败后必须等待节流过期再重试，否则显示器永远无法恢复。
         log::debug!("no displays, create virtual display");
-        if let Err(e) = virtual_display_manager::plug_in_headless() {
-            log::error!("plug in headless failed {}", e);
-        } else {
+        let mut plugged = false;
+        let mut retried = false;
+        loop {
+            match virtual_display_manager::plug_in_headless() {
+                Ok(()) => {
+                    plugged = true;
+                    break;
+                }
+                Err(e) => {
+                    log::error!("plug in headless failed {}", e);
+                    // 节流错误：等待节流过期（3s）后重试一次
+                    if !retried && e.to_string().contains("Plugging in too frequently") {
+                        retried = true;
+                        std::thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                    // 其他错误（如驱动未安装、会话切换中驱动不可用）：等待一会后重试一次
+                    if !retried {
+                        retried = true;
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        if plugged {
             displays = Display::all()?;
         }
     }

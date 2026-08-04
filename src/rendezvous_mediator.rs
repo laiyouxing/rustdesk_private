@@ -159,11 +159,7 @@ impl RendezvousMediator {
             Config::set_option("stop-service".into(), "".into());
             if crate::platform::is_installed() && !crate::platform::is_self_service_running() {
                 log::info!("Service not running on startup, starting it now...");
-                std::process::Command::new("sc")
-                    .arg("start")
-                    .arg(crate::get_app_name())
-                    .spawn()
-                    .ok();
+                crate::platform::ensure_service_running();
             }
         }
         let server = new_server();
