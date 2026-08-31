@@ -225,7 +225,9 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
     );
     if let Some(p) = file_path.to_str() {
         if let Some(session_id) = crate::platform::get_current_process_session_id() {
-            if update_msi {
+            // 以下载文件扩展名为准：.msi 走 msiexec 静默安装；否则走 exe 更新流程。
+            // 这样自定义客户端也能正确识别 api 推送的 msi 版本（原先 update_msi 对自定义客户端恒为 false）。
+            if update_msi || p.to_lowercase().ends_with(".msi") {
                 match crate::platform::update_me_msi(p, true) {
                     Ok(_) => {
                         log::debug!("New version \"{}\" updated.", version);

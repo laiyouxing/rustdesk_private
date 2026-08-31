@@ -964,9 +964,14 @@ async fn handle(data: Data, stream: &mut Connection) {
             log::info!("Service installing update: {}", file);
             #[cfg(windows)]
             {
-                let _ = std::process::Command::new(&file)
-                    .arg("--update")
-                    .spawn();
+                if file.to_lowercase().ends_with(".msi") {
+                    // msi：用 msiexec 静默安装
+                    let _ = crate::platform::update_me_msi(&file, true);
+                } else {
+                    let _ = std::process::Command::new(&file)
+                        .arg("--update")
+                        .spawn();
+                }
             }
             #[cfg(all(not(windows), not(any(target_os = "android", target_os = "ios"))))]
             {
