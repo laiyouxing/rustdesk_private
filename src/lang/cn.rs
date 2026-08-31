@@ -405,6 +405,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Right click to select tabs", "右键选择选项卡"),
         ("Skipped", "已跳过"),
         ("Add to address book", "添加到地址簿"),
+        ("Add my ID to address book", "加入地址薄"),
+        ("ID is not ready yet, please try again later", "本机 ID 未生成，请稍后再试"),
         ("Group", "小组"),
         ("Search", "搜索"),
         ("Closed manually by web console", "被 web 控制台手动关闭"),

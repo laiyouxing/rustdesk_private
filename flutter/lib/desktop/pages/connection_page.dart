@@ -19,6 +19,7 @@ import '../../common.dart';
 import '../../common/formatter/id_formatter.dart';
 import '../../common/widgets/peer_tab_page.dart';
 import '../../common/widgets/autocomplete.dart';
+import '../../common/widgets/dialog.dart';
 import '../../models/platform_model.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
 
@@ -635,22 +636,58 @@ class _ConnectionPageState extends State<ConnectionPage>
               model.saveHostname(value);
             },
           ),
-          Align(
-            alignment: Alignment.centerRight,
-            child: Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: SizedBox(
-                height: 28.0,
-                child: ElevatedButton(
-                  onPressed: () async {
-                    await model.saveHostname(model.hostname.text);
-                    showToast('保存成功',
-                        bgColor: const Color(0xFFE8F5E9),
-                        textColor: const Color(0xFF2E7D32));
-                  },
-                  child: Text("保存"),
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                // 将本机 ID 添加到个人地址薄
+                SizedBox(
+                  height: 28.0,
+                  child: OutlinedButton(
+                    onPressed: () async {
+                      final id = model.serverId.id;
+                      if (!RegExp(r'^\d+$').hasMatch(id)) {
+                        showToast(
+                            translate('ID is not ready yet, please try again later'));
+                        return;
+                      }
+                      final name = model.hostname.text.trim();
+                      final peer = Peer(
+                        id: id,
+                        hash: '',
+                        password: '',
+                        username: '',
+                        hostname: name,
+                        platform: '',
+                        alias: name,
+                        tags: [],
+                        forceAlwaysRelay: false,
+                        rdpPort: '',
+                        rdpUsername: '',
+                        loginName: '',
+                        device_group_name: '',
+                        note: '',
+                      );
+                      addPeersToAbDialog([peer]);
+                    },
+                    child: Text(translate('Add my ID to address book')),
+                  ),
                 ),
-              ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  height: 28.0,
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      await model.saveHostname(model.hostname.text);
+                      showToast('保存成功',
+                          bgColor: const Color(0xFFE8F5E9),
+                          textColor: const Color(0xFF2E7D32));
+                    },
+                    child: Text("保存"),
+                  ),
+                ),
+              ],
             ),
           ),
         ],
