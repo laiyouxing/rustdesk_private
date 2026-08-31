@@ -335,8 +335,8 @@ pub struct Connection {
     // The punch task stores the KcpStream here; without this it would be
     // dropped (and its kcp_io pump stopped) when the task exits.
     phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
-    // Phase 3: queue of peer addresses for the single punch task to drain.
-    phase3_targets: Option<Arc<hbb_common::tokio::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Phase 3: queue of peer addresses (+同步信号) for the single punch task to drain.
+    phase3_targets: Option<Arc<hbb_common::tokio::sync::Mutex<Vec<crate::common::PunchAddrInfo>>>>,
     // Phase 3: whether the single punch task has been spawned.
     phase3_started: Option<Arc<std::sync::atomic::AtomicBool>>,
     // Phase 3: whether the stream has already been switched to direct.
@@ -618,7 +618,7 @@ impl Connection {
         // Buffer 16 — host Phase3 may send up to 3 addresses (STUN, TCP, IPv6).
         // Capacity 1 risked blocking .send() if io_loop is temporarily busy; 16
         // provides safe headroom and aligns with the connector-side channel.
-        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(16);
+        let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<crate::common::PunchAddrInfo>(16);
         conn.punch_stream = Some(punch_stream.clone());
         conn.punch_notify = Some(punch_notify.clone());
         // Phase3 (Host-side): discover our public address via STUN and send it
@@ -633,6 +633,8 @@ impl Connection {
         {
             let phase3_tx = phase3_out_tx;
             let tx_to_cm = conn.tx_to_cm.clone();
+            // 时钟校准：算出双方约定的打洞起始时刻（NTP 对齐后的轮边界）
+            let sync_at_ms = crate::common::punch_sync_boundary(crate::common::ntp_now_ms().await);
             // Create persistent socket before spawn so both STUN and punch share it
             let punch_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => Some(Arc::new(s)),
@@ -664,14 +666,44 @@ impl Connection {
                                 status: nat.to_owned(),
                                 info: stun_addr.to_string(),
                             });
-                            if phase3_tx.send(stun_addr).await.is_err() {
+                            // 测量主机自身对称 NAT delta：向另一台 STUN 服务器查询，
+                            // 端口差即 delta。对称 NAT 时控制端需用它预测主机端口。
+                            let host_delta = {
+                                let servers = crate::common::get_stun_servers_v4();
+                                let alt = servers.get(1).or_else(|| servers.first());
+                                match alt {
+                                    Some(srv) => {
+                                        if let Some(alt_addr) = srv.to_socket_addrs().ok()
+                                            .and_then(|mut i| i.find(|a| a.is_ipv4()))
+                                        {
+                                            let _ = socket.connect(alt_addr).await;
+                                            socket.send(&[]).await.ok();
+                                            match crate::common::stun_query_single_server(socket.as_ref(), srv).await {
+                                                Ok((alt_res, _)) => alt_res.port() as i32 - stun_addr.port() as i32,
+                                                Err(_) => 0,
+                                            }
+                                        } else { 0 }
+                                    }
+                                    None => 0,
+                                }
+                            };
+                            log::info!("Phase3(Host): host symmetric delta = {}", host_delta);
+                            // ready=true：告知对端本端已就绪；delta 供对端预测主机端口；
+                            // sync_at_ms 用于双方时钟对齐
+                            let ready_info = crate::common::PunchAddrInfo {
+                                addr: stun_addr,
+                                ready: true,
+                                delta: host_delta,
+                                sync_at_ms,
+                            };
+                            if phase3_tx.send(ready_info).await.is_err() {
                                 log::info!("Phase3(Host): failed to send own address");
                             }
                             // Send TCP listener address for TCP simultaneous open
                             if let Some(tcp_port_val) = tcp_port {
                                 let tcp_addr = std::net::SocketAddr::new(
                                     stun_addr.ip(), tcp_port_val);
-                                let _ = phase3_tx.send(tcp_addr).await;
+                                let _ = phase3_tx.send(crate::common::PunchAddrInfo::new(tcp_addr)).await;
                                 log::info!("Phase3(Host): sent TCP listener address: {}", tcp_addr);
                             }
                         }
@@ -688,7 +720,7 @@ impl Connection {
                             status: "cone_nat".to_owned(),
                             info: ipv6_addr.to_string(),
                         });
-                        let _ = phase3_tx.send(ipv6_addr).await;
+                        let _ = phase3_tx.send(crate::common::PunchAddrInfo::new(ipv6_addr)).await;
                         log::info!("Phase3(Host): sent IPv6 address to peer: {}", ipv6_addr);
                     }
                 }
@@ -1006,16 +1038,21 @@ impl Connection {
                         }
                     }
                 },
-                Some(phase3_my_addr) = phase3_out_rx.recv() => {
-                    // Phase 3: Forward host's STUN-discovered address to connector through relay
+                Some(phase3_my_info) = phase3_out_rx.recv() => {
+                    // Phase 3: Forward host's STUN-discovered address (+同步信号) to connector via relay
                     let mut misc = Misc::new();
                     let mut ppa = PunchPeerAddr::new();
-                    ppa.addr = phase3_my_addr.to_string().into();
+                    ppa.addr = phase3_my_info.addr.to_string().into();
+                    ppa.set_ready(phase3_my_info.ready);
+                    ppa.set_delta(phase3_my_info.delta);
+                    ppa.set_sync_at_ms(phase3_my_info.sync_at_ms);
                     misc.set_punch_peer_addr(ppa);
                     let mut msg = Message::new();
                     msg.set_misc(misc);
                     allow_err!(conn.stream.send(&msg).await);
-                    log::info!("Phase3(Host): sent our address to peer: {}", phase3_my_addr);
+                    log::info!("Phase3(Host): sent our address {} (ready={}, delta={}, sync_at={}) to peer",
+                        phase3_my_info.addr, phase3_my_info.ready,
+                        phase3_my_info.delta, phase3_my_info.sync_at_ms);
                 },
                 _ = conn.file_timer.tick() => {
                     if !conn.read_jobs.is_empty() {
@@ -2488,11 +2525,12 @@ impl Connection {
                 raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
                 return false;
             }
-            // Phase 3: Received connector's public address through relay
+            // Phase 3: Received connector's public address (+同步信号) through relay
             if let Some(misc::Union::PunchPeerAddr(ppa)) = &misc.union {
                 if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
                 {
-                    log::info!("Phase3(Host): received peer address: {}", peer_addr);
+                    log::info!("Phase3(Host): received peer address: {} (ready={}, delta={}, sync_at={})",
+                        peer_addr, ppa.get_ready(), ppa.get_delta(), ppa.get_sync_at_ms());
                     // 忽略不可用地址：0.0.0.0 不可打洞，IPv6 与 v4 punch_socket 不匹配
                     if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
                         log::info!("Phase3(Host): ignore unusable address {}", peer_addr);
@@ -2501,10 +2539,16 @@ impl Connection {
                     }) {
                         log::info!("Phase3(Host): already upgraded, ignore {}", peer_addr);
                     } else {
-                        // 地址入队，由唯一打洞任务消费（每条消息 spawn 一个任务会
-                        // 共享 socket 互相 connect 覆盖、抢 recv_from）
+                        // 地址入队（携带同步信号），由唯一打洞任务消费
+                        // （每条消息 spawn 一个任务会共享 socket 互相 connect 覆盖、抢 recv_from）
+                        let info = crate::common::PunchAddrInfo {
+                            addr: peer_addr,
+                            ready: ppa.get_ready(),
+                            delta: ppa.get_delta(),
+                            sync_at_ms: ppa.get_sync_at_ms(),
+                        };
                         if let Some(ref targets) = self.phase3_targets {
-                            targets.lock().await.push(peer_addr);
+                            targets.lock().await.push(info);
                         }
                         let already_started = self.phase3_started.as_ref().map_or(true, |s| {
                             s.swap(true, std::sync::atomic::Ordering::SeqCst)

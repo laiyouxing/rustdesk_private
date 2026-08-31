@@ -82,8 +82,8 @@ pub struct Remote<T: InvokeUiSession> {
     // Relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
     punch_notify: Option<Arc<Notify>>,
-    // Phase 3: shared vec for relay_upgrade_task to pick up peer addresses
-    punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
+    // Phase 3: shared vec for relay_upgrade_task to pick up peer addresses (+同步信号)
+    punch_peer_addrs: Option<Arc<std::sync::Mutex<Vec<crate::common::PunchAddrInfo>>>>,
     // Phase 3 TCP: separate vec for peer TCP listener addresses (TCP simultaneous open)
     punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
     // Phase3 取消令牌：重连/断连时取消旧打洞线程，避免线程累积泄漏
@@ -237,10 +237,10 @@ impl<T: InvokeUiSession> Remote<T> {
                 // Buffer 16 — relay_upgrade_task may send multiple candidates (IPv6, TCP,
                 // main STUN addr, symmetric predicted addr, TCP timing).  Capacity 1 caused
                 // try_send to silently drop later candidates, losing TCP/symmetric fallback.
-                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<std::net::SocketAddr>(16);
+                let (phase3_out_tx, mut phase3_out_rx) = mpsc::channel::<crate::common::PunchAddrInfo>(16);
                 // Shared state for handle_msg_from_peer to push peer Phase 3 addresses
                 // into relay_upgrade_task's target list (same socket, no duplicate)
-                let phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> =
+                let phase3_peer_rx: Arc<std::sync::Mutex<Vec<crate::common::PunchAddrInfo>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
                 // Separate channel for peer TCP listener addresses (TCP simultaneous open).
                 // Identified by port: after KCP+IPv6 are received, the next different-port
@@ -453,16 +453,21 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.set_punch_status("failed", "");
                             }
                         }
-                        Some(phase3_my_addr) = phase3_out_rx.recv() => {
-                            // Phase 3: Forward our STUN-discovered address to peer through relay
+                        Some(phase3_my_info) = phase3_out_rx.recv() => {
+                            // Phase 3: Forward our STUN-discovered address (+同步信号) to peer via relay
                             let mut misc = Misc::new();
                             let mut ppa = PunchPeerAddr::new();
-                            ppa.addr = phase3_my_addr.to_string().into();
+                            ppa.addr = phase3_my_info.addr.to_string().into();
+                            ppa.set_ready(phase3_my_info.ready);
+                            ppa.set_delta(phase3_my_info.delta);
+                            ppa.set_sync_at_ms(phase3_my_info.sync_at_ms);
                             misc.set_punch_peer_addr(ppa);
                             let mut msg = Message::new();
                             msg.set_misc(misc);
                             allow_err!(peer.send(&msg).await);
-                            log::info!("Phase3: sent our address to peer: {}", phase3_my_addr);
+                            log::info!("Phase3: sent our address {} (ready={}, delta={}, sync_at={}) to peer",
+                                phase3_my_info.addr, phase3_my_info.ready,
+                                phase3_my_info.delta, phase3_my_info.sync_at_ms);
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {
@@ -2256,21 +2261,28 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.handler.set_current_display(d_idx);
                     }
                     Some(misc::Union::PunchPeerAddr(ppa)) => {
-                        // Phase 3: Received peer's public address through relay.
-                        // Route to appropriate channel:
-                        // - KCP/UDP addresses → punch_peer_addrs (for port-scan + KCP punch)
-                        // - TCP listener addresses → punch_tcp_addrs (for TCP simultaneous open)
-                        // Heuristic: if we already have addresses from this peer IP in
-                        // punch_peer_addrs, the new address with a different port is TCP.
+                        // Phase 3: Received peer's public address (+同步信号) through relay.
+                        // ready=true 的地址带 delta/sync_at_ms，作为"精确地址"交给打洞任务。
+                        // TCP listener 地址仍按启发式进入 punch_tcp_addrs。
                         if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
                             // 忽略无效地址（0.0.0.0 不可打洞；早前的时间戳同步机制已移除）
                             if peer_addr.ip().is_unspecified() {
                                 log::info!("Phase3: ignore unspecified peer address: {}", peer_addr);
                             } else {
-                                log::info!("Phase3: received peer address: {}", peer_addr);
-                                let is_tcp = self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
+                                log::info!("Phase3: received peer address: {} (ready={}, delta={}, sync_at={})",
+                                    peer_addr, ppa.get_ready(), ppa.get_delta(), ppa.get_sync_at_ms());
+                                let info = crate::common::PunchAddrInfo {
+                                    addr: peer_addr,
+                                    ready: ppa.get_ready(),
+                                    delta: ppa.get_delta(),
+                                    sync_at_ms: ppa.get_sync_at_ms(),
+                                };
+                                // 只有主 STUN 地址（ready=true）才可能触发 TCP 启发式误判，
+                                // 非 ready 的地址（TCP listener 等）直接按端口分类即可；
+                                // 统一先入 UDP 队列，由打洞任务忽略 IPv6/0.0.0.0。
+                                let is_tcp = !info.ready && self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
                                     ppa_ref.lock().map(|addrs| {
-                                        addrs.iter().any(|a| a.ip() == peer_addr.ip() && a.port() != peer_addr.port())
+                                        addrs.iter().any(|a| a.addr.ip() == peer_addr.ip() && a.addr.port() != peer_addr.port())
                                     }).unwrap_or(false)
                                 });
                                 if is_tcp {
@@ -2282,13 +2294,11 @@ impl<T: InvokeUiSession> Remote<T> {
                                             }
                                         }
                                     }
-                                } else {
-                                    if let Some(ref punch_peer) = self.punch_peer_addrs {
-                                        if let Ok(mut addrs) = punch_peer.lock() {
-                                            if !addrs.contains(&peer_addr) {
-                                                addrs.push(peer_addr);
-                                                log::info!("Phase3: added KCP peer address: {}", peer_addr);
-                                            }
+                                } else if let Some(ref punch_peer) = self.punch_peer_addrs {
+                                    if let Ok(mut addrs) = punch_peer.lock() {
+                                        if !addrs.iter().any(|a| a.addr == peer_addr) {
+                                            addrs.push(info);
+                                            log::info!("Phase3: added KCP peer address (ready={}): {}", info.ready, peer_addr);
                                         }
                                     }
                                 }
