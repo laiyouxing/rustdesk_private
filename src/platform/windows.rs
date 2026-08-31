@@ -3727,6 +3727,71 @@ pub fn is_self_service_running() -> bool {
     is_service_running(&crate::get_app_name())
 }
 
+/// 检查服务是否已在 SCM 注册（无论是否运行）
+pub fn is_service_registered(name: &str) -> bool {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    hklm.open_subkey(format!(r"SYSTEM\CurrentControlSet\Services\{}", name))
+        .is_ok()
+}
+
+/// 确保 Windows 服务已注册并运行。
+/// 服务被手动停止或删除后，重启软件时自动恢复。
+/// 需要管理员权限：进程已提权时静默执行，否则触发 UAC 提示。
+pub fn ensure_service_running() {
+    let app_name = crate::get_app_name();
+    if is_self_service_running() {
+        return;
+    }
+    if !is_installed() {
+        log::warn!("ensure_service_running: not installed, skip");
+        return;
+    }
+    let (_, _, _, exe) = get_install_info();
+    let cmds = if is_service_registered(&app_name) {
+        // 服务已注册但停止，直接启动
+        format!("sc start {}", app_name)
+    } else {
+        // 服务被删除，重新创建并启动
+        format!(
+            "sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"\nsc start {app_name}\n",
+            app_name = app_name,
+            exe = exe,
+        )
+    };
+    std::thread::spawn(move || {
+        let tmp = match write_cmds(cmds, "bat", "ensure-service") {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("Failed to write ensure-service cmd: {}", e);
+                return;
+            }
+        };
+        let tmp_fn = tmp.to_str().unwrap_or("").to_owned();
+        let res = runas::Command::new("cmd.exe")
+            .args(&["/C", &tmp_fn])
+            .show(false)
+            .force_prompt(false)
+            .status();
+        let _ = std::fs::remove_file(&tmp);
+        if let Ok(undone) = get_undone_file(&tmp) {
+            let _ = std::fs::remove_file(undone);
+        }
+        if let Err(e) = res {
+            log::warn!("Failed to ensure service running: {}", e);
+            return;
+        }
+        // 等待服务真正启动（最长 10s）
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_secs(1));
+            if is_self_service_running() {
+                log::info!("Service ensured running after startup");
+                return;
+            }
+        }
+        log::warn!("Service still not running after ensure attempt");
+    });
+}
+
 pub fn is_service_running(service_name: &str) -> bool {
     unsafe {
         let service_name = wide_string(service_name);

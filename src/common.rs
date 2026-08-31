@@ -2641,6 +2641,116 @@ static STUNS_V4_DEFAULT: [&str; 8] = [
     "stun.fitauto.ru:3478",
 ];
 
+// ===================== Phase3 打洞统一时序参数 =====================
+// 这些常量被控制端(relay_upgrade_task)与主机端(relay_phase3_punch_to_peer)共用。
+// 两端必须"步调一致"：UDP 打洞要求双方几乎同时向对方发包才能各自打开 NAT 映射，
+// 此前两端每 target 耗时不同(4.1s vs 3.2s)、偏移序列不同、起始时刻不同，导致
+// 双方几乎不可能同时打中正确的地址对，成功率≈0。
+// ---------------------------------------------------------------------
+/// 单个 target 的 KCP 尝试时长（两端一致）
+pub const PUNCH_ROUND_MS: u64 = 8_000;
+/// 精确地址（offset 0）持续打洞总时长：足够长以容忍两端数十秒的起始时间差
+pub const PUNCH_EXACT_MS: u64 = 60_000;
+/// 空包发送间隔（维持 NAT 映射不老化）
+pub const PUNCH_BURST_INTERVAL_MS: u64 = 200;
+/// 统一偏移序列：砍掉原来的 ±50 盲扫（101 个 target × 4s 远超时序预算，
+/// 使一端永远走不到精确地址）。保留"精确 + 小幅漂移"。
+pub const PUNCH_OFFSETS: &[i32] = &[0, 1, -1, 2, -2, 3, -3, 5, -5];
+
+/// NTP 服务器（用于双方时钟对齐的兜底同步）
+static NTP_SERVERS: [&str; 4] = [
+    "pool.ntp.org:123",
+    "time.windows.com:123",
+    "ntp.aliyun.com:123",
+    "time.cloudflare.com:123",
+];
+
+/// 查询 NTP 服务器，返回 (NTP 时间 - 本机时间) 的毫秒偏移。
+/// 用于两端把"约定的发起时刻"对齐到同一绝对时间轴上。
+/// 任一服务器失败则尝试下一个；全部失败返回 None（调用方退化为仅靠本机时钟）。
+pub async fn ntp_offset_ms() -> Option<i64> {
+    for server in NTP_SERVERS.iter() {
+        if let Some(off) = ntp_query_once(server).await {
+            return Some(off);
+        }
+    }
+    None
+}
+
+/// 返回 NTP 校准后的当前 Unix 毫秒时间；NTP 不可用时退化为本机系统时间。
+pub async fn ntp_now_ms() -> i64 {
+    let local = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match ntp_offset_ms().await {
+        Some(off) => local + off,
+        None => local,
+    }
+}
+
+/// 单个 NTP 服务器的 SNTP 查询（RFC 4330 最小实现）
+async fn ntp_query_once(server: &str) -> Option<i64> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let server_addr = server.to_socket_addrs().ok()?.find(|a| a.is_ipv4())?;
+    socket.connect(server_addr).await.ok()?;
+
+    // NTP v4 client request: LI=0(无警告), VN=4, Mode=3(client)
+    let mut req = [0u8; 48];
+    req[0] = 0x23; // 0b00_100_011
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    socket.send(&req).await.ok()?;
+
+    let mut buf = [0u8; 48];
+    // 单台超时 1s：NTP 只是打洞兜底（双方时钟对齐），不应阻塞打洞启动太久
+    let (n, _) = hbb_common::tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    if n < 48 {
+        return None;
+    }
+    let t3 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+
+    // Transmit Timestamp (服务器发出时刻) 位于报文第 40..48 字节
+    let mut secs = 0u32;
+    for (i, &b) in buf[40..44].iter().enumerate() {
+        secs |= (b as u32) << (24 - 8 * i);
+    }
+    let mut frac = 0u32;
+    for (i, &b) in buf[44..48].iter().enumerate() {
+        frac |= (b as u32) << (24 - 8 * i);
+    }
+    let ntp_secs = secs as u64;
+    if ntp_secs == 0 {
+        return None;
+    }
+    // NTP 纪元 1900-01-01，Unix 纪元 1970-01-01，相差 2208988800 秒
+    const NTP_TO_UNIX_SECS: u64 = 2_208_988_800;
+    if ntp_secs < NTP_TO_UNIX_SECS {
+        return None;
+    }
+    let server_unix_ms = (ntp_secs - NTP_TO_UNIX_SECS) as i64 * 1000
+        + ((frac as u64 * 1000) >> 32) as i64;
+
+    // 单向延迟按 RTT/2 估算（t0 发出、t3 收到）
+    let t0_ms = t0.as_millis() as i64;
+    let t3_ms = t3.as_millis() as i64;
+    let rtt = (t3_ms - t0_ms).max(0);
+    Some(server_unix_ms + rtt / 2 - t3_ms)
+}
+
+/// 把 NTP 校准时刻对齐到下一个"轮边界"（PUNCH_ROUND_MS 的整数倍）。
+/// 两端各自调用都会得到同一个绝对时刻，从而在相同时刻同时发起打洞。
+pub fn punch_sync_boundary(now_ntp_ms: i64) -> i64 {
+    let r = PUNCH_ROUND_MS as i64;
+    ((now_ntp_ms / r) + 1) * r
+}
+
 static STUNS_V6: [&str; 8] = [
     "stun.qq.com:3478",
     "stun.miwifi.com:3478",
@@ -2655,7 +2765,7 @@ static STUNS_V6: [&str; 8] = [
 /// Returns the list of STUN servers to use for IPv4.
 /// Checks `custom-stun-server` config option first (comma-separated),
 /// falls back to built-in defaults if empty.
-fn get_stun_servers_v4() -> Vec<String> {
+pub(crate) fn get_stun_servers_v4() -> Vec<String> {
     let custom = Config::get_option("custom-stun-server");
     if custom.is_empty() {
         return STUNS_V4_DEFAULT.iter().map(|s| s.to_string()).collect();
@@ -3043,6 +3153,77 @@ async fn accept_from_ip(
 
 
 
+/// 地址类型（与 message.proto PunchPeerAddr.addr_type 一致）
+pub const PUNCH_ADDR_TYPE_UDP: u32 = 0; // UDP/STUN（KCP 打洞目标）
+pub const PUNCH_ADDR_TYPE_TCP: u32 = 1; // TCP listener（TCP simultaneous open）
+pub const PUNCH_ADDR_TYPE_IPV6: u32 = 2; // IPv6
+
+/// Phase3 地址 + 同步信息。
+/// 两端通过 relay 交换：addr 是打洞目标，ready/delta/sync_at_ms 用于
+/// 让双方在同一时刻、按同一节奏发起打洞（此前两端各自盲扫，窗口互相错过）。
+/// `addr_type` 显式标记地址用途，取代"同 IP 不同端口=TCP"启发式分类。
+#[derive(Clone, Copy, Debug)]
+pub struct PunchAddrInfo {
+    pub addr: std::net::SocketAddr,
+    /// 本端 STUN 已完成、已就绪
+    pub ready: bool,
+    /// 本端对称 NAT delta（端口预测步长）
+    pub delta: i32,
+    /// 约定的打洞起始绝对时刻（NTP 校准后的 Unix 毫秒）
+    pub sync_at_ms: i64,
+    /// 地址类型：PUNCH_ADDR_TYPE_UDP / TCP / IPV6
+    pub addr_type: u32,
+}
+
+impl PunchAddrInfo {
+    pub fn new(addr: std::net::SocketAddr) -> Self {
+        Self { addr, ready: false, delta: 0, sync_at_ms: 0, addr_type: PUNCH_ADDR_TYPE_UDP }
+    }
+    pub fn new_tcp(addr: std::net::SocketAddr) -> Self {
+        Self { addr, ready: false, delta: 0, sync_at_ms: 0, addr_type: PUNCH_ADDR_TYPE_TCP }
+    }
+    pub fn is_tcp(&self) -> bool {
+        self.addr_type == PUNCH_ADDR_TYPE_TCP
+    }
+}
+
+/// 在单个 target 上"持续打洞"：整个时长内并行维持空包（防止 NAT 映射老化），
+/// 同时 KCP 在该时长内反复握手。返回 Some 表示打洞成功。
+///
+/// 这是修复成功率≈0 的关键：改成"长时间持续打同一个精确地址"后，即使两端
+/// 起始时刻相差数十秒，窗口仍有大量重叠，双方能真正同时向对方发包。
+async fn punch_target_sustained(
+    socket: &Arc<UdpSocket>,
+    target: std::net::SocketAddr,
+    duration_ms: u64,
+    prefer_connect: bool,
+) -> Option<(crate::kcp_stream::KcpStream, Stream)> {
+    // 后台持续发空包维持 NAT 映射（打洞成败取决于双方是否都在持续发包）
+    let sock = socket.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let burst = hbb_common::tokio::spawn(async move {
+        while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = sock.send(&[]).await;
+            hbb_common::tokio::time::sleep(Duration::from_millis(PUNCH_BURST_INTERVAL_MS)).await;
+        }
+    });
+
+    let res = crate::kcp_stream::KcpStream::race(
+        socket.clone(),
+        Duration::from_millis(duration_ms),
+        prefer_connect,
+    )
+    .await;
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = burst.await;
+    match res {
+        Ok(v) => Some(v),
+        Err(_) => None,
+    }
+}
+
 /// Returns true if punch succeeded, false otherwise.
 ///
 /// Merged with Phase 3: after STUN, sends our address out through
@@ -3056,13 +3237,11 @@ pub async fn relay_upgrade_task(
     direct_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
     kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
     punch_port: u16,
-    phase3_out_tx: mpsc::Sender<std::net::SocketAddr>,
-    phase3_peer_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
+    phase3_out_tx: mpsc::Sender<PunchAddrInfo>,
+    phase3_peer_rx: Arc<std::sync::Mutex<Vec<PunchAddrInfo>>>,
     phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
     cancel: hbb_common::tokio_util::sync::CancellationToken,
 ) -> bool {
-    use crate::kcp_stream::KcpStream;
-
     // 先等 relay 稳定再启动任何网络操作，避免与中继抢 tokio 运行时资源
     hbb_common::tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -3087,10 +3266,16 @@ pub async fn relay_upgrade_task(
         }
     }
 
+    // 对称 NAT（本端已缓存或刚检测到）无法打洞，直接放弃升级走中继，
+    // 避免白打 180s。Cone/未知则继续。
+    if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
+        log::info!("relay_upgrade_task: NAT type = SYMMETRIC, skipping punch, staying on relay");
+        return false;
+    }
+
     // "以时间换资源"：中继已建立，不急。拉长总预算到 3 分钟，每个目标间隔 1s，
     // 空包只发 2-3 个，让 Phase3 几乎不影响中继操作。
     const TOTAL_BUDGET: Duration = Duration::from_secs(180);
-    const PREDICTED_SCAN_RANGE: u16 = 50;
     let started = std::time::Instant::now();
 
     // Create TCP listener for TCP simultaneous open.
@@ -3143,6 +3328,9 @@ pub async fn relay_upgrade_task(
     // stale on auto-reconnect). Each Phase3 invocation gets its own fresh
     // address discovery, accurate for this specific socket, right now.
     let mut targets = peer_addrs.clone();
+    // 对端精确地址（由 PunchPeerAddr ready 信号提供）与对端 delta
+    let mut peer_exact: Option<std::net::SocketAddr> = None;
+    let mut peer_delta: i32 = 0;
     let mut our_addr: Option<std::net::SocketAddr> = None;
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
@@ -3280,7 +3468,13 @@ pub async fn relay_upgrade_task(
     // IPv6 and TCP listener are sent immediately (they don't need delta).
     if crate::get_ipv6_punch_enabled() {
         if let Some(ipv6_addr) = get_cached_ipv6_addr() {
-            let _ = phase3_out_tx.try_send(ipv6_addr);
+            let _ = phase3_out_tx.try_send(PunchAddrInfo {
+                addr: ipv6_addr,
+                ready: false,
+                delta: 0,
+                sync_at_ms: 0,
+                addr_type: PUNCH_ADDR_TYPE_IPV6,
+            });
             log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
         }
     }
@@ -3292,7 +3486,7 @@ pub async fn relay_upgrade_task(
             our_addr.map(|a| a.ip()).unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()),
             tcp_port,
         );
-        let _ = phase3_out_tx.try_send(tcp_addr);
+        let _ = phase3_out_tx.try_send(PunchAddrInfo::new_tcp(tcp_addr));
         log::info!("Phase3: sent TCP listener address: {}", tcp_addr);
     }
 
@@ -3300,7 +3494,12 @@ pub async fn relay_upgrade_task(
     // On symmetric NAT, the mapped port changes for each different destination.
     // P2: Try multiple alternative servers and take the consensus delta
     // (most common non-zero value) instead of relying on a single server.
-    let our_delta: i32 = if stun_ports.len() >= 2 && our_addr.is_some() {
+    // Cone NAT（已缓存 ASYMMETRIC）端口恒定，delta 必为 0，跳过测量
+    // 以缩小两端打洞起始时刻差。
+    let our_delta: i32 = if Config::get_nat_type() != NatType::ASYMMETRIC as i32
+        && stun_ports.len() >= 2
+        && our_addr.is_some()
+    {
         let base_port = stun_ports[0] as i32;
         let alt_servers = get_stun_servers_v4();
         let mut deltas: Vec<i32> = Vec::new();
@@ -3356,19 +3555,44 @@ pub async fn relay_upgrade_task(
     } else {
         0
     };
+    // NTP 时钟校准 + 计算双方约定的打洞起始时刻（同一绝对时间轴的轮边界）。
+    // 两端各自算出同一个 sync_at，从而在相同时刻同时发起，解决"窗口错位"。
+    // 保存 NTP 偏移供后续等待时用（避免每次重新查询 NTP）。
+    let ntp_offset_ms = ntp_offset_ms().await;
+    let now_ms = || -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64 + ntp_offset_ms.unwrap_or(0))
+            .unwrap_or(0)
+    };
+    let mut sync_at_ms: i64 = 0;
+    if our_addr.is_some() {
+        sync_at_ms = punch_sync_boundary(now_ms());
+        log::info!("Phase3: NTP offset={:?}, now={}, sync_at={}",
+            ntp_offset_ms, now_ms(), sync_at_ms);
+    }
+
     // BUGFIX: Send our address NOW (after delta measurement) so we can include
     // the predicted port for symmetric NAT. On cone NAT both ports are the same.
     // On symmetric NAT the peer needs to try: STUN_port (for our us→STUN mapping)
     // AND STUN_port+our_delta (for our us→peer mapping).
     if let Some(addr) = our_addr {
-        let _ = phase3_out_tx.try_send(addr);
-        log::info!("Phase3: sent our address to relay loop: {}", addr);
+        // ready=true 告知对端：本端 STUN 已完成，可以开始同步打洞
+        let _ = phase3_out_tx.try_send(PunchAddrInfo {
+            addr,
+            ready: true,
+            delta: our_delta,
+            sync_at_ms,
+            addr_type: PUNCH_ADDR_TYPE_UDP,
+        });
+        log::info!("Phase3: sent our address (ready, delta={}, sync_at={}) to relay loop: {}",
+            our_delta, sync_at_ms, addr);
         if our_delta != 0 {
             // i32 域计算后检查 1..=65535，越界则跳过，避免 u16 回绕
             let predicted_port = addr.port() as i32 + our_delta;
             if (1..=65535).contains(&predicted_port) && predicted_port != addr.port() as i32 {
                 let predicted_addr = std::net::SocketAddr::new(addr.ip(), predicted_port as u16);
-                let _ = phase3_out_tx.try_send(predicted_addr);
+                let _ = phase3_out_tx.try_send(PunchAddrInfo::new(predicted_addr));
                 log::info!("Phase3: sent predicted our address for symmetric NAT: {}", predicted_addr);
             }
         }
@@ -3386,91 +3610,68 @@ pub async fn relay_upgrade_task(
             return false;
         }
 
-        // Check for peer Phase 3 addresses and add them to targets.
-        // Instead of blind ±50 port scan, use delta-based prediction:
-        //   - exact peer port (most likely for asymmetric NAT)
-        //   - predicted port (peer_port + our_delta, most likely for symmetric)
-        //   - narrow scan range ±PREDICTED_SCAN_RANGE around base port
-        if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
-            for addr in peer_addrs.drain(..) {
-                let base_port = addr.port();
-                // 1) Exact peer port (before closure to avoid borrow conflict)
-                if !targets.contains(&addr) {
-                    targets.push(addr);
-                    log::info!("Phase3: added peer address {} to targets", addr);
+        // 收集对端地址与同步信息（PunchAddrInfo）。ready=true 的是对端主 STUN
+        // 地址，作为"精确地址"；delta 用于对称 NAT 端口预测。
+        if let Ok(mut infos) = phase3_peer_rx.lock() {
+            for info in infos.drain(..) {
+                if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
+                    continue;
                 }
-                // 2) Predicted port: base_port + our_delta (symmetric NAT heuristic)
-                // i32 域计算后检查 1..=65535，越界则跳过，避免 u16 回绕
-                if our_delta != 0 {
-                    let predicted = base_port as i32 + our_delta;
-                    if (1..=65535).contains(&predicted) && predicted != base_port as i32 {
-                        let mut scan_addr = addr;
-                        scan_addr.set_port(predicted as u16);
-                        if !targets.contains(&scan_addr) {
-                            targets.push(scan_addr);
-                        }
-                    }
-                    log::info!("Phase3: predicted port {} (base {} + delta {})",
-                        predicted, base_port, our_delta);
+                if !targets.contains(&info.addr) {
+                    targets.push(info.addr);
+                    log::info!("Phase3: added peer address {} to targets", info.addr);
                 }
-                // 3) Narrow scan range around base port (i32 域计算，越界跳过)
-                for offset in 1..=PREDICTED_SCAN_RANGE {
-                    for &d in &[offset as i32, -(offset as i32)] {
-                        let p = base_port as i32 + d;
-                        if (1..=65535).contains(&p) && p != base_port as i32 {
-                            let mut scan_addr = addr;
-                            scan_addr.set_port(p as u16);
-                            if !targets.contains(&scan_addr) {
-                                targets.push(scan_addr);
-                            }
-                        }
-                    }
+                // 优先取 ready 的 IPv4 主地址作为精确地址
+                // （主机侧 punch_socket 只绑 IPv4，IPv6 目标必然失败，不选它做精确地址）
+                if info.ready && peer_exact.is_none() && !info.addr.is_ipv6() {
+                    peer_exact = Some(info.addr);
+                    peer_delta = info.delta;
+                    log::info!("Phase3: peer exact address {} (ready, peer_delta={}, sync_at={})",
+                        info.addr, info.delta, info.sync_at_ms);
                 }
-                log::info!("Phase3: predicted scan for {}: {} targets (range ±{}, delta {})",
-                    addr, targets.len(), PREDICTED_SCAN_RANGE, our_delta);
             }
         }
-        // Try each target address with KCP (UDP) hole punching.
-        // Inter-target delay prevents flooding the network and impacting relay traffic.
-        for &target in &targets {
+
+        let exact = match peer_exact {
+            Some(a) => a,
+            None => {
+                // 还没收到对端地址，短暂等待后重试
+                hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        // 同步兜底：若双方已就绪，且约定的起始时刻（NTP 对齐的轮边界）在未来
+        // 且等待不超过 30s，则等到该时刻再开始打洞 —— 两端在同一时刻同时发起，
+        // 彻底消除"窗口错位"。
+        if sync_at_ms > 0 {
+            let wait = sync_at_ms - now_ms();
+            if wait > 0 && wait <= 30_000 {
+                log::info!("Phase3: waiting {}ms until sync_at {} to start punching", wait, sync_at_ms);
+                hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+            }
+        }
+
+        // ===== 阶段 A：在精确地址上"持续打洞" =====
+        // 两端使用同一时长(PUNCH_EXACT_MS)与同一轮长(PUNCH_ROUND_MS)，
+        // 只要两端的活跃窗口有重叠就能同时向对方发包打开 NAT 映射。
+        // 这是修复"窗口错位"的核心：此前每 target 只打 3~4s 就换，
+        // 两端步调不同步导致几乎不可能撞上。
+        let exact_deadline = std::time::Instant::now() + Duration::from_millis(PUNCH_EXACT_MS);
+        while std::time::Instant::now() < exact_deadline {
             if cancel.is_cancelled() {
                 return false;
             }
             if started.elapsed() >= TOTAL_BUDGET {
-                // 预算耗尽也要 break 到轮末的 TCP fallback，而不是直接放弃
                 break;
             }
-            let socket = if target.is_ipv6() {
-                match socket_v6.as_ref() {
-                    Some(s) => s.clone(),
-                    None => continue,
-                }
-            } else {
-                socket_v4.clone()
-            };
-            if socket.connect(target).await.is_err() {
-                continue;
+            let sock = socket_v4.clone();
+            if sock.connect(exact).await.is_err() {
+                break;
             }
-            // Send an initial empty packet immediately after connect to establish
-            // the NAT mapping. Without this, aggressive NATs may drop the mapping
-            // during the 1s sleep gap, causing all subsequent packets to fail.
-            socket.send(&[]).await.ok();
-            // 串行慢慢试：每个目标间隔 1s，让中继操作不被干扰
-            hbb_common::tokio::time::sleep(Duration::from_millis(1000)).await;
-
-            // Minimal burst: 2 packets at 5ms spacing (relay already established, no rush)
-            for _ in 0..2 {
-                if started.elapsed() >= TOTAL_BUDGET {
-                    break;
-                }
-                socket.send(&[]).await.ok();
-                hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-
-            // 单 endpoint 上竞速 connect/accept（控制端优先 connect），
-            // 避免两个 endpoint 在同一 UDP socket 上抢 recv_from 吃掉握手包
-            if let Ok((kcp, stream)) =
-                KcpStream::race(socket.clone(), Duration::from_secs(3), true).await
+            let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
+            let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+            if let Some((kcp, stream)) = punch_target_sustained(&sock, exact, round_ms, true).await
             {
                 if let Ok(mut h) = kcp_handle.lock() {
                     *h = Some(kcp);
@@ -3478,8 +3679,63 @@ pub async fn relay_upgrade_task(
                 let mut guard = direct_stream.lock().await;
                 *guard = Some(stream);
                 notify.notify_one();
-                log::info!("[NAT穿透] Phase3 KCP 打洞成功, 耗时={:?}", started.elapsed());
+                log::info!("[NAT穿透] Phase3 KCP 打洞成功(exact {}), 耗时={:?}", exact, started.elapsed());
                 return true;
+            }
+        }
+
+        // ===== 阶段 B：统一偏移序列扫描 =====
+        // 砍掉原来的 ±50 盲扫：101 个 target × 4s ≈ 414s 远超 180s 预算，
+        // 一端永远走不到真正有效的地址。这里只保留"精确 + 小幅漂移"，
+        // 对称 NAT 额外加入对端 delta 预测。
+        let mut scan_offsets: Vec<i32> = PUNCH_OFFSETS.to_vec();
+        if peer_delta != 0 && !scan_offsets.contains(&peer_delta) {
+            scan_offsets.insert(1, peer_delta);
+        }
+        'offsets: for &offset in scan_offsets.iter() {
+            if offset == 0 {
+                continue; // 精确地址已在阶段 A 充分尝试
+            }
+            for base in targets.iter() {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                if started.elapsed() >= TOTAL_BUDGET {
+                    break 'offsets;
+                }
+                // i32 域计算端口，越界跳过，避免 u16 回绕
+                let p = base.port() as i32 + offset;
+                if !(1..=65535).contains(&p) {
+                    continue;
+                }
+                let mut target = *base;
+                target.set_port(p as u16);
+                let sock = if target.is_ipv6() {
+                    match socket_v6.as_ref() {
+                        Some(s) => s.clone(),
+                        None => continue,
+                    }
+                } else {
+                    socket_v4.clone()
+                };
+                if sock.connect(target).await.is_err() {
+                    continue;
+                }
+                let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
+                let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+                if let Some((kcp, stream)) =
+                    punch_target_sustained(&sock, target, round_ms, true).await
+                {
+                    if let Ok(mut h) = kcp_handle.lock() {
+                        *h = Some(kcp);
+                    }
+                    let mut guard = direct_stream.lock().await;
+                    *guard = Some(stream);
+                    notify.notify_one();
+                    log::info!("[NAT穿透] Phase3 KCP 打洞成功(offset {} -> {}), 耗时={:?}",
+                        offset, target, started.elapsed());
+                    return true;
+                }
             }
         }
 
@@ -3554,25 +3810,19 @@ pub async fn relay_upgrade_task(
         // 轮间休息 2s，让中继操作不被 Phase3 干扰
         hbb_common::tokio::time::sleep(Duration::from_millis(2000)).await;
         // Also check for new Phase 3 addresses during gap
-        if let Ok(mut peer_addrs) = phase3_peer_rx.lock() {
-            for addr in peer_addrs.drain(..) {
-                if !targets.contains(&addr) {
-                    targets.push(addr);
-                    log::info!("Phase3: added peer address {} to targets (during gap)", addr);
+        if let Ok(mut infos) = phase3_peer_rx.lock() {
+            for info in infos.drain(..) {
+                if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
+                    continue;
                 }
-                let base_port = addr.port();
-                for offset in 1..=PREDICTED_SCAN_RANGE {
-                    // i32 域计算，越界跳过，避免 u16 回绕
-                    for &d in &[offset as i32, -(offset as i32)] {
-                        let p = base_port as i32 + d;
-                        if (1..=65535).contains(&p) && p != base_port as i32 {
-                            let mut scan_addr = addr;
-                            scan_addr.set_port(p as u16);
-                            if !targets.contains(&scan_addr) {
-                                targets.push(scan_addr);
-                            }
-                        }
-                    }
+                if !targets.contains(&info.addr) {
+                    targets.push(info.addr);
+                    log::info!("Phase3: added peer address {} to targets (during gap)", info.addr);
+                }
+                if info.ready && peer_exact.is_none() && !info.addr.is_ipv6() {
+                    peer_exact = Some(info.addr);
+                    peer_delta = info.delta;
+                    log::info!("Phase3: peer exact address {} (during gap)", info.addr);
                 }
             }
         }
@@ -3596,14 +3846,13 @@ pub async fn relay_upgrade_task(
 /// same socket, so the NAT mapping is consistent. When `None`, a new socket
 /// is created internally (fallback for edge cases).
 pub async fn relay_phase3_punch_to_peer(
-    targets: Arc<hbb_common::tokio::sync::Mutex<Vec<std::net::SocketAddr>>>,
+    targets: Arc<hbb_common::tokio::sync::Mutex<Vec<PunchAddrInfo>>>,
     kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
     punch_socket: Option<Arc<tokio::net::UdpSocket>>,
     tcp_listener: Option<Arc<tokio::net::TcpListener>>,
     upgraded: Arc<std::sync::atomic::AtomicBool>,
+    stun_done: Arc<std::sync::atomic::AtomicBool>,
 ) -> ResultType<Stream> {
-    use crate::kcp_stream::KcpStream;
-
     // Use the persistent punch socket if available, otherwise create a new one.
     let socket = if let Some(s) = punch_socket {
         s
@@ -3617,54 +3866,42 @@ pub async fn relay_phase3_punch_to_peer(
         Arc::new(UdpSocket::bind(bind_addr).await?)
     };
 
+    // 对称 NAT（本端已缓存）无法打洞，直接放弃走中继，避免白打 180s
+    if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
+        bail!("Phase3(Host) NAT type = SYMMETRIC, skipping punch");
+    }
+
+    // 等待 STUN 任务结束再操作共享 socket：socket.connect(target) 会过滤掉
+    // 来自其他地址的包（STUN 响应），kcp_io 的 recv_from 也会抢走 STUN 包。
+    // 最多等 5s（STUN 查询本身有 3s 超时），避免打洞任务被永久阻塞。
+    for _ in 0..50 {
+        if stun_done.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // 与控制端 TOTAL_BUDGET(180s) 对齐：主机任务死了控制端单方面不可能成功
     const MAX_TIME: Duration = Duration::from_secs(180);
     let started = std::time::Instant::now();
 
-    // Measure our symmetric NAT delta to predict peer's port offset.
-    let our_delta: i32 = {
-        let servers_v4 = get_stun_servers_v4();
-        if servers_v4.is_empty() {
-            0
-        } else {
-            // STUN to first server to get base port
-            if let Ok((base_addr, _)) = stun_query_single_server(&socket, &servers_v4[0]).await {
-                let base_port = base_addr.port() as i32;
-                // Try a different server to measure delta
-                let alt = servers_v4.get(1).unwrap_or(&servers_v4[0]);
-                if let Some(alt_addr) = alt.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4())) {
-                    let _ = socket.connect(alt_addr).await;
-                    socket.send(&[]).await.ok();
-                    if let Ok((alt_addr, _)) = stun_query_single_server(&socket, alt).await {
-                        let delta = alt_addr.port() as i32 - base_port;
-                        log::info!("Phase3(Host): symmetric delta measured: {} (base {}, alt {})",
-                            delta, base_port, alt_addr.port());
-                        delta
-                    } else { 0 }
-                } else { 0 }
-            } else { 0 }
-        }
+    // NTP 时钟校准 + 双方约定的打洞起始时刻（与控制端计算方式一致）
+    let ntp_offset_ms = crate::common::ntp_offset_ms().await;
+    let host_now_ms = || -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64 + ntp_offset_ms.unwrap_or(0))
+            .unwrap_or(0)
     };
+    let sync_at_ms: i64 = punch_sync_boundary(host_now_ms());
+    log::info!("Phase3(Host): NTP offset={:?}, now={}, sync_at={}",
+        ntp_offset_ms, host_now_ms(), sync_at_ms);
 
-    // Build port offset list: prioritized by likelihood.
-    // - 0: exact match (asymmetric NAT)
-    // - our_delta: prediction for symmetric NAT
-    // - ±1, ±2, ±3: small drift
-    // - ±5, ±10, ±20: larger drift
-    // Extended to ±50 to match the connector-side scan range (PREDICTED_SCAN_RANGE=50),
-    // improving hit rate on symmetric NAT where per-destination port increment can be large.
-    let mut port_offsets: Vec<i32> = vec![0];
-    if our_delta != 0 && !port_offsets.contains(&our_delta) {
-        port_offsets.push(our_delta);
-    }
-    for d in [1i32, -1, 2, -2, 3, -3, 5, -5, 10, -10, 20, -20, 30, -30, 40, -40, 50, -50] {
-        if !port_offsets.contains(&d) {
-            port_offsets.push(d);
-        }
-    }
+    // 对端精确地址（由 PunchPeerAddr ready 信号提供）与对端 delta
+    let mut peer_exact: Option<std::net::SocketAddr> = None;
+    let mut peer_delta: i32 = 0;
+    let mut round_targets: Vec<PunchAddrInfo> = Vec::new();
 
-    let mut round_targets: Vec<std::net::SocketAddr> = Vec::new();
-    let mut round = 0usize;
     loop {
         if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("Phase3(Host) stop punch: already upgraded");
@@ -3676,52 +3913,106 @@ pub async fn relay_phase3_punch_to_peer(
         // Drain newly arrived peer addresses from the queue.
         {
             let mut q = targets.lock().await;
-            for addr in q.drain(..) {
-                if !round_targets.contains(&addr) {
-                    round_targets.push(addr);
-                    log::info!("Phase3(Host): added peer address {} to targets", addr);
+            for info in q.drain(..) {
+                if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
+                    continue;
+                }
+                if !round_targets.iter().any(|t| t.addr == info.addr) {
+                    round_targets.push(info);
+                    log::info!("Phase3(Host): added peer address {} (type={}) to targets",
+                        info.addr, info.addr_type);
+                }
+                // 优先取 ready 的 UDP 主地址作为精确地址（TCP/IPv6 地址不能作为 UDP 打洞目标）
+                if info.ready && info.addr_type == PUNCH_ADDR_TYPE_UDP && peer_exact.is_none() {
+                    peer_exact = Some(info.addr);
+                    peer_delta = info.delta;
+                    log::info!("Phase3(Host): peer exact address {} (ready, peer_delta={}, sync_at={})",
+                        info.addr, info.delta, info.sync_at_ms);
                 }
             }
         }
-        if round_targets.is_empty() {
-            // 队列暂空，500ms 后看是否有新地址
-            hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        }
-        round += 1;
-        let offsets: &[i32] = if round == 1 { &port_offsets[..5.min(port_offsets.len())] } else { &port_offsets };
 
-        for &peer_addr in &round_targets {
-            for &offset in offsets {
+        let exact = match peer_exact {
+            Some(a) => a,
+            None => {
+                // 队列暂空，500ms 后看是否有新地址
+                hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        // 同步兜底：等到约定的起始时刻（NTP 对齐的轮边界）再开始打洞，
+        // 与控制端在同一时刻同时发起。等待不超过 30s，避免卡死。
+        if sync_at_ms > 0 {
+            let wait = sync_at_ms - host_now_ms();
+            if wait > 0 && wait <= 30_000 {
+                log::info!("Phase3(Host): waiting {}ms until sync_at {} to start punching", wait, sync_at_ms);
+                hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+            }
+        }
+
+        // ===== 阶段 A：在精确地址上持续打洞（与控制端同一时长/轮长）=====
+        // 主机端优先 accept（prefer_connect=false）。
+        let exact_deadline = std::time::Instant::now() + Duration::from_millis(PUNCH_EXACT_MS);
+        while std::time::Instant::now() < exact_deadline {
+            if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
+                bail!("Phase3(Host) stop punch: already upgraded");
+            }
+            if started.elapsed() >= MAX_TIME {
+                bail!("Phase3(Host) punch timed out");
+            }
+            if socket.connect(exact).await.is_err() { break; }
+            let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
+            let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+            if let Some((kcp, stream)) =
+                punch_target_sustained(&socket, exact, round_ms, false).await
+            {
+                if let Ok(mut h) = kcp_handle.lock() {
+                    *h = Some(kcp);
+                }
+                log::info!("Phase3(Host) KCP punch to exact {} succeeded after {:?}",
+                    exact, started.elapsed());
+                return Ok(stream);
+            }
+        }
+
+        // ===== 阶段 B：统一偏移序列扫描（对端 delta 预测 + 小幅漂移）=====
+        let mut scan_offsets: Vec<i32> = PUNCH_OFFSETS.to_vec();
+        if peer_delta != 0 && !scan_offsets.contains(&peer_delta) {
+            scan_offsets.insert(1, peer_delta);
+        }
+        'offsets: for &offset in scan_offsets.iter() {
+            if offset == 0 {
+                continue; // 精确地址已在阶段 A 充分尝试
+            }
+            for base in round_targets.iter() {
+                // TCP listener 地址不是 UDP 打洞目标，跳过（留给 TCP fallback）
+                if base.is_tcp() {
+                    continue;
+                }
                 if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
                     bail!("Phase3(Host) stop punch: already upgraded");
                 }
                 if started.elapsed() >= MAX_TIME {
-                    bail!("Phase3(Host) punch timed out");
+                    break 'offsets;
                 }
                 // i32 域计算端口，越界跳过，避免 u16 回绕
-                let new_port = peer_addr.port() as i32 + offset;
+                let new_port = base.addr.port() as i32 + offset;
                 if !(1..=65535).contains(&new_port) { continue; }
-                let mut target = peer_addr;
+                let mut target = base.addr;
                 target.set_port(new_port as u16);
 
                 if socket.connect(target).await.is_err() { continue; }
-
-                // 空包 burst 打开 NAT 映射
-                for _ in 0..20 {
-                    socket.send(&[]).await.ok();
-                    hbb_common::tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-
-                // 单 endpoint 上竞速 connect/accept（主机优先 accept），
-                // 避免两个 endpoint 在同一 UDP socket 上抢 recv_from 吃掉握手包
-                if let Ok((kcp, stream)) =
-                    KcpStream::race(socket.clone(), Duration::from_secs(3), false).await
+                let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
+                let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+                if let Some((kcp, stream)) =
+                    punch_target_sustained(&socket, target, round_ms, false).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
                     }
-                    log::info!("Phase3(Host) KCP punch to {} succeeded after {:?}", target, started.elapsed());
+                    log::info!("Phase3(Host) KCP punch to {} (offset {}) succeeded after {:?}",
+                        target, offset, started.elapsed());
                     return Ok(stream);
                 }
             }
@@ -3730,15 +4021,14 @@ pub async fn relay_phase3_punch_to_peer(
         // After KCP rounds, try TCP simultaneous open on remaining budget.
         {
             const TCP_SCAN_MAX: i32 = 20;
-            let tcp_offsets: &[i32] = if round == 1 { &[0] }
-                else { &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX] };
-            for &peer_addr in &round_targets {
+            let tcp_offsets: &[i32] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX];
+            for base in &round_targets {
                 for &offset in tcp_offsets {
                     if started.elapsed() >= MAX_TIME { break; }
                     // i32 域计算端口，越界跳过，避免 u16 回绕
-                    let new_port = peer_addr.port() as i32 + offset;
+                    let new_port = base.addr.port() as i32 + offset;
                     if !(1..=65535).contains(&new_port) { continue; }
-                    let mut tcp_target = peer_addr;
+                    let mut tcp_target = base.addr;
                     tcp_target.set_port(new_port as u16);
 
                     let result: Option<tokio::net::TcpStream> = if let Some(ref listener) = tcp_listener {
