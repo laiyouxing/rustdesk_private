@@ -458,10 +458,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut misc = Misc::new();
                             let mut ppa = PunchPeerAddr::new();
                             ppa.addr = phase3_my_info.addr.to_string().into();
-                            ppa.set_ready(phase3_my_info.ready);
-                            ppa.set_delta(phase3_my_info.delta);
-                            ppa.set_sync_at_ms(phase3_my_info.sync_at_ms);
-                            ppa.set_addr_type(phase3_my_info.addr_type);
+                            ppa.ready = phase3_my_info.ready;
+                            ppa.delta = phase3_my_info.delta;
+                            ppa.sync_at_ms = phase3_my_info.sync_at_ms;
+                            ppa.addr_type = phase3_my_info.addr_type;
                             misc.set_punch_peer_addr(ppa);
                             let mut msg = Message::new();
                             msg.set_misc(misc);
@@ -2271,15 +2271,15 @@ impl<T: InvokeUiSession> Remote<T> {
                             if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
                                 log::info!("Phase3: ignore unusable peer address: {}", peer_addr);
                             } else {
-                                let addr_type = ppa.get_addr_type();
+                                let addr_type = ppa.addr_type;
                                 log::info!("Phase3: received peer address: {} (ready={}, delta={}, sync_at={}, type={})",
-                                    peer_addr, ppa.get_ready(), ppa.get_delta(),
-                                    ppa.get_sync_at_ms(), addr_type);
+                                    peer_addr, ppa.ready, ppa.delta,
+                                    ppa.sync_at_ms, addr_type);
                                 let info = crate::common::PunchAddrInfo {
                                     addr: peer_addr,
-                                    ready: ppa.get_ready(),
-                                    delta: ppa.get_delta(),
-                                    sync_at_ms: ppa.get_sync_at_ms(),
+                                    ready: ppa.ready,
+                                    delta: ppa.delta,
+                                    sync_at_ms: ppa.sync_at_ms,
                                     addr_type,
                                 };
                                 if addr_type == crate::common::PUNCH_ADDR_TYPE_TCP {

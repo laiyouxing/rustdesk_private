@@ -1063,9 +1063,10 @@ impl Connection {
                     let mut misc = Misc::new();
                     let mut ppa = PunchPeerAddr::new();
                     ppa.addr = phase3_my_info.addr.to_string().into();
-                    ppa.set_ready(phase3_my_info.ready);
-                    ppa.set_delta(phase3_my_info.delta);
-                    ppa.set_sync_at_ms(phase3_my_info.sync_at_ms);
+                    ppa.ready = phase3_my_info.ready;
+                    ppa.delta = phase3_my_info.delta;
+                    ppa.sync_at_ms = phase3_my_info.sync_at_ms;
+                    ppa.addr_type = phase3_my_info.addr_type;
                     misc.set_punch_peer_addr(ppa);
                     let mut msg = Message::new();
                     msg.set_misc(misc);
@@ -2550,7 +2551,7 @@ impl Connection {
                 if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
                 {
                     log::info!("Phase3(Host): received peer address: {} (ready={}, delta={}, sync_at={}, type={})",
-                        peer_addr, ppa.get_ready(), ppa.get_delta(), ppa.get_sync_at_ms(), ppa.get_addr_type());
+                        peer_addr, ppa.ready, ppa.delta, ppa.sync_at_ms, ppa.addr_type);
                     // 忽略不可用地址：0.0.0.0 不可打洞，IPv6 与 v4 punch_socket 不匹配
                     if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
                         log::info!("Phase3(Host): ignore unusable address {}", peer_addr);
@@ -2563,10 +2564,10 @@ impl Connection {
                         // （每条消息 spawn 一个任务会共享 socket 互相 connect 覆盖、抢 recv_from）
                         let info = crate::common::PunchAddrInfo {
                             addr: peer_addr,
-                            ready: ppa.get_ready(),
-                            delta: ppa.get_delta(),
-                            sync_at_ms: ppa.get_sync_at_ms(),
-                            addr_type: ppa.get_addr_type(),
+                            ready: ppa.ready,
+                            delta: ppa.delta,
+                            sync_at_ms: ppa.sync_at_ms,
+                            addr_type: ppa.addr_type,
                         };
                         if let Some(ref targets) = self.phase3_targets {
                             targets.lock().await.push(info);
