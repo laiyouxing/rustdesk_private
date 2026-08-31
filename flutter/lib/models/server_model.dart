@@ -123,7 +123,7 @@ class ServerModel with ChangeNotifier {
         kOptionAllowNumericOneTimePassword, !_allowNumericOneTimePassword);
   }
 
-  TextEditingController get serverId => _serverId;
+  IDTextEditingController get serverId => _serverId;
   TextEditingController get hostname => _hostname;
   String get systemHostname => _systemHostname;
 
