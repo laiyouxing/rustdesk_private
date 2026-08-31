@@ -2765,7 +2765,7 @@ static STUNS_V6: [&str; 8] = [
 /// Returns the list of STUN servers to use for IPv4.
 /// Checks `custom-stun-server` config option first (comma-separated),
 /// falls back to built-in defaults if empty.
-fn get_stun_servers_v4() -> Vec<String> {
+pub(crate) fn get_stun_servers_v4() -> Vec<String> {
     let custom = Config::get_option("custom-stun-server");
     if custom.is_empty() {
         return STUNS_V4_DEFAULT.iter().map(|s| s.to_string()).collect();

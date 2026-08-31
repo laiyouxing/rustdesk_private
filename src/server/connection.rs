@@ -684,7 +684,7 @@ impl Connection {
                                 let alt = servers.get(1).or_else(|| servers.first());
                                 match alt {
                                     Some(srv) => {
-                                        if let Some(alt_addr) = srv.to_socket_addrs().ok()
+                                        if let Some(alt_addr) = std::net::ToSocketAddrs::to_socket_addrs(srv).ok()
                                             .and_then(|mut i| i.find(|a| a.is_ipv4()))
                                         {
                                             let _ = socket.connect(alt_addr).await;
