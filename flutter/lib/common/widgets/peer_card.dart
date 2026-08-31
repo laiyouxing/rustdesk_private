@@ -1602,7 +1602,8 @@ Future<bool> checkSubscriptionExpired(BuildContext context) async {
       if (body is Map && body['data'] is Map) {
         final data = body['data'];
         final status = data['status'] ?? 'none';
-        return status != 'active';
+        // active 与 permanent 均视为有效订阅
+        return status != 'active' && status != 'permanent';
       }
     }
   } catch (_) {
