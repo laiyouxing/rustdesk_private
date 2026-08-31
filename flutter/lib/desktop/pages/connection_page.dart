@@ -641,7 +641,21 @@ class _ConnectionPageState extends State<ConnectionPage>
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                // 将本机 ID 添加到个人地址薄
+                // 保存本机名称
+                SizedBox(
+                  height: 28.0,
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      await model.saveHostname(model.hostname.text);
+                      showToast('保存成功',
+                          bgColor: const Color(0xFFE8F5E9),
+                          textColor: const Color(0xFF2E7D32));
+                    },
+                    child: Text("保存"),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // 将本机 ID 添加到个人地址薄（需先填写本机名称）
                 SizedBox(
                   height: 28.0,
                   child: OutlinedButton(
@@ -653,6 +667,10 @@ class _ConnectionPageState extends State<ConnectionPage>
                         return;
                       }
                       final name = model.hostname.text.trim();
+                      if (name.isEmpty) {
+                        showToast(translate('Please enter hostname first'));
+                        return;
+                      }
                       final peer = Peer(
                         id: id,
                         hash: '',
@@ -672,19 +690,6 @@ class _ConnectionPageState extends State<ConnectionPage>
                       addPeersToAbDialog([peer]);
                     },
                     child: Text(translate('Add my ID to address book')),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                SizedBox(
-                  height: 28.0,
-                  child: ElevatedButton(
-                    onPressed: () async {
-                      await model.saveHostname(model.hostname.text);
-                      showToast('保存成功',
-                          bgColor: const Color(0xFFE8F5E9),
-                          textColor: const Color(0xFF2E7D32));
-                    },
-                    child: Text("保存"),
                   ),
                 ),
               ],

@@ -406,6 +406,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Skipped", "已跳过"),
         ("Add to address book", "添加到地址簿"),
         ("Add my ID to address book", "加入地址薄"),
+        ("Please enter hostname first", "请先填写本机名称"),
         ("ID is not ready yet, please try again later", "本机 ID 未生成，请稍后再试"),
         ("Group", "小组"),
         ("Search", "搜索"),
