@@ -446,18 +446,26 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       if (updateUrl.isNotEmpty && !isCardClosed) {
         final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
         String btnText = isToUpdate ? 'Update' : 'Download';
+        // 自定义客户端下载地址优先级：API 返回的 updateUrl > api-server /downloads > 官网
         GestureTapCallback onPressed = () async {
+          if (isToUpdate) {
+            handleUpdate(updateUrl);
+            return;
+          }
           final apiServer = await bind.mainGetApiServer();
-          final url = apiServer.isNotEmpty
-              ? Uri.parse(apiServer + '/downloads')
-              : Uri.parse('https://rustdesk.com/download');
+          final Uri url;
+          if (updateUrl.isNotEmpty && !updateUrl.startsWith('https://github.com/rustdesk')) {
+            url = Uri.parse(updateUrl);
+          } else if (apiServer.isNotEmpty) {
+            url = Uri.parse(apiServer + '/downloads');
+          } else {
+            url = Uri.parse('https://rustdesk.com/download');
+          }
           await launchUrl(url);
         };
-        if (isToUpdate) {
-          onPressed = () {
-            handleUpdate(updateUrl);
-          };
-        }
+        final downloadLink = (updateUrl.isNotEmpty && !updateUrl.startsWith('https://github.com/rustdesk'))
+            ? updateUrl
+            : 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}';
         cards.add(buildInstallCard(
             "Status",
             "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
@@ -465,9 +473,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             onPressed,
             closeButton: true,
             help: isToUpdate ? 'Changelog' : null,
-            link: isToUpdate
-                ? 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}'
-                : null));
+            link: isToUpdate ? downloadLink : null));
       }
       if (cards.isNotEmpty) {
         return Column(children: cards);
