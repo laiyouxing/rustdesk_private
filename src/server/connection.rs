@@ -341,6 +341,10 @@ pub struct Connection {
     phase3_started: Option<Arc<std::sync::atomic::AtomicBool>>,
     // Phase 3: whether the stream has already been switched to direct.
     phase3_upgraded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Phase 3: STUN 任务是否已结束（成功或失败）。打洞任务须等它完成再操作
+    // 共享 socket，避免 socket.connect(target) 过滤掉 STUN 响应、kcp_io 抢
+    // recv_from 吃掉 STUN 包。
+    phase3_stun_done: Option<Arc<std::sync::atomic::AtomicBool>>,
     // Phase 3: TCP listener for simultaneous open, bound at setup time and
     // kept alive with the connection so the punch task can accept on it.
     phase3_tcp_listener: Option<Arc<tokio::net::TcpListener>>,
@@ -533,6 +537,7 @@ impl Connection {
             phase3_targets: Some(Arc::new(hbb_common::tokio::sync::Mutex::new(Vec::new()))),
             phase3_started: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             phase3_upgraded: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            phase3_stun_done: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             phase3_tcp_listener: None,
             phase3_task: None,
         };
@@ -651,6 +656,8 @@ impl Connection {
                 .and_then(|l| l.local_addr().ok())
                 .map(|a| a.port());
             conn.phase3_tcp_listener = phase3_tcp_listener;
+            // STUN 完成标志：打洞任务须等它置位才能操作共享 socket
+            let stun_done = conn.phase3_stun_done.clone().unwrap();
             tokio::spawn(async move {
                 // 1. STUN to discover our public IPv4 address using the persistent socket
                 if let Some(ref socket) = punch_socket {
@@ -668,7 +675,11 @@ impl Connection {
                             });
                             // 测量主机自身对称 NAT delta：向另一台 STUN 服务器查询，
                             // 端口差即 delta。对称 NAT 时控制端需用它预测主机端口。
-                            let host_delta = {
+                            // Cone NAT（已缓存 ASYMMETRIC）端口恒定 delta=0，跳过测量
+                            // 以缩小两端打洞起始时刻差。
+                            let host_delta = if Config::get_nat_type() == NatType::ASYMMETRIC as i32 {
+                                0
+                            } else {
                                 let servers = crate::common::get_stun_servers_v4();
                                 let alt = servers.get(1).or_else(|| servers.first());
                                 match alt {
@@ -689,12 +700,13 @@ impl Connection {
                             };
                             log::info!("Phase3(Host): host symmetric delta = {}", host_delta);
                             // ready=true：告知对端本端已就绪；delta 供对端预测主机端口；
-                            // sync_at_ms 用于双方时钟对齐
+                            // sync_at_ms 用于双方时钟对齐；addr_type=UDP 供对端显式分类
                             let ready_info = crate::common::PunchAddrInfo {
                                 addr: stun_addr,
                                 ready: true,
                                 delta: host_delta,
                                 sync_at_ms,
+                                addr_type: crate::common::PUNCH_ADDR_TYPE_UDP,
                             };
                             if phase3_tx.send(ready_info).await.is_err() {
                                 log::info!("Phase3(Host): failed to send own address");
@@ -703,7 +715,7 @@ impl Connection {
                             if let Some(tcp_port_val) = tcp_port {
                                 let tcp_addr = std::net::SocketAddr::new(
                                     stun_addr.ip(), tcp_port_val);
-                                let _ = phase3_tx.send(crate::common::PunchAddrInfo::new(tcp_addr)).await;
+                                let _ = phase3_tx.send(crate::common::PunchAddrInfo::new_tcp(tcp_addr)).await;
                                 log::info!("Phase3(Host): sent TCP listener address: {}", tcp_addr);
                             }
                         }
@@ -720,10 +732,18 @@ impl Connection {
                             status: "cone_nat".to_owned(),
                             info: ipv6_addr.to_string(),
                         });
-                        let _ = phase3_tx.send(crate::common::PunchAddrInfo::new(ipv6_addr)).await;
+                        let _ = phase3_tx.send(crate::common::PunchAddrInfo {
+                            addr: ipv6_addr,
+                            ready: false,
+                            delta: 0,
+                            sync_at_ms: 0,
+                            addr_type: crate::common::PUNCH_ADDR_TYPE_IPV6,
+                        }).await;
                         log::info!("Phase3(Host): sent IPv6 address to peer: {}", ipv6_addr);
                     }
                 }
+                // STUN（及地址广播）全部完成，打洞任务可以安全操作共享 socket
+                stun_done.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         }
 
@@ -2529,8 +2549,8 @@ impl Connection {
             if let Some(misc::Union::PunchPeerAddr(ppa)) = &misc.union {
                 if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
                 {
-                    log::info!("Phase3(Host): received peer address: {} (ready={}, delta={}, sync_at={})",
-                        peer_addr, ppa.get_ready(), ppa.get_delta(), ppa.get_sync_at_ms());
+                    log::info!("Phase3(Host): received peer address: {} (ready={}, delta={}, sync_at={}, type={})",
+                        peer_addr, ppa.get_ready(), ppa.get_delta(), ppa.get_sync_at_ms(), ppa.get_addr_type());
                     // 忽略不可用地址：0.0.0.0 不可打洞，IPv6 与 v4 punch_socket 不匹配
                     if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
                         log::info!("Phase3(Host): ignore unusable address {}", peer_addr);
@@ -2539,13 +2559,14 @@ impl Connection {
                     }) {
                         log::info!("Phase3(Host): already upgraded, ignore {}", peer_addr);
                     } else {
-                        // 地址入队（携带同步信号），由唯一打洞任务消费
+                        // 地址入队（携带同步信号与显式类型），由唯一打洞任务消费
                         // （每条消息 spawn 一个任务会共享 socket 互相 connect 覆盖、抢 recv_from）
                         let info = crate::common::PunchAddrInfo {
                             addr: peer_addr,
                             ready: ppa.get_ready(),
                             delta: ppa.get_delta(),
                             sync_at_ms: ppa.get_sync_at_ms(),
+                            addr_type: ppa.get_addr_type(),
                         };
                         if let Some(ref targets) = self.phase3_targets {
                             targets.lock().await.push(info);
@@ -2560,13 +2581,14 @@ impl Connection {
                             let targets = self.phase3_targets.clone().unwrap();
                             let upgraded = self.phase3_upgraded.clone().unwrap();
                             let tcp_listener = self.phase3_tcp_listener.clone();
+                            let stun_done = self.phase3_stun_done.clone().unwrap();
                             let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
                                 Arc::new(std::sync::Mutex::new(None));
                             // KcpStream 随 Connection 存活，避免打洞任务结束后被 drop 停掉 kcp_io
                             self.phase3_kcp = Some(kcp_handle.clone());
                             self.phase3_task = Some(tokio::spawn(async move {
                                 match relay_phase3_punch_to_peer(
-                                    targets, kcp_handle, punch_socket, tcp_listener, upgraded,
+                                    targets, kcp_handle, punch_socket, tcp_listener, upgraded, stun_done,
                                 ).await {
                                     Ok(stream) => {
                                         if let Some(s) = punch_stream {

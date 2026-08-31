@@ -3153,9 +3153,15 @@ async fn accept_from_ip(
 
 
 
+/// 地址类型（与 message.proto PunchPeerAddr.addr_type 一致）
+pub const PUNCH_ADDR_TYPE_UDP: u32 = 0; // UDP/STUN（KCP 打洞目标）
+pub const PUNCH_ADDR_TYPE_TCP: u32 = 1; // TCP listener（TCP simultaneous open）
+pub const PUNCH_ADDR_TYPE_IPV6: u32 = 2; // IPv6
+
 /// Phase3 地址 + 同步信息。
 /// 两端通过 relay 交换：addr 是打洞目标，ready/delta/sync_at_ms 用于
 /// 让双方在同一时刻、按同一节奏发起打洞（此前两端各自盲扫，窗口互相错过）。
+/// `addr_type` 显式标记地址用途，取代"同 IP 不同端口=TCP"启发式分类。
 #[derive(Clone, Copy, Debug)]
 pub struct PunchAddrInfo {
     pub addr: std::net::SocketAddr,
@@ -3165,11 +3171,19 @@ pub struct PunchAddrInfo {
     pub delta: i32,
     /// 约定的打洞起始绝对时刻（NTP 校准后的 Unix 毫秒）
     pub sync_at_ms: i64,
+    /// 地址类型：PUNCH_ADDR_TYPE_UDP / TCP / IPV6
+    pub addr_type: u32,
 }
 
 impl PunchAddrInfo {
     pub fn new(addr: std::net::SocketAddr) -> Self {
-        Self { addr, ready: false, delta: 0, sync_at_ms: 0 }
+        Self { addr, ready: false, delta: 0, sync_at_ms: 0, addr_type: PUNCH_ADDR_TYPE_UDP }
+    }
+    pub fn new_tcp(addr: std::net::SocketAddr) -> Self {
+        Self { addr, ready: false, delta: 0, sync_at_ms: 0, addr_type: PUNCH_ADDR_TYPE_TCP }
+    }
+    pub fn is_tcp(&self) -> bool {
+        self.addr_type == PUNCH_ADDR_TYPE_TCP
     }
 }
 
@@ -3250,6 +3264,13 @@ pub async fn relay_upgrade_task(
                 );
             }
         }
+    }
+
+    // 对称 NAT（本端已缓存或刚检测到）无法打洞，直接放弃升级走中继，
+    // 避免白打 180s。Cone/未知则继续。
+    if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
+        log::info!("relay_upgrade_task: NAT type = SYMMETRIC, skipping punch, staying on relay");
+        return false;
     }
 
     // "以时间换资源"：中继已建立，不急。拉长总预算到 3 分钟，每个目标间隔 1s，
@@ -3447,7 +3468,13 @@ pub async fn relay_upgrade_task(
     // IPv6 and TCP listener are sent immediately (they don't need delta).
     if crate::get_ipv6_punch_enabled() {
         if let Some(ipv6_addr) = get_cached_ipv6_addr() {
-            let _ = phase3_out_tx.try_send(PunchAddrInfo::new(ipv6_addr));
+            let _ = phase3_out_tx.try_send(PunchAddrInfo {
+                addr: ipv6_addr,
+                ready: false,
+                delta: 0,
+                sync_at_ms: 0,
+                addr_type: PUNCH_ADDR_TYPE_IPV6,
+            });
             log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
         }
     }
@@ -3459,7 +3486,7 @@ pub async fn relay_upgrade_task(
             our_addr.map(|a| a.ip()).unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()),
             tcp_port,
         );
-        let _ = phase3_out_tx.try_send(PunchAddrInfo::new(tcp_addr));
+        let _ = phase3_out_tx.try_send(PunchAddrInfo::new_tcp(tcp_addr));
         log::info!("Phase3: sent TCP listener address: {}", tcp_addr);
     }
 
@@ -3467,7 +3494,12 @@ pub async fn relay_upgrade_task(
     // On symmetric NAT, the mapped port changes for each different destination.
     // P2: Try multiple alternative servers and take the consensus delta
     // (most common non-zero value) instead of relying on a single server.
-    let our_delta: i32 = if stun_ports.len() >= 2 && our_addr.is_some() {
+    // Cone NAT（已缓存 ASYMMETRIC）端口恒定，delta 必为 0，跳过测量
+    // 以缩小两端打洞起始时刻差。
+    let our_delta: i32 = if Config::get_nat_type() != NatType::ASYMMETRIC as i32
+        && stun_ports.len() >= 2
+        && our_addr.is_some()
+    {
         let base_port = stun_ports[0] as i32;
         let alt_servers = get_stun_servers_v4();
         let mut deltas: Vec<i32> = Vec::new();
@@ -3551,6 +3583,7 @@ pub async fn relay_upgrade_task(
             ready: true,
             delta: our_delta,
             sync_at_ms,
+            addr_type: PUNCH_ADDR_TYPE_UDP,
         });
         log::info!("Phase3: sent our address (ready, delta={}, sync_at={}) to relay loop: {}",
             our_delta, sync_at_ms, addr);
@@ -3818,6 +3851,7 @@ pub async fn relay_phase3_punch_to_peer(
     punch_socket: Option<Arc<tokio::net::UdpSocket>>,
     tcp_listener: Option<Arc<tokio::net::TcpListener>>,
     upgraded: Arc<std::sync::atomic::AtomicBool>,
+    stun_done: Arc<std::sync::atomic::AtomicBool>,
 ) -> ResultType<Stream> {
     // Use the persistent punch socket if available, otherwise create a new one.
     let socket = if let Some(s) = punch_socket {
@@ -3831,6 +3865,21 @@ pub async fn relay_phase3_punch_to_peer(
         };
         Arc::new(UdpSocket::bind(bind_addr).await?)
     };
+
+    // 对称 NAT（本端已缓存）无法打洞，直接放弃走中继，避免白打 180s
+    if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
+        bail!("Phase3(Host) NAT type = SYMMETRIC, skipping punch");
+    }
+
+    // 等待 STUN 任务结束再操作共享 socket：socket.connect(target) 会过滤掉
+    // 来自其他地址的包（STUN 响应），kcp_io 的 recv_from 也会抢走 STUN 包。
+    // 最多等 5s（STUN 查询本身有 3s 超时），避免打洞任务被永久阻塞。
+    for _ in 0..50 {
+        if stun_done.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // 与控制端 TOTAL_BUDGET(180s) 对齐：主机任务死了控制端单方面不可能成功
     const MAX_TIME: Duration = Duration::from_secs(180);
@@ -3851,7 +3900,7 @@ pub async fn relay_phase3_punch_to_peer(
     // 对端精确地址（由 PunchPeerAddr ready 信号提供）与对端 delta
     let mut peer_exact: Option<std::net::SocketAddr> = None;
     let mut peer_delta: i32 = 0;
-    let mut round_targets: Vec<std::net::SocketAddr> = Vec::new();
+    let mut round_targets: Vec<PunchAddrInfo> = Vec::new();
 
     loop {
         if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3868,12 +3917,13 @@ pub async fn relay_phase3_punch_to_peer(
                 if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
                     continue;
                 }
-                if !round_targets.contains(&info.addr) {
-                    round_targets.push(info.addr);
-                    log::info!("Phase3(Host): added peer address {} to targets", info.addr);
+                if !round_targets.iter().any(|t| t.addr == info.addr) {
+                    round_targets.push(info);
+                    log::info!("Phase3(Host): added peer address {} (type={}) to targets",
+                        info.addr, info.addr_type);
                 }
-                // 优先取 ready 的 IPv4 主地址作为精确地址
-                if info.ready && peer_exact.is_none() && !info.addr.is_ipv6() {
+                // 优先取 ready 的 UDP 主地址作为精确地址（TCP/IPv6 地址不能作为 UDP 打洞目标）
+                if info.ready && info.addr_type == PUNCH_ADDR_TYPE_UDP && peer_exact.is_none() {
                     peer_exact = Some(info.addr);
                     peer_delta = info.delta;
                     log::info!("Phase3(Host): peer exact address {} (ready, peer_delta={}, sync_at={})",
@@ -3936,6 +3986,10 @@ pub async fn relay_phase3_punch_to_peer(
                 continue; // 精确地址已在阶段 A 充分尝试
             }
             for base in round_targets.iter() {
+                // TCP listener 地址不是 UDP 打洞目标，跳过（留给 TCP fallback）
+                if base.is_tcp() {
+                    continue;
+                }
                 if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
                     bail!("Phase3(Host) stop punch: already upgraded");
                 }
@@ -3943,9 +3997,9 @@ pub async fn relay_phase3_punch_to_peer(
                     break 'offsets;
                 }
                 // i32 域计算端口，越界跳过，避免 u16 回绕
-                let new_port = base.port() as i32 + offset;
+                let new_port = base.addr.port() as i32 + offset;
                 if !(1..=65535).contains(&new_port) { continue; }
-                let mut target = *base;
+                let mut target = base.addr;
                 target.set_port(new_port as u16);
 
                 if socket.connect(target).await.is_err() { continue; }
@@ -3968,13 +4022,13 @@ pub async fn relay_phase3_punch_to_peer(
         {
             const TCP_SCAN_MAX: i32 = 20;
             let tcp_offsets: &[i32] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX];
-            for &peer_addr in &round_targets {
+            for base in &round_targets {
                 for &offset in tcp_offsets {
                     if started.elapsed() >= MAX_TIME { break; }
                     // i32 域计算端口，越界跳过，避免 u16 回绕
-                    let new_port = peer_addr.port() as i32 + offset;
+                    let new_port = base.addr.port() as i32 + offset;
                     if !(1..=65535).contains(&new_port) { continue; }
-                    let mut tcp_target = peer_addr;
+                    let mut tcp_target = base.addr;
                     tcp_target.set_port(new_port as u16);
 
                     let result: Option<tokio::net::TcpStream> = if let Some(ref listener) = tcp_listener {

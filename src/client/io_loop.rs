@@ -461,13 +461,15 @@ impl<T: InvokeUiSession> Remote<T> {
                             ppa.set_ready(phase3_my_info.ready);
                             ppa.set_delta(phase3_my_info.delta);
                             ppa.set_sync_at_ms(phase3_my_info.sync_at_ms);
+                            ppa.set_addr_type(phase3_my_info.addr_type);
                             misc.set_punch_peer_addr(ppa);
                             let mut msg = Message::new();
                             msg.set_misc(misc);
                             allow_err!(peer.send(&msg).await);
-                            log::info!("Phase3: sent our address {} (ready={}, delta={}, sync_at={}) to peer",
+                            log::info!("Phase3: sent our address {} (ready={}, delta={}, sync_at={}, type={}) to peer",
                                 phase3_my_info.addr, phase3_my_info.ready,
-                                phase3_my_info.delta, phase3_my_info.sync_at_ms);
+                                phase3_my_info.delta, phase3_my_info.sync_at_ms,
+                                phase3_my_info.addr_type);
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {
@@ -2262,30 +2264,26 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::PunchPeerAddr(ppa)) => {
                         // Phase 3: Received peer's public address (+同步信号) through relay.
-                        // ready=true 的地址带 delta/sync_at_ms，作为"精确地址"交给打洞任务。
-                        // TCP listener 地址仍按启发式进入 punch_tcp_addrs。
+                        // 用显式 addr_type 分类（取代"同 IP 不同端口=TCP"启发式，
+                        // 启发式在地址发送顺序变化时会把 UDP 地址误判为 TCP）。
                         if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
                             // 忽略无效地址（0.0.0.0 不可打洞；早前的时间戳同步机制已移除）
-                            if peer_addr.ip().is_unspecified() {
-                                log::info!("Phase3: ignore unspecified peer address: {}", peer_addr);
+                            if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
+                                log::info!("Phase3: ignore unusable peer address: {}", peer_addr);
                             } else {
-                                log::info!("Phase3: received peer address: {} (ready={}, delta={}, sync_at={})",
-                                    peer_addr, ppa.get_ready(), ppa.get_delta(), ppa.get_sync_at_ms());
+                                let addr_type = ppa.get_addr_type();
+                                log::info!("Phase3: received peer address: {} (ready={}, delta={}, sync_at={}, type={})",
+                                    peer_addr, ppa.get_ready(), ppa.get_delta(),
+                                    ppa.get_sync_at_ms(), addr_type);
                                 let info = crate::common::PunchAddrInfo {
                                     addr: peer_addr,
                                     ready: ppa.get_ready(),
                                     delta: ppa.get_delta(),
                                     sync_at_ms: ppa.get_sync_at_ms(),
+                                    addr_type,
                                 };
-                                // 只有主 STUN 地址（ready=true）才可能触发 TCP 启发式误判，
-                                // 非 ready 的地址（TCP listener 等）直接按端口分类即可；
-                                // 统一先入 UDP 队列，由打洞任务忽略 IPv6/0.0.0.0。
-                                let is_tcp = !info.ready && self.punch_peer_addrs.as_ref().map_or(false, |ppa_ref| {
-                                    ppa_ref.lock().map(|addrs| {
-                                        addrs.iter().any(|a| a.addr.ip() == peer_addr.ip() && a.addr.port() != peer_addr.port())
-                                    }).unwrap_or(false)
-                                });
-                                if is_tcp {
+                                if addr_type == crate::common::PUNCH_ADDR_TYPE_TCP {
+                                    // TCP listener 地址 → TCP simultaneous open 目标
                                     if let Some(ref punch_tcp) = self.punch_tcp_addrs {
                                         if let Ok(mut addrs) = punch_tcp.lock() {
                                             if !addrs.contains(&peer_addr) {
@@ -2295,10 +2293,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                         }
                                     }
                                 } else if let Some(ref punch_peer) = self.punch_peer_addrs {
+                                    // UDP / IPv6 地址 → KCP 打洞目标（打洞任务自行忽略 IPv6）
                                     if let Ok(mut addrs) = punch_peer.lock() {
                                         if !addrs.iter().any(|a| a.addr == peer_addr) {
                                             addrs.push(info);
-                                            log::info!("Phase3: added KCP peer address (ready={}): {}", info.ready, peer_addr);
+                                            log::info!("Phase3: added KCP peer address (ready={}, type={}): {}",
+                                                info.ready, addr_type, peer_addr);
                                         }
                                     }
                                 }
