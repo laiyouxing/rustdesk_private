@@ -133,6 +133,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Insert Ctrl + Alt + Del", ""),
         ("Insert Lock", ""),
         ("Refresh", ""),
+        ("Connection failed, please login!", ""),
+        ("Token error, please log out and log back in!", ""),
         ("ID does not exist", ""),
         ("Failed to connect to rendezvous server", ""),
         ("Please try later", ""),

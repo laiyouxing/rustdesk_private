@@ -136,6 +136,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Insert Ctrl + Alt + Del", "插入 Ctrl + Alt + Del"),
         ("Insert Lock", "锁定远程电脑"),
         ("Refresh", "刷新画面"),
+        ("Connection failed, please login!", "连接失败，请登录"),
+        ("Token error, please log out and log back in!", "令牌验证失败，请重新登录"),
         ("ID does not exist", "ID 不存在"),
         ("Failed to connect to rendezvous server", "连接注册服务器失败"),
         ("Please try later", "请稍后再试"),
