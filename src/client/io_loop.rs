@@ -155,6 +155,14 @@ impl<T: InvokeUiSession> Remote<T> {
         }
     }
 
+    /// 标记本次连接为重连：Session::handle_login_error 据此区分"网络波动误报密码错误"，
+    /// 保留已保存的密码自动重试，避免反复弹"重新输入密码"；
+    /// 无密码/手动接收场景重连时跳过"输入密码"弹框，直接发空密码由对端接受。
+    pub fn mark_reconnecting(&self) {
+        self.handler.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        self.handler.lc.write().unwrap().reconnecting = true;
+    }
+
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
         // Reset per-connection state for auto-reconnect path.
         // User-initiated reconnect() clears peer_info via LoginConfigHandler,
