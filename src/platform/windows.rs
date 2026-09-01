@@ -1813,10 +1813,13 @@ fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
     let tmp_fn = tmp.to_str().unwrap_or("");
     // https://github.com/rustdesk/rustdesk/issues/6786#issuecomment-1879655410
     // Specify cmd.exe explicitly to avoid the replacement of cmd commands.
+    // force_prompt(false)：仅当当前进程无管理员权限时才弹 UAC 提权。
+    // 修复：更新时 --update 进程已是管理员，若 force_prompt(true) 会二次弹 UAC，
+    // 被拦截后 bat 未执行，taskkill 未杀旧进程，而恢复逻辑又拉起新托盘 → 新旧并存两个图标。
     let res = runas::Command::new("cmd.exe")
         .args(&["/C", &tmp_fn])
         .show(show)
-        .force_prompt(true)
+        .force_prompt(false)
         .status();
     if !show {
         allow_err!(std::fs::remove_file(tmp));
@@ -2031,9 +2034,28 @@ pub fn prepare_custom_client_update() -> ResultType<bool> {
         }
     } else {
         log::info!(
-            "Custom client staging directory {:?} does not exist.",
+            "Custom client staging directory {:?} does not exist, falling back to install dir.",
             custom_client_staging_dir
         );
+        // 修复：staging 缺失时（如 is_custom_client 判断失败、主窗口目录无 custom.txt），
+        // 回退到安装目录读取 custom.txt，保证 --update 进程的 APP_NAME 与已安装的客户端一致。
+        // 否则 taskkill /IM 与 sc stop 针对错误的进程名/服务名，旧进程无法被清理 → 新旧托盘并存。
+        let (_, _, _, install_exe) = get_install_info();
+        let install_custom_txt = std::path::Path::new(&install_exe)
+            .parent()
+            .map(|dir| dir.join("custom.txt"));
+        if let Some(install_custom_txt) = install_custom_txt {
+            if install_custom_txt.is_file() {
+                let local_custom_file_path = current_exe_dir.join("custom.txt");
+                fs::copy(&install_custom_txt, &local_custom_file_path)?;
+                log::info!(
+                    "Loaded custom.txt from install dir fallback: {:?}",
+                    install_custom_txt
+                );
+                crate::load_custom_client();
+                allow_err!(fs::remove_file(&local_custom_file_path));
+            }
+        }
     }
 
     Ok(true)
@@ -3063,7 +3085,14 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         bail!("{} is not installed.", &app_name);
     }
 
-    let app_exe_name = &format!("{}.exe", &app_name);
+    // 用安装目录 exe 的文件名做进程匹配/杀进程目标，比 app_name 更可靠：
+    // --update 进程若未加载 custom.txt（staging 缺失），app_name 会退化为 "RustDesk"，
+    // 导致 taskkill /IM 与 sc stop 针对错误名字，旧进程无法被清理 → 新旧托盘并存。
+    let exe_name = std::path::Path::new(&exe)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}.exe", &app_name));
+    let app_exe_name = &exe_name;
     let main_window_pids =
         crate::platform::get_pids_of_process_with_args::<_, &str>(&app_exe_name, &[]);
     let main_window_sessions = main_window_pids
@@ -3200,7 +3229,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
         "
 chcp 65001
 sc stop {app_name}
-taskkill /F /IM {app_name}.exe{filter}
+taskkill /F /IM {exe_name}{filter}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
@@ -3217,7 +3246,7 @@ taskkill /F /IM {app_name}.exe{filter}
         sleep = if debug { "timeout 300" } else { "" },
     );
 
-    let _restore_session_guard = crate::common::SimpleCallOnReturn {
+    let mut _restore_session_guard = crate::common::SimpleCallOnReturn {
         b: true,
         f: Box::new(move || {
             let is_root = is_root();
@@ -3274,7 +3303,14 @@ taskkill /F /IM {app_name}.exe{filter}
         }),
     };
 
-    run_cmds(cmds, debug, "update")?;
+    if let Err(e) = run_cmds(cmds, debug, "update") {
+        // bat 未执行成功（如 UAC 被拦截/权限不足）：旧进程可能未被清理，
+        // 禁止恢复新托盘/主窗口，避免新旧版本进程并存（两个托盘图标）。
+        // 更新未完成，由用户重试或手动处理。
+        log::error!("Update command failed, skip restoring processes: {}", e);
+        _restore_session_guard.b = false;
+        return Err(e);
+    }
 
     std::thread::sleep(std::time::Duration::from_millis(2000));
     log::info!("Update completed.");

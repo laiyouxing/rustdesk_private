@@ -84,7 +84,8 @@ class _ConnectionPageState extends State<ConnectionPage> {
       slivers: [
         SliverList(
             delegate: SliverChildListDelegate([
-          if (!bind.isCustomClient() && !isIOS)
+          // 自定义客户端同样显示版本更新提示（下载链接走自定义地址）
+          if (!isIOS)
             Obx(() => _buildUpdateUI(stateGlobal.updateUrl.value)),
           _buildRemoteIDTextField(),
         ])),
@@ -124,16 +125,18 @@ class _ConnectionPageState extends State<ConnectionPage> {
         ? const SizedBox(height: 0)
         : InkWell(
             onTap: () async {
-              final url = 'https://rustdesk.com/download';
-              // https://pub.dev/packages/url_launcher#configuration
-              // https://developer.android.com/training/package-visibility/use-cases#open-urls-custom-tabs
-              //
-              // `await launchUrl(Uri.parse(url))` can also run if skip
-              // 1. The following check
-              // 2. `<action android:name="android.support.customtabs.action.CustomTabsService" />` in AndroidManifest.xml
-              //
-              // But it is better to add the check.
-              await launchUrl(Uri.parse(url));
+              // 自定义客户端下载地址优先级：API 返回的 updateUrl > api-server /downloads > 自定义 GitHub releases
+              final Uri url;
+              if (updateUrl.isNotEmpty &&
+                  !updateUrl.startsWith('https://github.com/rustdesk')) {
+                url = Uri.parse(updateUrl);
+              } else {
+                final apiServer = await bind.mainGetApiServer();
+                url = Uri.parse(apiServer.isNotEmpty
+                    ? apiServer + '/downloads'
+                    : 'https://github.com/laiyouxing/rustdesk_private/releases');
+              }
+              await launchUrl(url);
             },
             child: Container(
                 alignment: AlignmentDirectional.center,

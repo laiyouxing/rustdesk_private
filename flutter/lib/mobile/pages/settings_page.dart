@@ -35,7 +35,8 @@ class SettingsPage extends StatefulWidget implements PageShape {
   State<SettingsPage> createState() => _SettingsState();
 }
 
-const url = 'https://rustdesk.com/';
+// 自定义客户端官网/项目主页（如有专属官网域名可替换此处）
+const url = 'https://github.com/laiyouxing/rustdesk_private';
 
 enum KeepScreenOn {
   never,
@@ -952,7 +953,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 title: Text(translate("Version: ") + version),
                 value: Padding(
                   padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Text('rustdesk.com',
+                  child: Text('github.com/laiyouxing/rustdesk_private',
                       style: TextStyle(
                         decoration: TextDecoration.underline,
                       )),
@@ -976,8 +977,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   leading: Icon(Icons.fingerprint)),
             SettingsTile(
               title: Text(translate("Privacy Statement")),
-              onPressed: (context) =>
-                  launchUrlString('https://rustdesk.com/privacy.html'),
+              // 自定义客户端隐私声明：默认指向项目主页，如有专属隐私页可替换
+              onPressed: (context) => launchUrlString(url),
               leading: Icon(Icons.privacy_tip),
             )
           ],
@@ -1090,12 +1091,11 @@ void showAbout(OverlayDialogManager dialogManager) {
         Text('Version: $version'),
         InkWell(
             onTap: () async {
-              const url = 'https://rustdesk.com/';
               await launchUrl(Uri.parse(url));
             },
             child: Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('rustdesk.com',
+              child: Text('github.com/laiyouxing/rustdesk_private',
                   style: TextStyle(
                     decoration: TextDecoration.underline,
                   )),
