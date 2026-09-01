@@ -319,6 +319,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Restarting remote device", "正在重新啟動遠端裝置"),
         ("remote_restarting_tip", "遠端裝置正在重新啟動，請關閉此對話框，並在一段時間後使用永久密碼重新連線"),
         ("Copied", "已複製"),
+        ("Copy ID", "複製 ID"),
         ("Exit Fullscreen", "退出全螢幕"),
         ("Fullscreen", "全螢幕"),
         ("Mobile Actions", "手機操作"),
