@@ -454,16 +454,23 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           }
           final apiServer = await bind.mainGetApiServer();
           final Uri url;
-          if (updateUrl.isNotEmpty && !updateUrl.startsWith('https://github.com/rustdesk')) {
+          // 仅当 updateUrl 为官方地址（rustdesk.com / github.com/rustdesk）时替换为自定义地址
+          final bool isOfficialUrl = updateUrl.contains('rustdesk.com') ||
+              updateUrl.startsWith('https://github.com/rustdesk') ||
+              updateUrl.startsWith('http://github.com/rustdesk');
+          if (updateUrl.isNotEmpty && !isOfficialUrl) {
             url = Uri.parse(updateUrl);
           } else if (apiServer.isNotEmpty) {
             url = Uri.parse(apiServer + '/downloads');
           } else {
-            url = Uri.parse('https://rustdesk.com/download');
+            url = Uri.parse('https://github.com/laiyouxing/rustdesk_private/releases');
           }
           await launchUrl(url);
         };
-        final downloadLink = (updateUrl.isNotEmpty && !updateUrl.startsWith('https://github.com/rustdesk'))
+        final bool isOfficialLink = updateUrl.contains('rustdesk.com') ||
+            updateUrl.startsWith('https://github.com/rustdesk') ||
+            updateUrl.startsWith('http://github.com/rustdesk');
+        final downloadLink = (updateUrl.isNotEmpty && !isOfficialLink)
             ? updateUrl
             : 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}';
         cards.add(buildInstallCard(

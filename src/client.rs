@@ -1811,6 +1811,8 @@ pub struct LoginConfigHandler {
     pub force_relay: bool,
     pub direct: Option<bool>,
     pub received: bool,
+    // 自动重连中：无密码/手动接收场景下跳过"输入密码"弹框，避免网络波动反复提示
+    pub reconnecting: bool,
     switch_uuid: Option<String>,
     #[cfg(feature = "flutter")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -3602,8 +3604,14 @@ pub async fn handle_hash(
     }
 
     let password = if password.is_empty() {
-        // login without password, the remote side can click accept
-        interface.msgbox("input-password", "Password Required", "", "");
+        // 无密码（手动接收）模式：
+        // - 首次连接弹输入框（可跳过，由对端手动接受）
+        // - 自动重连中（reconnecting）不再弹框，直接发空密码，避免网络波动反复提示
+        let reconnecting = lc.read().unwrap().reconnecting;
+        lc.write().unwrap().reconnecting = false;
+        if !reconnecting {
+            interface.msgbox("input-password", "Password Required", "", "");
+        }
         Vec::new()
     } else {
         let mut hasher = Sha256::new();

@@ -393,7 +393,8 @@ const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
-const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+// 最近会话免认证窗口：10 分钟内同一发起端+ID 重连自动放行（手动断开除外）
+const SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Connection {
     pub async fn start(
@@ -1716,6 +1717,9 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        // 记录最近会话：10 分钟内同一发起端+ID 重连（未手动断开）免再次接受/输密码。
+        // 覆盖密码验证与手动接受（Authorize）两种授权路径。
+        raii::AuthedConnID::update_or_insert_session(self.session_key(), None, None);
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -2543,7 +2547,8 @@ impl Connection {
             if let Some(misc::Union::CloseReason(s)) = &misc.union {
                 log::info!("receive close reason: {}", s);
                 self.on_close("Peer close", true).await;
-                raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+                // 手动断开（收到 CloseReason）：清除最近会话记录，下次连接需重新接受/输密码
+                raii::AuthedConnID::remove_session(self.session_key());
                 return false;
             }
             // Phase 3: Received connector's public address (+同步信号) through relay
@@ -5940,11 +5945,16 @@ mod raii {
         }
 
         pub fn check_remove_session(conn_id: i32, key: SessionKey) {
-            // 不主动删除 session：让 SESSION_TIMEOUT(30s) 在 is_recent_session 的 retain 中统一清理。
-            // 这样授权成功后断开连接的 30s 内重连，可用最近会话免认证直接连接。
+            // 网络断开（非手动）：保留 session，让 SESSION_TIMEOUT(10min) 在 is_recent_session 的 retain 中统一清理。
+            // 这样自动重连（未手动断开）可用最近会话免认证直接连接。
             if SESSIONS.lock().unwrap().contains_key(&key) {
-                log::info!("check_remove_session: keep session for 30s timeout");
+                log::info!("check_remove_session: keep session for timeout");
             }
+        }
+
+        pub fn remove_session(key: SessionKey) {
+            SESSIONS.lock().unwrap().remove(&key);
+            log::info!("remove_session: cleared recent session (manual disconnect)");
         }
 
         pub fn update_or_insert_session(
@@ -5961,6 +5971,8 @@ mod raii {
                 if let Some(tfa) = tfa {
                     session.tfa = tfa;
                 }
+                // 刷新最近接收时间：重连授权成功后延续 10 分钟免认证窗口
+                *session.last_recv_time.lock().unwrap() = Instant::now();
             } else {
                 lock.insert(
                     key,

@@ -1776,6 +1776,18 @@ impl<T: InvokeUiSession> Interface for Session<T> {
     }
 
     fn handle_login_error(&self, err: &str) -> bool {
+        // 重连场景（reconnect_count>0）下的"密码错误/密码为空"多为网络波动导致
+        // 密码响应丢失被服务端误判：保留已保存的密码，结束本连接由自动重连
+        // 用保存的密码重新验证，避免网络波动时反复弹"重新输入密码"。
+        if (err == crate::client::LOGIN_MSG_PASSWORD_WRONG
+            || err == crate::client::LOGIN_MSG_PASSWORD_EMPTY)
+            && self.reconnect_count.load(Ordering::SeqCst) > 0
+        {
+            log::info!(
+                "Password error during reconnect, keep password and let auto-reconnect retry"
+            );
+            return false;
+        }
         handle_login_error(self.lc.clone(), err, self)
     }
 
@@ -2091,6 +2103,11 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     for retry in 0..max_retries {
         if retry > 0 {
             log::info!("Connection lost, auto-reconnect attempt #{}/{} (delay={:.1}s)", retry + 1, max_retries, delay);
+            // 标记为重连：Session::handle_login_error 据此区分"网络波动误报密码错误"，
+            // 保留已保存的密码自动重试，避免反复弹"重新输入密码"。
+            handler.reconnect_count.fetch_add(1, Ordering::SeqCst);
+            // 无密码/手动接收场景：重连时跳过"输入密码"弹框，直接发空密码由对端接受
+            handler.lc.write().unwrap().reconnecting = true;
             sleep(delay).await;
             delay = (delay * 1.5).min(15.0);
         }

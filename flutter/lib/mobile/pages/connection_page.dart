@@ -125,10 +125,13 @@ class _ConnectionPageState extends State<ConnectionPage> {
         ? const SizedBox(height: 0)
         : InkWell(
             onTap: () async {
-              // 自定义客户端下载地址优先级：API 返回的 updateUrl > api-server /downloads > 自定义 GitHub releases
+              // 自定义客户端下载地址优先级：API 返回的自定义 updateUrl > api-server /downloads > 自定义 GitHub releases
+              // 仅当 updateUrl 为官方地址（rustdesk.com / github.com/rustdesk）时替换为自定义地址
+              final bool isOfficialUrl = updateUrl.contains('rustdesk.com') ||
+                  updateUrl.startsWith('https://github.com/rustdesk') ||
+                  updateUrl.startsWith('http://github.com/rustdesk');
               final Uri url;
-              if (updateUrl.isNotEmpty &&
-                  !updateUrl.startsWith('https://github.com/rustdesk')) {
+              if (updateUrl.isNotEmpty && !isOfficialUrl) {
                 url = Uri.parse(updateUrl);
               } else {
                 final apiServer = await bind.mainGetApiServer();
