@@ -1174,6 +1174,8 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
             log::info!("Force update to version {} from {}", latest_version, download_url);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
+                // 下载前清理历史更新下载残留（保留本次文件名对应的缓存文件）
+                crate::updater::cleanup_old_update_files(Some(&file_path));
                 // Download using the same HTTP client
                 if let Ok(resp) = client.get(&download_url).send().await {
                     if let Ok(bytes) = resp.bytes().await {

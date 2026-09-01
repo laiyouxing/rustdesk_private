@@ -3315,6 +3315,17 @@ taskkill /F /IM {exe_name}{filter}
     std::thread::sleep(std::time::Duration::from_millis(2000));
     log::info!("Update completed.");
 
+    // 更新完成：清理更新下载文件。src_exe 是位于 temp 目录的更新安装包，
+    // 已通过 bat 复制到安装目录；当前 --update 进程仍在运行（文件被占用），
+    // 用独立 cmd 延迟删除，等待本进程退出后再删。
+    if std::path::Path::new(&src_exe).starts_with(std::env::temp_dir()) {
+        let del_cmd = format!("ping -n 6 127.0.0.1 >nul & del /f /q \"{}\"", src_exe);
+        match std::process::Command::new("cmd").args(&["/C"]).arg(del_cmd).spawn() {
+            Ok(_) => log::info!("Scheduled delayed cleanup of update file: {}", src_exe),
+            Err(e) => log::warn!("Failed to schedule cleanup of update file {}: {}", src_exe, e),
+        }
+    }
+
     Ok(())
 }
 

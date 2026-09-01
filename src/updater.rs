@@ -171,6 +171,9 @@ fn check_update(manually: bool) -> ResultType<()> {
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
+        // 每次更新下载前清理历史下载残留（保留本次文件名对应的缓存文件），
+        // 避免 temp 目录长期堆积未使用的更新安装包。
+        cleanup_old_update_files(Some(&file_path));
         let mut is_file_exists = false;
         if file_path.exists() {
             // Check if the file size is the same as the server file size
@@ -231,6 +234,8 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                 match crate::platform::update_me_msi(p, true) {
                     Ok(_) => {
                         log::debug!("New version \"{}\" updated.", version);
+                        // 安装完成后删除下载的 msi 安装包
+                        std::fs::remove_file(&file_path).ok();
                     }
                     Err(e) => {
                         log::error!(
@@ -309,10 +314,41 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
 
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     let filename = url.split('/').filter(|s| !s.is_empty()).last()?;
+    // 统一以 `{app_name}_update_` 前缀命名，更新完成后可精确清理 temp 目录中的下载残留，
+    // 不会误删其他文件。
+    let prefix = format!("{}_update_", crate::get_app_name().to_lowercase());
     if filename.is_empty() || !filename.contains('.') {
         // Fallback: use a generic name when the URL has no recognizable filename
-        Some(std::env::temp_dir().join("rustdesk_update.exe"))
+        Some(std::env::temp_dir().join(format!("{}rustdesk_update.exe", prefix)))
     } else {
-        Some(std::env::temp_dir().join(filename))
+        Some(std::env::temp_dir().join(format!("{}{}", prefix, filename)))
+    }
+}
+
+/// 清理 temp 目录中本程序的历史更新下载残留文件。
+/// 文件名统一以 `{app_name}_update_` 前缀命名，不会误删其他文件。
+/// `keep` 非空时保留该文件（本次下载复用的缓存文件）。
+pub fn cleanup_old_update_files(keep: Option<&std::path::Path>) {
+    let prefix = format!("{}_update_", crate::get_app_name().to_lowercase());
+    let dir = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.map(|k| path == k).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.to_lowercase().starts_with(&prefix) {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    match std::fs::remove_file(&path) {
+                        Ok(_) => log::info!("Cleaned up old update file: {:?}", path),
+                        Err(e) => log::debug!("Skip cleaning update file {:?}: {}", path, e),
+                    }
+                }
+            }
+        }
     }
 }
