@@ -965,8 +965,13 @@ async fn handle(data: Data, stream: &mut Connection) {
             #[cfg(windows)]
             {
                 if file.to_lowercase().ends_with(".msi") {
-                    // msi：用 msiexec 静默安装
-                    let _ = crate::platform::update_me_msi(&file, true);
+                    // 服务（Session 0）静默安装 msi：不依赖 msi 的 LaunchAppTray
+                    // （会在服务会话启动托盘，用户桌面不可见），
+                    // 安装完成后在用户会话主动启动客户端。
+                    if let Err(e) = crate::platform::update_me_msi_silent(&file) {
+                        log::error!("Failed to install msi: {}", e);
+                    }
+                    crate::platform::launch_client_after_update();
                 } else {
                     let _ = std::process::Command::new(&file)
                         .arg("--update")

@@ -3498,15 +3498,63 @@ pub fn update_to(file: &str) -> ResultType<()> {
 //    `1` and `3` must be done in custom actions.
 //    We need also to handle the command line parsing to find the tray processes.
 pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
-    // msi 路径加引号，避免 temp 路径含空格时 msiexec 解析失败；
-    // 静默安装传 LAUNCH_TRAY_APP=Y，让 msi 在 InstallFinalize 后自动启动新托盘
-    // （原先 LAUNCH_TRAY_APP=N 导致静默更新后不启动任何程序）。
-    let cmds = format!(
-        "chcp 65001 && msiexec /i \"{msi}\" {}",
-        if quiet { "/qn LAUNCH_TRAY_APP=Y" } else { "" }
-    );
+    // 用户会话内的 msi 更新：静默安装（/qn），安装完成后由 msi 的 LaunchAppTray 启动新托盘
+    update_me_msi_impl(msi, quiet, true)
+}
+
+/// 服务（Session 0）等无交互会话的 msi 静默安装：不依赖 msi 启动托盘
+/// （LaunchAppTray 会在服务会话启动，用户桌面不可见），由调用方在用户会话主动启动。
+pub fn update_me_msi_silent(msi: &str) -> ResultType<()> {
+    update_me_msi_impl(msi, true, false)
+}
+
+fn update_me_msi_impl(msi: &str, quiet: bool, launch_tray: bool) -> ResultType<()> {
+    // msi 路径加引号，避免 temp 路径含空格时 msiexec 解析失败。
+    let tray_flag = if launch_tray {
+        "LAUNCH_TRAY_APP=Y"
+    } else {
+        "LAUNCH_TRAY_APP=N"
+    };
+    let quiet_cmd = if quiet {
+        format!("/qn {}", tray_flag)
+    } else {
+        String::new()
+    };
+    let cmds = format!("chcp 65001 && msiexec /i \"{msi}\" {}", quiet_cmd);
     run_cmds(cmds, false, "update-msi")?;
     Ok(())
+}
+
+/// 服务（Session 0）静默安装 msi 后，在用户会话启动客户端托盘。
+/// msi 静默安装（/qn）时 LaunchApp 因 UILevel=2 不执行；
+/// LaunchAppTray 即使启动也会在服务会话（用户桌面不可见）。
+pub fn launch_client_after_update() {
+    let (_, _, _, exe) = get_install_info();
+    if !std::path::Path::new(&exe).exists() {
+        log::error!("launch_client_after_update: exe not found: {}", exe);
+        return;
+    }
+    // 优先 active console session，其次第一个非 0 会话
+    let mut session_id = get_current_session_id(false);
+    if session_id == 0 || session_id == u32::MAX {
+        session_id = get_available_sessions(false)
+            .iter()
+            .map(|s| s.sid)
+            .find(|&sid| sid != 0)
+            .unwrap_or(0);
+    }
+    if session_id == 0 {
+        log::error!("launch_client_after_update: no user session found");
+        return;
+    }
+    match run_exe_in_session(&exe, vec!["--tray"], session_id, true) {
+        Ok(_) => log::info!("Client launched in session {} after update", session_id),
+        Err(e) => log::error!(
+            "Failed to launch client in session {}: {}",
+            session_id,
+            e
+        ),
+    }
 }
 
 pub fn get_tray_shortcut(
