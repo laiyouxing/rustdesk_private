@@ -227,7 +227,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   ?.color
                                   ?.withOpacity(0.5)),
                         ).marginOnly(top: 5),
-                        buildPopupMenu(context)
+                        Row(
+                          children: [
+                            buildCopyIdButton(context),
+                            buildPopupMenu(context),
+                          ],
+                        )
                       ],
                     ),
                   ),
@@ -257,6 +262,38 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           ),
         ],
       ),
+    );
+  }
+
+  /// 本机 ID 标题行的"复制 ID"按钮，样式与 buildPopupMenu 一致。
+  Widget buildCopyIdButton(BuildContext context) {
+    final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    RxBool hover = false.obs;
+    return InkWell(
+      onTap: () {
+        final id = gFFI.serverModel.serverId.text;
+        if (id.isNotEmpty) {
+          Clipboard.setData(ClipboardData(text: id));
+          showToast(translate("Copied"));
+        }
+      },
+      child: Tooltip(
+        message: translate('Copy ID'),
+        child: Obx(
+          () => CircleAvatar(
+            radius: 15,
+            backgroundColor: hover.value
+                ? Theme.of(context).scaffoldBackgroundColor
+                : Theme.of(context).colorScheme.background,
+            child: Icon(
+              Icons.copy_outlined,
+              size: 20,
+              color: hover.value ? textColor : textColor?.withOpacity(0.5),
+            ),
+          ),
+        ),
+      ),
+      onHover: (value) => hover.value = value,
     );
   }
 
