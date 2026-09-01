@@ -23,38 +23,15 @@ class ServerPage extends StatefulWidget implements PageShape {
   final icon = const Icon(Icons.mobile_screen_share);
 
   @override
-  final appBarActions = [
-    // 复制本机 ID 按钮（始终显示）
-    _CopyIdAction(),
-    if (!bind.isDisableSettings() &&
-        bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y')
-      _DropDownAction(),
-  ];
+  final appBarActions = (!bind.isDisableSettings() &&
+          bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y')
+      ? [_DropDownAction()]
+      : [];
 
   ServerPage({Key? key}) : super(key: key);
 
   @override
   State<StatefulWidget> createState() => _ServerPageState();
-}
-
-/// AppBar 上的"复制本机 ID"按钮。
-class _CopyIdAction extends StatelessWidget {
-  const _CopyIdAction();
-
-  @override
-  Widget build(BuildContext context) {
-    return IconButton(
-      tooltip: translate('Copy ID'),
-      icon: const Icon(Icons.copy_outlined),
-      onPressed: () {
-        final id = gFFI.serverModel.serverId.value.text.trim();
-        if (id.isNotEmpty) {
-          Clipboard.setData(ClipboardData(text: id));
-          showToast(translate('Copied'));
-        }
-      },
-    );
-  }
 }
 
 class _DropDownAction extends StatelessWidget {

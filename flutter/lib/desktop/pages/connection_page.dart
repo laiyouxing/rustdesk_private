@@ -6,6 +6,7 @@ import 'dart:math';
 
 import 'package:auto_size_text/auto_size_text.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/widgets/connection_page_title.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
@@ -499,6 +500,35 @@ class _ConnectionPageState extends State<ConnectionPage>
                       onConnect();
                     },
                     child: Text(translate("Connect")),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // 复制当前输入的远程 ID
+                SizedBox(
+                  height: 28.0,
+                  width: 28.0,
+                  child: Tooltip(
+                    message: translate('Copy ID'),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        border:
+                            Border.all(color: Theme.of(context).dividerColor),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Center(
+                        child: IconButton(
+                          padding: EdgeInsets.zero,
+                          icon: const Icon(Icons.copy_outlined, size: 14),
+                          onPressed: () {
+                            final id = _idController.text.trim();
+                            if (id.isNotEmpty) {
+                              Clipboard.setData(ClipboardData(text: id));
+                              showToast(translate('Copied'));
+                            }
+                          },
+                        ),
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
