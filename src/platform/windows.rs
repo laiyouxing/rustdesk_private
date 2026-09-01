@@ -3473,7 +3473,11 @@ pub fn update_to(file: &str) -> ResultType<()> {
             );
         }
     } else if file.ends_with(".msi") {
-        if let Err(e) = update_me_msi(file, false) {
+        // msi 更新走静默安装（/qn）：不弹安装向导，msi 的 TerminateProcesses
+        // 会自动关闭旧进程，安装完成后由 LaunchAppTray 启动新托盘。
+        // 原先非静默（false）会弹出 msiexec UI 向导等待用户操作，
+        // 导致"提示关闭当前程序但根本没关闭"、更新卡住。
+        if let Err(e) = update_me_msi(file, true) {
             bail!("Failed to run the update msi: {}", e);
         }
     } else {
@@ -3494,9 +3498,12 @@ pub fn update_to(file: &str) -> ResultType<()> {
 //    `1` and `3` must be done in custom actions.
 //    We need also to handle the command line parsing to find the tray processes.
 pub fn update_me_msi(msi: &str, quiet: bool) -> ResultType<()> {
+    // msi 路径加引号，避免 temp 路径含空格时 msiexec 解析失败；
+    // 静默安装传 LAUNCH_TRAY_APP=Y，让 msi 在 InstallFinalize 后自动启动新托盘
+    // （原先 LAUNCH_TRAY_APP=N 导致静默更新后不启动任何程序）。
     let cmds = format!(
-        "chcp 65001 && msiexec /i {msi} {}",
-        if quiet { "/qn LAUNCH_TRAY_APP=N" } else { "" }
+        "chcp 65001 && msiexec /i \"{msi}\" {}",
+        if quiet { "/qn LAUNCH_TRAY_APP=Y" } else { "" }
     );
     run_cmds(cmds, false, "update-msi")?;
     Ok(())
