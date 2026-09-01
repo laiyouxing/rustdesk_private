@@ -19,6 +19,8 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../common.dart';
+import 'ignore_cert_http_io.dart'
+    if (dart.library.html) 'ignore_cert_http_stub.dart' as ignore_cert_http;
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
     Function(BuildContext);
@@ -1598,8 +1600,9 @@ Future<bool> checkSubscriptionExpired(BuildContext context) async {
   try {
     final api = '${await bind.mainGetApiServer()}/api/subscribe/mine';
     final headers = getHttpHeaders();
-    final resp = await http.get(Uri.parse(api), headers: headers)
-        .timeout(const Duration(seconds: 5));
+    // 使用忽略自签名证书的请求（api-server 为自签名证书，dart:io 默认校验会失败）
+    final resp = await ignore_cert_http.getHttpIgnoreCert(Uri.parse(api), headers,
+        timeout: const Duration(seconds: 5));
     if (resp.statusCode == 200) {
       final body = jsonDecode(resp.body);
       if (body is Map && body['data'] is Map) {
