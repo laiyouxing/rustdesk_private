@@ -2962,45 +2962,81 @@ pub async fn punch_udp(
 /// Queries all 3 STUN servers in parallel and takes the first 2 replies.
 /// If they agree on the mapped address, uses it (high confidence).
 /// Otherwise falls back to the first reply (better than nothing).
-pub async fn stun_query_with_socket(
-    socket: &UdpSocket,
-) -> ResultType<(SocketAddr, String)> {
-    use hbb_common::futures::future::FutureExt;
+/// Query STUN servers concurrently on a shared (unconnected) socket.
+///
+/// Sends a binding request to every server up front, then dispatches replies
+/// by transaction ID in a single recv loop. The previous implementation
+/// awaited each server's future in turn, so one dead server burned its full
+/// 2s timeout before the next server was even contacted.
+pub async fn stun_query_with_socket(socket: &UdpSocket) -> ResultType<(SocketAddr, String)> {
     use hbb_common::rand::{self, Rng};
 
-    const SINGLE_RECV_TIMEOUT: Duration = Duration::from_secs(2);
     const TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 
-    async fn try_one(socket: &UdpSocket, stun: &str) -> ResultType<(SocketAddr, String)> {
-        let stun_addr = stun
-            .to_socket_addrs()?
-            .filter(|x| x.is_ipv4())
-            .next()
-            .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
-
+    // 1. Fire a binding request at every STUN server (best effort per server).
+    let mut tx_map: std::collections::HashMap<[u8; 12], String> = std::collections::HashMap::new();
+    for stun in get_stun_servers_v4().iter() {
+        let stun_addr = match stun.to_socket_addrs() {
+            Ok(mut addrs) => match addrs.find(|x| x.is_ipv4()) {
+                Some(a) => a,
+                None => continue,
+            },
+            Err(_) => continue,
+        };
         let mut req = vec![0u8; 20];
         req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
         req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
         let mut tx_id = [0u8; 12];
         rand::thread_rng().fill(&mut tx_id);
         req[8..20].copy_from_slice(&tx_id);
+        if socket.send_to(&req, stun_addr).await.is_err() {
+            continue;
+        }
+        tx_map.insert(tx_id, stun.clone());
+    }
+    if tx_map.is_empty() {
+        bail!("Failed to send STUN requests to any server");
+    }
 
-        socket.send_to(&req, stun_addr).await?;
-
-        let mut buf = vec![0u8; 4096];
-        let (n, _) = tokio::time::timeout(SINGLE_RECV_TIMEOUT, socket.recv_from(&mut buf))
-            .await
-            .map_err(|_| anyhow!("STUN recv timeout from {}", stun))??;
+    // 2. Single recv loop; dispatch each reply by its transaction ID so
+    //    interleaved responses from different servers are matched correctly.
+    let deadline = std::time::Instant::now() + TOTAL_TIMEOUT;
+    let mut results: Vec<(SocketAddr, String)> = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    while results.len() < 2 {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let (n, _) = match hbb_common::tokio::time::timeout(
+            deadline - now,
+            socket.recv_from(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                // Windows 上 UDP 收到 ICMP 不可达会报 ConnectionReset，忽略继续收
+                if e.kind() == std::io::ErrorKind::ConnectionReset {
+                    continue;
+                }
+                break;
+            }
+            Err(_) => break,
+        };
         if n < 20 {
-            bail!("STUN response too short");
+            continue;
         }
-        let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
-        if resp_type != 0x0101 {
-            bail!("Not a STUN Binding Response");
+        if u16::from_be_bytes([buf[0], buf[1]]) != 0x0101 {
+            continue;
         }
-        if &buf[8..20] != &tx_id {
-            bail!("STUN transaction ID mismatch from {}", stun);
-        }
+        let tx_id: [u8; 12] = match buf[8..20].try_into() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let Some(stun) = tx_map.get(&tx_id) else {
+            continue; // 非本次请求发出的响应（其他探测流量/旧请求）
+        };
         let mut pos = 20;
         while pos + 4 <= n {
             let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
@@ -3015,54 +3051,22 @@ pub async fn stun_query_with_socket(
                 for i in 0..4 {
                     ip_bytes[i] = buf[pos + 8 + i] ^ buf[4 + i];
                 }
-                let ip = std::net::Ipv4Addr::new(
-                    ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
-                );
-                return Ok((SocketAddr::from((ip, port)), stun.to_string()));
+                let ip =
+                    std::net::Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                results.push((SocketAddr::from((ip, port)), stun.clone()));
+                break;
             }
             pos += 4 + attr_len;
             if attr_len % 4 != 0 {
                 pos += 4 - (attr_len % 4);
             }
         }
-        bail!("No XOR-MAPPED-ADDRESS found in STUN response from {}", stun)
     }
-
-    // Race all STUN servers concurrently, collect first 2 successful results
-    // (same logic as try_one above, accessible outside the closure)
-    let work = async {
-        let servers = get_stun_servers_v4();
-        let futs = servers
-            .iter()
-            .map(|stun| {
-                tokio::time::timeout(TOTAL_TIMEOUT, try_one(socket, stun.as_str())).boxed()
-            })
-            .collect::<Vec<_>>();
-        let mut results = Vec::new();
-        // Take first 2 successful replies (or all if fewer succeed)
-        for fut in futs {
-            if results.len() >= 2 {
-                break;
-            }
-            if let Ok(Ok(ok)) = fut.await {
-                results.push(ok);
-            }
-        }
-        if results.is_empty() {
-            bail!("All STUN servers failed");
-        }
-        // If 2+ servers agree on the mapped address, use it (high confidence).
-        // Otherwise trust the first reply.
-        if results.len() >= 2 && results[0].0 == results[1].0 {
-            Ok(results[0].clone())
-        } else {
-            Ok(results[0].clone())
-        }
-    };
-
-    tokio::time::timeout(TOTAL_TIMEOUT, work)
-        .await
-        .map_err(|_| anyhow!("STUN total timeout"))?
+    if results.is_empty() {
+        bail!("All STUN servers failed");
+    }
+    // 两台以上一致即高置信；不一致时信任第一台（与旧实现一致）
+    Ok(results.remove(0))
 }
 
 /// Query a single specific STUN server (not race all servers).
@@ -3179,14 +3183,42 @@ pub struct PunchAddrInfo {
 
 impl PunchAddrInfo {
     pub fn new(addr: std::net::SocketAddr) -> Self {
-        Self { addr, ready: false, delta: 0, sync_at_ms: 0, addr_type: PUNCH_ADDR_TYPE_UDP }
+        Self {
+            addr,
+            ready: false,
+            delta: 0,
+            sync_at_ms: 0,
+            addr_type: PUNCH_ADDR_TYPE_UDP,
+        }
     }
     pub fn new_tcp(addr: std::net::SocketAddr) -> Self {
-        Self { addr, ready: false, delta: 0, sync_at_ms: 0, addr_type: PUNCH_ADDR_TYPE_TCP }
+        Self {
+            addr,
+            ready: false,
+            delta: 0,
+            sync_at_ms: 0,
+            addr_type: PUNCH_ADDR_TYPE_TCP,
+        }
     }
     pub fn is_tcp(&self) -> bool {
         self.addr_type == PUNCH_ADDR_TYPE_TCP
     }
+}
+
+/// 判断一个地址能否作为打洞目标（两端共用同一标准）：
+/// - `0.0.0.0` / 端口 0：不可用（0.0.0.0 connect 等价于连本机，
+///   可能把本机服务误当成对端；端口 0 表示"未提供实际端口"，如未修正的 IPv6 地址）
+/// - IPv6 链路本地（fe80::/10）与唯一本地（fc00::/7）：公网不可路由
+pub fn is_unusable_punch_addr(addr: &std::net::SocketAddr) -> bool {
+    if addr.ip().is_unspecified() || addr.port() == 0 {
+        return true;
+    }
+    if let std::net::IpAddr::V6(v6) = addr.ip() {
+        if (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00 {
+            return true;
+        }
+    }
+    false
 }
 
 /// 在单个 target 上"持续打洞"：整个时长内并行维持空包（防止 NAT 映射老化），
@@ -3251,9 +3283,8 @@ pub async fn relay_upgrade_task(
     if Config::get_nat_type() == 0 {
         match detect_symmetric_nat().await {
             Ok(true) => {
-                log::info!("relay_upgrade_task: detected SYMMETRIC NAT, switching to relay-only");
+                log::info!("relay_upgrade_task: detected SYMMETRIC NAT");
                 Config::set_nat_type(NatType::SYMMETRIC as _);
-                return false;
             }
             Ok(false) => {
                 Config::set_nat_type(NatType::ASYMMETRIC as _);
@@ -3268,11 +3299,24 @@ pub async fn relay_upgrade_task(
         }
     }
 
-    // 对称 NAT（本端已缓存或刚检测到）无法打洞，直接放弃升级走中继，
-    // 避免白打 180s。Cone/未知则继续。
-    if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
-        log::info!("relay_upgrade_task: NAT type = SYMMETRIC, skipping punch, staying on relay");
+    // 对称 NAT 分两种处理：
+    // - 经代理/WS 连接时打洞无意义，直接放弃走中继；
+    // - 否则进入"低强度模式"：只打精确地址 + 对端 delta 预测端口（约 60s 预算），
+    //   跳过阶段 B 盲扫与 TCP fallback。轻度对称 NAT（端口随目的地址线性递增，
+    //   如部分 4G 热点/企业网关）有机会打通；严格对称的也不会比现在更糟
+    //   （3 次失败熔断仍然生效，不会反复白打）。
+    let symmetric_mode = Config::get_nat_type() == NatType::SYMMETRIC as i32;
+    let via_proxy = Config::get_socks().is_some() || config::use_ws();
+    if symmetric_mode && via_proxy {
+        log::info!(
+            "relay_upgrade_task: SYMMETRIC NAT via proxy/ws, skipping punch, staying on relay"
+        );
         return false;
+    }
+    if symmetric_mode {
+        log::info!(
+            "relay_upgrade_task: SYMMETRIC NAT, low-intensity punch mode (exact + predicted port only)"
+        );
     }
 
     // "以时间换资源"：中继已建立，不急。拉长总预算到 3 分钟，每个目标间隔 1s，
@@ -3333,6 +3377,9 @@ pub async fn relay_upgrade_task(
     // 对端精确地址（由 PunchPeerAddr ready 信号提供）与对端 delta
     let mut peer_exact: Option<std::net::SocketAddr> = None;
     let mut peer_delta: i32 = 0;
+    // 对端约定的打洞起始时刻（NTP 对齐）：等待时与自己的 sync_at 取较大值，
+    // 两端才会在同一个绝对时刻同时发起（此前对端 sync_at 只进日志、不参与等待）
+    let mut peer_sync_at_ms: i64 = 0;
     let mut our_addr: Option<std::net::SocketAddr> = None;
     let mut stun_ports: Vec<u16> = Vec::new();
     let mut selected_server: Option<String> = None;
@@ -3352,8 +3399,11 @@ pub async fn relay_upgrade_task(
                 socket.send_to(&data, hbbs_addr).await.ok();
                 let mut buf = vec![0u8; 1024];
                 if let Ok(Ok((n, _))) = hbb_common::tokio::time::timeout(
-                    Duration::from_secs(3), socket.recv_from(&mut buf)
-                ).await {
+                    Duration::from_secs(3),
+                    socket.recv_from(&mut buf),
+                )
+                .await
+                {
                     if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
                         if let Some(rendezvous_message::Union::TestNatResponse(resp)) = msg_in.union {
                             let port = resp.port as u16;
@@ -3377,90 +3427,118 @@ pub async fn relay_upgrade_task(
 
     // Only run STUN if hbbs didn't already provide the address
     if our_addr.is_none() {
-
-    for i in 0..5 {
-        // P1: retry up to 2 times with exponential backoff (200ms, 400ms)
-        let mut retries: u32 = 2;
-        loop {
-            let result = if let Some(ref server) = selected_server {
-                // Queries 2-5: prefer locked server for consistent delta on Symmetric NAT
-                stun_query_single_server(&socket, server).await
-            } else {
-                // Query 1: race all servers, pick the best
-                stun_query_with_socket(&socket).await
-            };
-            match result {
-                Ok((addr, srv)) => {
-                    if our_addr.is_none() {
-                        selected_server = Some(srv.clone());
-                        our_addr = Some(addr);
-                        log::info!("RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
-                            i + 1, addr, addr.port(), srv);
-                        if let Ok(mut public) = PUBLIC_ADDR.lock() {
-                            *public = addr.to_string();
+        for i in 0..5 {
+            // P1: retry up to 2 times with exponential backoff (200ms, 400ms)
+            let mut retries: u32 = 2;
+            loop {
+                let result = if let Some(ref server) = selected_server {
+                    // Queries 2-5: prefer locked server for consistent delta on Symmetric NAT
+                    stun_query_single_server(&socket, server).await
+                } else {
+                    // Query 1: race all servers, pick the best
+                    stun_query_with_socket(&socket).await
+                };
+                match result {
+                    Ok((addr, srv)) => {
+                        if our_addr.is_none() {
+                            selected_server = Some(srv.clone());
+                            our_addr = Some(addr);
+                            log::info!(
+                                "RelayUpgrade STUN #{}: mapped {} (port {}, server {})",
+                                i + 1,
+                                addr,
+                                addr.port(),
+                                srv
+                            );
+                            if let Ok(mut public) = PUBLIC_ADDR.lock() {
+                                *public = addr.to_string();
+                            }
+                        } else {
+                            log::info!(
+                                "RelayUpgrade STUN #{}: port {} via {}",
+                                i + 1,
+                                addr.port(),
+                                srv
+                            );
                         }
-                    } else {
-                        log::info!("RelayUpgrade STUN #{}: port {} via {}",
-                            i + 1, addr.port(), srv);
+                        stun_ports.push(addr.port());
+                        break; // success, exit retry loop
                     }
-                    stun_ports.push(addr.port());
-                    break; // success, exit retry loop
-                }
-                Err(e) => {
-                    if retries > 0 {
-                        let delay = Duration::from_millis(200 * (3 - retries) as u64);
-                        log::info!("RelayUpgrade STUN #{} retrying in {:?} ({}/2): {:?}",
-                            i + 1, delay, 3 - retries, e);
-                        retries -= 1;
-                        hbb_common::tokio::time::sleep(delay).await;
-                        // P0: if locked server exhausted retries, try other servers one by one.
-                        // Cannot use stun_query_with_socket (concurrent send_to) because
-                        // the socket may be connected (Windows WSAEISCONN on send_to mismatch).
-                        if retries == 0 && selected_server.is_some() {
-                            log::info!("RelayUpgrade STUN #{} locked server unresponsive, trying other servers one by one", i + 1);
-                            let alt_servers = get_stun_servers_v4();
-                            let mut fallback_ok = false;
-                            for alt_srv in alt_servers.iter() {
-                                if selected_server.as_ref().map_or(false, |s| s == alt_srv) {
-                                    continue; // skip the already-failed locked server
-                                }
-                                match stun_query_single_server(&socket, alt_srv).await {
-                                    Ok((fb_addr, fb_srv)) => {
-                                        log::info!("RelayUpgrade STUN #{} fallback OK via {} (port {})",
+                    Err(e) => {
+                        if retries > 0 {
+                            let delay = Duration::from_millis(200 * (3 - retries) as u64);
+                            log::info!(
+                                "RelayUpgrade STUN #{} retrying in {:?} ({}/2): {:?}",
+                                i + 1,
+                                delay,
+                                3 - retries,
+                                e
+                            );
+                            retries -= 1;
+                            hbb_common::tokio::time::sleep(delay).await;
+                            // P0: if locked server exhausted retries, try other servers one by one.
+                            // Cannot use stun_query_with_socket (concurrent send_to) because
+                            // the socket may be connected (Windows WSAEISCONN on send_to mismatch).
+                            if retries == 0 && selected_server.is_some() {
+                                log::info!("RelayUpgrade STUN #{} locked server unresponsive, trying other servers one by one", i + 1);
+                                let alt_servers = get_stun_servers_v4();
+                                let mut fallback_ok = false;
+                                for alt_srv in alt_servers.iter() {
+                                    if selected_server.as_ref().map_or(false, |s| s == alt_srv) {
+                                        continue; // skip the already-failed locked server
+                                    }
+                                    match stun_query_single_server(&socket, alt_srv).await {
+                                        Ok((fb_addr, fb_srv)) => {
+                                            log::info!("RelayUpgrade STUN #{} fallback OK via {} (port {})",
                                             i + 1, fb_srv, fb_addr.port());
-                                        selected_server = Some(fb_srv);
-                                        stun_ports.push(fb_addr.port());
-                                        fallback_ok = true;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        log::info!("RelayUpgrade STUN #{} fallback vs {} failed: {:?}",
-                                            i + 1, alt_srv, e);
+                                            selected_server = Some(fb_srv);
+                                            stun_ports.push(fb_addr.port());
+                                            fallback_ok = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            log::info!(
+                                                "RelayUpgrade STUN #{} fallback vs {} failed: {:?}",
+                                                i + 1,
+                                                alt_srv,
+                                                e
+                                            );
+                                        }
                                     }
                                 }
+                                if !fallback_ok {
+                                    log::info!(
+                                        "RelayUpgrade STUN #{} all fallback servers failed",
+                                        i + 1
+                                    );
+                                }
                             }
-                            if !fallback_ok {
-                                log::info!("RelayUpgrade STUN #{} all fallback servers failed", i + 1);
-                            }
+                            continue;
                         }
-                        continue;
+                        // All retries exhausted, no locked server to fall back from
+                        if our_addr.is_none() {
+                            log::info!(
+                                "RelayUpgrade STUN #{} failed after retries: {:?}",
+                                i + 1,
+                                e
+                            );
+                        } else {
+                            log::info!(
+                                "RelayUpgrade STUN #{} failed, stopping prediction: {:?}",
+                                i + 1,
+                                e
+                            );
+                        }
+                        break;
                     }
-                    // All retries exhausted, no locked server to fall back from
-                    if our_addr.is_none() {
-                        log::info!("RelayUpgrade STUN #{} failed after retries: {:?}", i + 1, e);
-                    } else {
-                        log::info!("RelayUpgrade STUN #{} failed, stopping prediction: {:?}", i + 1, e);
-                    }
-                    break;
                 }
             }
+            // If very first query completely failed (no our_addr yet), exit early
+            if our_addr.is_none() && selected_server.is_none() {
+                break;
+            }
+            hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // If very first query completely failed (no our_addr yet), exit early
-        if our_addr.is_none() && selected_server.is_none() {
-            break;
-        }
-        hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     } // end if our_addr.is_none() (skip STUN when hbbs already provided addr)
 
     // Phase 3: send our public address to peer through relay.
@@ -3470,14 +3548,27 @@ pub async fn relay_upgrade_task(
     // IPv6 and TCP listener are sent immediately (they don't need delta).
     if crate::get_ipv6_punch_enabled() {
         if let Some(ipv6_addr) = get_cached_ipv6_addr() {
-            let _ = phase3_out_tx.try_send(PunchAddrInfo {
-                addr: ipv6_addr,
-                ready: false,
-                delta: 0,
-                sync_at_ms: 0,
-                addr_type: PUNCH_ADDR_TYPE_IPV6,
-            });
-            log::info!("Phase3: sent IPv6 address to relay loop: {}", ipv6_addr);
+            // 必须带上打洞 socket 的实际本地端口：test_ipv6 缓存的地址端口为 0，
+            // 对端会按"端口 0 不可打洞"丢弃，IPv6 打洞因此单向死亡。
+            // 带上端口后两端各以 v6 socket 互打，IPv6 路径才真正可用。
+            let v6_local_port = socket_v6
+                .as_ref()
+                .and_then(|s| s.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(0);
+            if v6_local_port > 0 {
+                let v6_punch_addr = std::net::SocketAddr::new(ipv6_addr.ip(), v6_local_port);
+                let _ = phase3_out_tx.try_send(PunchAddrInfo {
+                    addr: v6_punch_addr,
+                    ready: false,
+                    delta: 0,
+                    sync_at_ms: 0,
+                    addr_type: PUNCH_ADDR_TYPE_IPV6,
+                });
+                log::info!("Phase3: sent IPv6 address to relay loop: {}", v6_punch_addr);
+            } else {
+                log::info!("Phase3: no IPv6 punch socket, skip IPv6 address");
+            }
         }
     }
     // If hbbs-discovered address differs from STUN (symmetric NAT), send it
@@ -3608,7 +3699,15 @@ pub async fn relay_upgrade_task(
             return false;
         }
         if started.elapsed() >= TOTAL_BUDGET {
-            log::info!("[NAT穿透] 穿透总预算({}s)超时, 放弃", TOTAL_BUDGET.as_secs());
+            log::info!(
+                "[NAT穿透] 穿透总预算({}s)超时, 放弃",
+                TOTAL_BUDGET.as_secs()
+            );
+            return false;
+        }
+        // 对称低强度模式总预算 60s：只打精确 + 预测端口，不做盲扫/TCP
+        if symmetric_mode && started.elapsed() >= Duration::from_secs(60) {
+            log::info!("[NAT穿透] 对称低强度模式预算(60s)超时, 放弃");
             return false;
         }
 
@@ -3616,7 +3715,7 @@ pub async fn relay_upgrade_task(
         // 地址，作为"精确地址"；delta 用于对称 NAT 端口预测。
         if let Ok(mut infos) = phase3_peer_rx.lock() {
             for info in infos.drain(..) {
-                if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
+                if is_unusable_punch_addr(&info.addr) {
                     continue;
                 }
                 if !targets.contains(&info.addr) {
@@ -3624,12 +3723,17 @@ pub async fn relay_upgrade_task(
                     log::info!("Phase3: added peer address {} to targets", info.addr);
                 }
                 // 优先取 ready 的 IPv4 主地址作为精确地址
-                // （主机侧 punch_socket 只绑 IPv4，IPv6 目标必然失败，不选它做精确地址）
+                // （IPv6 目标不选作精确地址：精确地址持续打洞只走 v4 socket）
                 if info.ready && peer_exact.is_none() && !info.addr.is_ipv6() {
                     peer_exact = Some(info.addr);
                     peer_delta = info.delta;
-                    log::info!("Phase3: peer exact address {} (ready, peer_delta={}, sync_at={})",
-                        info.addr, info.delta, info.sync_at_ms);
+                    peer_sync_at_ms = info.sync_at_ms;
+                    log::info!(
+                        "Phase3: peer exact address {} (ready, peer_delta={}, sync_at={})",
+                        info.addr,
+                        info.delta,
+                        info.sync_at_ms
+                    );
                 }
             }
         }
@@ -3643,23 +3747,47 @@ pub async fn relay_upgrade_task(
             }
         };
 
-        // 同步兜底：若双方已就绪，且约定的起始时刻（NTP 对齐的轮边界）在未来
-        // 且等待不超过 30s，则等到该时刻再开始打洞 —— 两端在同一时刻同时发起，
-        // 彻底消除"窗口错位"。
-        if sync_at_ms > 0 {
-            let wait = sync_at_ms - now_ms();
+        // 同步：等到"双方约定起始时刻的较大值"再开始打洞。
+        // 只等自己的 sync_at 没有意义——对端发来的 sync_at 也必须参与，
+        // 两端才会在同一个绝对时刻同时发起（修复前对端 sync_at 只进日志）。
+        let target_sync = sync_at_ms.max(peer_sync_at_ms);
+        if target_sync > 0 {
+            let wait = target_sync - now_ms();
             if wait > 0 && wait <= 30_000 {
-                log::info!("Phase3: waiting {}ms until sync_at {} to start punching", wait, sync_at_ms);
+                log::info!(
+                    "Phase3: waiting {}ms until sync_at {} (own={}, peer={}) to start punching",
+                    wait,
+                    target_sync,
+                    sync_at_ms,
+                    peer_sync_at_ms
+                );
                 hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
             }
         }
 
         // ===== 阶段 A：在精确地址上"持续打洞" =====
-        // 两端使用同一时长(PUNCH_EXACT_MS)与同一轮长(PUNCH_ROUND_MS)，
+        // 两端使用同一时长与同一轮长(PUNCH_ROUND_MS)，
         // 只要两端的活跃窗口有重叠就能同时向对方发包打开 NAT 映射。
         // 这是修复"窗口错位"的核心：此前每 target 只打 3~4s 就换，
         // 两端步调不同步导致几乎不可能撞上。
-        let exact_deadline = std::time::Instant::now() + Duration::from_millis(PUNCH_EXACT_MS);
+        // 对称低强度模式：除精确地址外同时打"对端预测端口" exact+peer_delta
+        // （对端每条新目的地址的映射端口按 delta 递增），时长缩短为 30s。
+        let mut primary_targets: Vec<std::net::SocketAddr> = vec![exact];
+        if symmetric_mode && peer_delta != 0 {
+            let p = exact.port() as i32 + peer_delta;
+            if (1..=65535).contains(&p) {
+                let mut predicted = exact;
+                predicted.set_port(p as u16);
+                log::info!("[NAT穿透] 对称低强度模式：同时打对端预测端口 {}", predicted);
+                primary_targets.push(predicted);
+            }
+        }
+        let exact_ms = if symmetric_mode {
+            30_000
+        } else {
+            PUNCH_EXACT_MS
+        };
+        let exact_deadline = std::time::Instant::now() + Duration::from_millis(exact_ms);
         while std::time::Instant::now() < exact_deadline {
             if cancel.is_cancelled() {
                 return false;
@@ -3667,66 +3795,21 @@ pub async fn relay_upgrade_task(
             if started.elapsed() >= TOTAL_BUDGET {
                 break;
             }
-            let sock = socket_v4.clone();
-            if sock.connect(exact).await.is_err() {
-                break;
-            }
-            let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
-            let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
-            if let Some((kcp, stream)) = punch_target_sustained(&sock, exact, round_ms, true).await
-            {
-                if let Ok(mut h) = kcp_handle.lock() {
-                    *h = Some(kcp);
-                }
-                let mut guard = direct_stream.lock().await;
-                *guard = Some(stream);
-                notify.notify_one();
-                log::info!("[NAT穿透] Phase3 KCP 打洞成功(exact {}), 耗时={:?}", exact, started.elapsed());
-                return true;
-            }
-        }
-
-        // ===== 阶段 B：统一偏移序列扫描 =====
-        // 砍掉原来的 ±50 盲扫：101 个 target × 4s ≈ 414s 远超 180s 预算，
-        // 一端永远走不到真正有效的地址。这里只保留"精确 + 小幅漂移"，
-        // 对称 NAT 额外加入对端 delta 预测。
-        let mut scan_offsets: Vec<i32> = PUNCH_OFFSETS.to_vec();
-        if peer_delta != 0 && !scan_offsets.contains(&peer_delta) {
-            scan_offsets.insert(1, peer_delta);
-        }
-        'offsets: for &offset in scan_offsets.iter() {
-            if offset == 0 {
-                continue; // 精确地址已在阶段 A 充分尝试
-            }
-            for base in targets.iter() {
+            for target in primary_targets.iter() {
                 if cancel.is_cancelled() {
                     return false;
                 }
                 if started.elapsed() >= TOTAL_BUDGET {
-                    break 'offsets;
+                    break;
                 }
-                // i32 域计算端口，越界跳过，避免 u16 回绕
-                let p = base.port() as i32 + offset;
-                if !(1..=65535).contains(&p) {
-                    continue;
-                }
-                let mut target = *base;
-                target.set_port(p as u16);
-                let sock = if target.is_ipv6() {
-                    match socket_v6.as_ref() {
-                        Some(s) => s.clone(),
-                        None => continue,
-                    }
-                } else {
-                    socket_v4.clone()
-                };
-                if sock.connect(target).await.is_err() {
+                let sock = socket_v4.clone();
+                if sock.connect(*target).await.is_err() {
                     continue;
                 }
                 let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, target, round_ms, true).await
+                    punch_target_sustained(&sock, *target, round_ms, true).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
@@ -3734,9 +3817,96 @@ pub async fn relay_upgrade_task(
                     let mut guard = direct_stream.lock().await;
                     *guard = Some(stream);
                     notify.notify_one();
-                    log::info!("[NAT穿透] Phase3 KCP 打洞成功(offset {} -> {}), 耗时={:?}",
-                        offset, target, started.elapsed());
+                    let kind = if *target == exact {
+                        "exact"
+                    } else {
+                        "predicted"
+                    };
+                    log::info!(
+                        "[NAT穿透] Phase3 KCP 打洞成功({} {}), 耗时={:?}",
+                        kind,
+                        target,
+                        started.elapsed()
+                    );
                     return true;
+                }
+            }
+        }
+
+        // ===== 阶段 B：统一偏移序列扫描 =====
+        // 砍掉原来的 ±50 盲扫：101 个 target × 4s ≈ 414s 远超 180s 预算，
+        // 一端永远走不到真正有效的地址。这里只保留"精确 + 小幅漂移"，
+        // 对称 NAT 额外加入对端 delta 预测。
+        // 预算重排（修复"TCP fallback 永远跑不到"）：
+        // - 目标按"精确地址优先"排序，每个 offset 最多打 2 个 base
+        //   （原实现 9 偏移 × N 目标 × 8s ≈ 300s+，第 2 轮和 TCP 永远没预算）；
+        // - 阶段 B 封顶 40s，给后面的 TCP fallback 留出时间。
+        // 对称低强度模式跳过阶段 B（预测端口已在阶段 A 打过）。
+        if !symmetric_mode {
+            let mut ordered: Vec<std::net::SocketAddr> = Vec::with_capacity(targets.len() + 1);
+            ordered.push(exact);
+            for t in targets.iter() {
+                if *t != exact && !ordered.contains(t) {
+                    ordered.push(*t);
+                }
+            }
+            let mut scan_offsets: Vec<i32> = PUNCH_OFFSETS.to_vec();
+            if peer_delta != 0 && !scan_offsets.contains(&peer_delta) {
+                scan_offsets.insert(1, peer_delta);
+            }
+            let stage_b_deadline = std::time::Instant::now() + Duration::from_secs(40);
+            'offsets: for &offset in scan_offsets.iter() {
+                if offset == 0 {
+                    continue; // 精确地址已在阶段 A 充分尝试
+                }
+                for base in ordered.iter().take(2) {
+                    if cancel.is_cancelled() {
+                        return false;
+                    }
+                    if started.elapsed() >= TOTAL_BUDGET {
+                        break 'offsets;
+                    }
+                    if std::time::Instant::now() >= stage_b_deadline {
+                        break 'offsets;
+                    }
+                    // i32 域计算端口，越界跳过，避免 u16 回绕
+                    let p = base.port() as i32 + offset;
+                    if !(1..=65535).contains(&p) {
+                        continue;
+                    }
+                    let mut target = *base;
+                    target.set_port(p as u16);
+                    let sock = if target.is_ipv6() {
+                        match socket_v6.as_ref() {
+                            Some(s) => s.clone(),
+                            None => continue,
+                        }
+                    } else {
+                        socket_v4.clone()
+                    };
+                    if sock.connect(target).await.is_err() {
+                        continue;
+                    }
+                    let remain_ms =
+                        TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
+                    let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+                    if let Some((kcp, stream)) =
+                        punch_target_sustained(&sock, target, round_ms, true).await
+                    {
+                        if let Ok(mut h) = kcp_handle.lock() {
+                            *h = Some(kcp);
+                        }
+                        let mut guard = direct_stream.lock().await;
+                        *guard = Some(stream);
+                        notify.notify_one();
+                        log::info!(
+                            "[NAT穿透] Phase3 KCP 打洞成功(offset {} -> {}), 耗时={:?}",
+                            offset,
+                            target,
+                            started.elapsed()
+                        );
+                        return true;
+                    }
                 }
             }
         }
@@ -3745,7 +3915,16 @@ pub async fn relay_upgrade_task(
         // dedicated TCP listener port (exchanged via PunchPeerAddr). Race an
         // outbound connect against a source-validated accept on our listener;
         // both sides bounded to 3s so each target costs at most ~3s.
-        if let Some(ref listener) = tcp_listener {
+        // 封顶 30s：7 偏移 × 3s × N 目标最坏 168s，不封顶会把第 2 轮的
+        // UDP 打洞预算全部吃光。对称低强度模式跳过（TCP 映射同样每目的
+        // 地址变化，预算只给 60s，全部留给 UDP 预测打洞）——tcp_listener_ref
+        // 取 None 实现整段跳过。
+        let tcp_listener_ref = if symmetric_mode {
+            None
+        } else {
+            tcp_listener.as_ref()
+        };
+        if let Some(listener) = tcp_listener_ref {
             // drain 本轮到达的 TCP 目标，本地累积去重，只保留最新 8 条，
             // 避免无限增长和陈旧 target（原来只 clone 不 drain）
             if let Ok(mut addrs) = phase3_tcp_rx.lock() {
@@ -3759,13 +3938,28 @@ pub async fn relay_upgrade_task(
                     tcp_targets.drain(..excess);
                 }
             }
+            let tcp_deadline = std::time::Instant::now() + Duration::from_secs(30);
             for &tcp_target in &tcp_targets {
-                if cancel.is_cancelled() { return false; }
-                if started.elapsed() >= TOTAL_BUDGET { break; }
-                if tcp_target.is_ipv6() { continue; }
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                if started.elapsed() >= TOTAL_BUDGET {
+                    break;
+                }
+                if std::time::Instant::now() >= tcp_deadline {
+                    break;
+                }
+                if tcp_target.is_ipv6() {
+                    continue;
+                }
                 let ports = [0i32, 1, -1, 2, -2, 5, -5];
                 for &port_offset in &ports {
-                    if started.elapsed() >= TOTAL_BUDGET { break; }
+                    if started.elapsed() >= TOTAL_BUDGET {
+                        break;
+                    }
+                    if std::time::Instant::now() >= tcp_deadline {
+                        break;
+                    }
                     // i32 域计算端口，越界跳过，避免 u16 回绕
                     let p = tcp_target.port() as i32 + port_offset;
                     if !(1..=65535).contains(&p) { continue; }
@@ -3814,7 +4008,7 @@ pub async fn relay_upgrade_task(
         // Also check for new Phase 3 addresses during gap
         if let Ok(mut infos) = phase3_peer_rx.lock() {
             for info in infos.drain(..) {
-                if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
+                if is_unusable_punch_addr(&info.addr) {
                     continue;
                 }
                 if !targets.contains(&info.addr) {
@@ -3824,6 +4018,7 @@ pub async fn relay_upgrade_task(
                 if info.ready && peer_exact.is_none() && !info.addr.is_ipv6() {
                     peer_exact = Some(info.addr);
                     peer_delta = info.delta;
+                    peer_sync_at_ms = info.sync_at_ms;
                     log::info!("Phase3: peer exact address {} (during gap)", info.addr);
                 }
             }
@@ -3847,10 +4042,13 @@ pub async fn relay_upgrade_task(
 /// STUN query. When provided, STUN discovery and hole punching share the
 /// same socket, so the NAT mapping is consistent. When `None`, a new socket
 /// is created internally (fallback for edge cases).
+/// `punch_socket_v6` is the IPv6 counterpart for dual-stack punching; when
+/// `None`, IPv6 targets are skipped.
 pub async fn relay_phase3_punch_to_peer(
     targets: Arc<hbb_common::tokio::sync::Mutex<Vec<PunchAddrInfo>>>,
     kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
     punch_socket: Option<Arc<tokio::net::UdpSocket>>,
+    punch_socket_v6: Option<Arc<tokio::net::UdpSocket>>,
     tcp_listener: Option<Arc<tokio::net::TcpListener>>,
     upgraded: Arc<std::sync::atomic::AtomicBool>,
     stun_done: Arc<std::sync::atomic::AtomicBool>,
@@ -3868,9 +4066,19 @@ pub async fn relay_phase3_punch_to_peer(
         Arc::new(UdpSocket::bind(bind_addr).await?)
     };
 
-    // 对称 NAT（本端已缓存）无法打洞，直接放弃走中继，避免白打 180s
-    if Config::get_nat_type() == NatType::SYMMETRIC as i32 {
-        bail!("Phase3(Host) NAT type = SYMMETRIC, skipping punch");
+    // 对称 NAT：与控制端 relay_upgrade_task 的同名逻辑保持一致（两端必须同时进退）。
+    // - 经代理/WS 连接时打洞无意义，直接放弃走中继；
+    // - 否则进入"低强度模式"：只打精确地址 + 对端 delta 预测端口（约 60s 预算），
+    //   跳过阶段 B 盲扫与 TCP fallback。
+    let symmetric_mode = Config::get_nat_type() == NatType::SYMMETRIC as i32;
+    let via_proxy = Config::get_socks().is_some() || config::use_ws();
+    if symmetric_mode && via_proxy {
+        bail!("Phase3(Host) NAT type = SYMMETRIC via proxy/ws, skipping punch");
+    }
+    if symmetric_mode {
+        log::info!(
+            "Phase3(Host): SYMMETRIC NAT, low-intensity punch mode (exact + predicted port only)"
+        );
     }
 
     // 等待 STUN 任务结束再操作共享 socket：socket.connect(target) 会过滤掉
@@ -3902,6 +4110,9 @@ pub async fn relay_phase3_punch_to_peer(
     // 对端精确地址（由 PunchPeerAddr ready 信号提供）与对端 delta
     let mut peer_exact: Option<std::net::SocketAddr> = None;
     let mut peer_delta: i32 = 0;
+    // 对端约定的打洞起始时刻（NTP 对齐）：等待时与自己的 sync_at 取较大值，
+    // 两端才会在同一个绝对时刻同时发起（此前对端 sync_at 只进日志）
+    let mut peer_sync_at_ms: i64 = 0;
     let mut round_targets: Vec<PunchAddrInfo> = Vec::new();
 
     loop {
@@ -3911,12 +4122,16 @@ pub async fn relay_phase3_punch_to_peer(
         if started.elapsed() >= MAX_TIME {
             bail!("Phase3(Host) punch timed out after {:?}", started.elapsed());
         }
+        // 对称低强度模式总预算 60s：只打精确 + 预测端口，不做盲扫/TCP
+        if symmetric_mode && started.elapsed() >= Duration::from_secs(60) {
+            bail!("Phase3(Host) symmetric low-intensity budget (60s) exhausted");
+        }
 
         // Drain newly arrived peer addresses from the queue.
         {
             let mut q = targets.lock().await;
             for info in q.drain(..) {
-                if info.addr.ip().is_unspecified() || info.addr.port() == 0 {
+                if is_unusable_punch_addr(&info.addr) {
                     continue;
                 }
                 if !round_targets.iter().any(|t| t.addr == info.addr) {
@@ -3924,12 +4139,18 @@ pub async fn relay_phase3_punch_to_peer(
                     log::info!("Phase3(Host): added peer address {} (type={}) to targets",
                         info.addr, info.addr_type);
                 }
-                // 优先取 ready 的 UDP 主地址作为精确地址（TCP/IPv6 地址不能作为 UDP 打洞目标）
+                // 优先取 ready 的 UDP 主地址作为精确地址（TCP 地址不能作为 UDP 打洞目标；
+                // IPv6 地址只在阶段 B 用 v6 socket 尝试，不作精确地址）
                 if info.ready && info.addr_type == PUNCH_ADDR_TYPE_UDP && peer_exact.is_none() {
                     peer_exact = Some(info.addr);
                     peer_delta = info.delta;
-                    log::info!("Phase3(Host): peer exact address {} (ready, peer_delta={}, sync_at={})",
-                        info.addr, info.delta, info.sync_at_ms);
+                    peer_sync_at_ms = info.sync_at_ms;
+                    log::info!(
+                        "Phase3(Host): peer exact address {} (ready, peer_delta={}, sync_at={})",
+                        info.addr,
+                        info.delta,
+                        info.sync_at_ms
+                    );
                 }
             }
         }
@@ -3943,19 +4164,42 @@ pub async fn relay_phase3_punch_to_peer(
             }
         };
 
-        // 同步兜底：等到约定的起始时刻（NTP 对齐的轮边界）再开始打洞，
-        // 与控制端在同一时刻同时发起。等待不超过 30s，避免卡死。
-        if sync_at_ms > 0 {
-            let wait = sync_at_ms - host_now_ms();
+        // 同步：等到"双方约定起始时刻的较大值"再开始打洞。
+        // 只等自己的 sync_at 没有意义——对端发来的 sync_at 也必须参与，
+        // 两端才会在同一个绝对时刻同时发起（修复前对端 sync_at 只进日志）。
+        let target_sync = sync_at_ms.max(peer_sync_at_ms);
+        if target_sync > 0 {
+            let wait = target_sync - host_now_ms();
             if wait > 0 && wait <= 30_000 {
-                log::info!("Phase3(Host): waiting {}ms until sync_at {} to start punching", wait, sync_at_ms);
+                log::info!("Phase3(Host): waiting {}ms until sync_at {} (own={}, peer={}) to start punching",
+                    wait, target_sync, sync_at_ms, peer_sync_at_ms);
                 hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
             }
         }
 
         // ===== 阶段 A：在精确地址上持续打洞（与控制端同一时长/轮长）=====
         // 主机端优先 accept（prefer_connect=false）。
-        let exact_deadline = std::time::Instant::now() + Duration::from_millis(PUNCH_EXACT_MS);
+        // 对称低强度模式：除精确地址外同时打"对端预测端口" exact+peer_delta
+        // （对端每条新目的地址的映射端口按 delta 递增），时长缩短为 30s。
+        let mut primary_targets: Vec<std::net::SocketAddr> = vec![exact];
+        if symmetric_mode && peer_delta != 0 {
+            let p = exact.port() as i32 + peer_delta;
+            if (1..=65535).contains(&p) {
+                let mut predicted = exact;
+                predicted.set_port(p as u16);
+                log::info!(
+                    "Phase3(Host): symmetric low-intensity mode, also punch predicted port {}",
+                    predicted
+                );
+                primary_targets.push(predicted);
+            }
+        }
+        let exact_ms = if symmetric_mode {
+            30_000
+        } else {
+            PUNCH_EXACT_MS
+        };
+        let exact_deadline = std::time::Instant::now() + Duration::from_millis(exact_ms);
         while std::time::Instant::now() < exact_deadline {
             if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
                 bail!("Phase3(Host) stop punch: already upgraded");
@@ -3963,26 +4207,45 @@ pub async fn relay_phase3_punch_to_peer(
             if started.elapsed() >= MAX_TIME {
                 bail!("Phase3(Host) punch timed out");
             }
-            if socket.connect(exact).await.is_err() { break; }
-            let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
-            let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
-            if let Some((kcp, stream)) =
-                punch_target_sustained(&socket, exact, round_ms, false).await
-            {
-                if let Ok(mut h) = kcp_handle.lock() {
-                    *h = Some(kcp);
+            for target in primary_targets.iter() {
+                if socket.connect(*target).await.is_err() {
+                    break;
                 }
-                log::info!("Phase3(Host) KCP punch to exact {} succeeded after {:?}",
-                    exact, started.elapsed());
-                return Ok(stream);
+                let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
+                let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+                if let Some((kcp, stream)) =
+                    punch_target_sustained(&socket, *target, round_ms, false).await
+                {
+                    if let Ok(mut h) = kcp_handle.lock() {
+                        *h = Some(kcp);
+                    }
+                    let kind = if *target == exact {
+                        "exact"
+                    } else {
+                        "predicted"
+                    };
+                    log::info!(
+                        "Phase3(Host) KCP punch to {} {} succeeded after {:?}",
+                        kind,
+                        target,
+                        started.elapsed()
+                    );
+                    return Ok(stream);
+                }
             }
         }
 
         // ===== 阶段 B：统一偏移序列扫描（对端 delta 预测 + 小幅漂移）=====
-        let mut scan_offsets: Vec<i32> = PUNCH_OFFSETS.to_vec();
-        if peer_delta != 0 && !scan_offsets.contains(&peer_delta) {
-            scan_offsets.insert(1, peer_delta);
-        }
+        // 对称低强度模式下 scan_offsets 为空，整段跳过（预测端口已在阶段 A 打过）
+        let mut scan_offsets: Vec<i32> = if symmetric_mode {
+            Vec::new()
+        } else {
+            let mut v = PUNCH_OFFSETS.to_vec();
+            if peer_delta != 0 && !v.contains(&peer_delta) {
+                v.insert(1, peer_delta);
+            }
+            v
+        };
         'offsets: for &offset in scan_offsets.iter() {
             if offset == 0 {
                 continue; // 精确地址已在阶段 A 充分尝试
@@ -4004,11 +4267,22 @@ pub async fn relay_phase3_punch_to_peer(
                 let mut target = base.addr;
                 target.set_port(new_port as u16);
 
-                if socket.connect(target).await.is_err() { continue; }
+                // IPv6 目标走 v6 socket（双栈打洞）；无 v6 socket 时跳过
+                let sock = if target.is_ipv6() {
+                    match punch_socket_v6.as_ref() {
+                        Some(s) => s.clone(),
+                        None => continue,
+                    }
+                } else {
+                    socket.clone()
+                };
+                if sock.connect(target).await.is_err() {
+                    continue;
+                }
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&socket, target, round_ms, false).await
+                    punch_target_sustained(&sock, target, round_ms, false).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
@@ -4021,12 +4295,25 @@ pub async fn relay_phase3_punch_to_peer(
         }
 
         // After KCP rounds, try TCP simultaneous open on remaining budget.
-        {
+        // 只对对端 TCP listener 类型的目标做（对 UDP 地址 connect 必然超时，
+        // 纯烧预算：4 目标 × 11 偏移 × 3s ≈ 132s），并封顶 30s。
+        // 对称低强度模式整段跳过。
+        if !symmetric_mode {
             const TCP_SCAN_MAX: i32 = 20;
-            let tcp_offsets: &[i32] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX];
+            let tcp_offsets: &[i32] =
+                &[0, 1, -1, 2, -2, 5, -5, 10, -10, TCP_SCAN_MAX, -TCP_SCAN_MAX];
+            let tcp_deadline = std::time::Instant::now() + Duration::from_secs(30);
             for base in &round_targets {
+                if !base.is_tcp() {
+                    continue;
+                }
                 for &offset in tcp_offsets {
-                    if started.elapsed() >= MAX_TIME { break; }
+                    if started.elapsed() >= MAX_TIME {
+                        break;
+                    }
+                    if std::time::Instant::now() >= tcp_deadline {
+                        break;
+                    }
                     // i32 域计算端口，越界跳过，避免 u16 回绕
                     let new_port = base.addr.port() as i32 + offset;
                     if !(1..=65535).contains(&new_port) { continue; }
@@ -4060,8 +4347,12 @@ pub async fn relay_phase3_punch_to_peer(
                         }
                     } else {
                         // 无 listener 时只做 connect
-                        match tokio::time::timeout(Duration::from_secs(3),
-                            tokio::net::TcpStream::connect(tcp_target)).await {
+                        match tokio::time::timeout(
+                            Duration::from_secs(3),
+                            tokio::net::TcpStream::connect(tcp_target),
+                        )
+                        .await
+                        {
                             Ok(Ok(stream)) => {
                                 stream.set_nodelay(true).ok();
                                 log::info!("Phase3(Host) TCP: connect to {} succeeded!", tcp_target);

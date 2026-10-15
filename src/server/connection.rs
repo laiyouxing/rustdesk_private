@@ -348,6 +348,17 @@ pub struct Connection {
     // Phase 3: TCP listener for simultaneous open, bound at setup time and
     // kept alive with the connection so the punch task can accept on it.
     phase3_tcp_listener: Option<Arc<tokio::net::TcpListener>>,
+    // Phase 3: IPv6 UDP socket for dual-stack punching (None if unavailable
+    // or IPv6 punch disabled). IPv6 targets are punched through this socket.
+    punch_socket_v6: Option<Arc<tokio::net::UdpSocket>>,
+    // Phase 3: whether the session type is worth punching (set by on_message
+    // after the LoginRequest type is known: only desktop control / view
+    // camera sessions are punchable; file transfer / terminal / port forward
+    // are not, because the connector never upgrades those).
+    phase3_useful: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Phase 3: whether a LoginRequest has been seen (so the STUN task knows
+    // the phase3_useful verdict is final and can exit early if not useful).
+    phase3_login_seen: Option<Arc<std::sync::atomic::AtomicBool>>,
     // Phase 3: handle of the single punch task, aborted on connection close
     // to avoid leaking the task (180s budget) across reconnections.
     phase3_task: Option<hbb_common::tokio::task::JoinHandle<()>>,
@@ -540,6 +551,9 @@ impl Connection {
             phase3_upgraded: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             phase3_stun_done: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             phase3_tcp_listener: None,
+            punch_socket_v6: None,
+            phase3_useful: None,
+            phase3_login_seen: None,
             phase3_task: None,
         };
         let addr = hbb_common::try_into_v4(addr);
@@ -639,14 +653,38 @@ impl Connection {
         {
             let phase3_tx = phase3_out_tx;
             let tx_to_cm = conn.tx_to_cm.clone();
-            // 时钟校准：算出双方约定的打洞起始时刻（NTP 对齐后的轮边界）
-            let sync_at_ms = crate::common::punch_sync_boundary(crate::common::ntp_now_ms().await);
+            // 会话可用性标志：on_message 判定登录类型后置位。
+            // 只有桌面控制/摄像头会话值得打洞——文件传输/终端/端口转发控制端
+            // 不会发起 Phase3，主机 STUN/广播没有接收方，纯属无用功。
+            let phase3_useful = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let phase3_login_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            conn.phase3_useful = Some(phase3_useful.clone());
+            conn.phase3_login_seen = Some(phase3_login_seen.clone());
+            // 本机时钟助手：STUN 任务内用 NTP 校准后的时钟重算双方约定的
+            // 打洞起始时刻。不在此处 await NTP——UDP/123 被墙时 ntp_offset_ms
+            // 最多顺序试 4 台 × 1s，会把每次连接建立拖慢最多 4s。
+            let host_local_now_ms = || -> i64 {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            };
             // Create persistent socket before spawn so both STUN and punch share it
             let punch_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => Some(Arc::new(s)),
                 Err(_) => None,
             };
             conn.punch_socket = punch_socket.clone();
+            // IPv6 打洞 socket（双栈）：仅启用 IPv6 punch 时创建
+            let punch_socket_v6 = if crate::get_ipv6_punch_enabled() {
+                tokio::net::UdpSocket::bind(std::net::SocketAddr::from(([0u16; 8], 0u16)))
+                    .await
+                    .ok()
+                    .map(Arc::new)
+            } else {
+                None
+            };
+            conn.punch_socket_v6 = punch_socket_v6.clone();
             // TCP listener 在 spawn 前创建并随 Connection 存活（spawn 结束不 drop），
             // spawn 内只广播端口，打洞任务之后在这个 listener 上 accept
             let phase3_tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0")
@@ -660,6 +698,31 @@ impl Connection {
             // STUN 完成标志：打洞任务须等它置位才能操作共享 socket
             let stun_done = conn.phase3_stun_done.clone().unwrap();
             tokio::spawn(async move {
+                // 等待登录类型判定：非桌面/摄像头会话直接退出（控制端不会打洞，
+                // 主机 STUN/广播没有接收方）；最多等 10s，超时按旧行为继续
+                for _ in 0..100 {
+                    if phase3_login_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if phase3_login_seen.load(std::sync::atomic::Ordering::SeqCst)
+                    && !phase3_useful.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    log::info!("Phase3(Host): session type not punchable, skip STUN/broadcast");
+                    stun_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                // NTP 时钟校准（后台任务内做，不阻塞连接建立）：重算约定起始时刻
+                let ntp_offset = crate::common::ntp_offset_ms().await;
+                let sync_at_ms = crate::common::punch_sync_boundary(
+                    host_local_now_ms() + ntp_offset.unwrap_or(0),
+                );
+                log::info!(
+                    "Phase3(Host): NTP offset={:?}, sync_at={}",
+                    ntp_offset,
+                    sync_at_ms
+                );
                 // 1. STUN to discover our public IPv4 address using the persistent socket
                 if let Some(ref socket) = punch_socket {
                     match crate::common::stun_query_with_socket(socket).await {
@@ -729,18 +792,37 @@ impl Connection {
                 if crate::get_ipv6_punch_enabled() {
                     crate::test_ipv6().await;
                     if let Some(ipv6_addr) = crate::common::get_cached_ipv6_addr() {
-                        let _ = tx_to_cm.send(ipc::Data::PunchStatus {
-                            status: "cone_nat".to_owned(),
-                            info: ipv6_addr.to_string(),
-                        });
-                        let _ = phase3_tx.send(crate::common::PunchAddrInfo {
-                            addr: ipv6_addr,
-                            ready: false,
-                            delta: 0,
-                            sync_at_ms: 0,
-                            addr_type: crate::common::PUNCH_ADDR_TYPE_IPV6,
-                        }).await;
-                        log::info!("Phase3(Host): sent IPv6 address to peer: {}", ipv6_addr);
+                        // 必须带上 v6 打洞 socket 的实际本地端口：test_ipv6 缓存的
+                        // 地址端口为 0，对端会按"端口 0 不可打洞"丢弃，IPv6 打洞
+                        // 因此单向死亡。带上端口后两端各以 v6 socket 互打。
+                        let v6_local_port = punch_socket_v6
+                            .as_ref()
+                            .and_then(|s| s.local_addr().ok())
+                            .map(|a| a.port())
+                            .unwrap_or(0);
+                        if v6_local_port > 0 {
+                            let v6_punch_addr =
+                                std::net::SocketAddr::new(ipv6_addr.ip(), v6_local_port);
+                            let _ = tx_to_cm.send(ipc::Data::PunchStatus {
+                                status: "cone_nat".to_owned(),
+                                info: v6_punch_addr.to_string(),
+                            });
+                            let _ = phase3_tx
+                                .send(crate::common::PunchAddrInfo {
+                                    addr: v6_punch_addr,
+                                    ready: false,
+                                    delta: 0,
+                                    sync_at_ms: 0,
+                                    addr_type: crate::common::PUNCH_ADDR_TYPE_IPV6,
+                                })
+                                .await;
+                            log::info!(
+                                "Phase3(Host): sent IPv6 address to peer: {}",
+                                v6_punch_addr
+                            );
+                        } else {
+                            log::info!("Phase3(Host): no IPv6 punch socket, skip IPv6 address");
+                        }
                     }
                 }
                 // STUN（及地址广播）全部完成，打洞任务可以安全操作共享 socket
@@ -1010,6 +1092,12 @@ impl Connection {
                     if let Some(res) = res {
                         match res {
                             Err(err) => {
+                                // 换流竞态防护：打洞流已就绪时优先完成换流——
+                                // 对端可能刚换流并 drop 了中继，导致这里读到错误，
+                                // 但直连流已经打好，不能把连接判死。
+                                if conn.try_apply_punch_stream(&punch_stream).await {
+                                    continue;
+                                }
                                 conn.on_close(&err.to_string(), true).await;
                                 break;
                             },
@@ -1031,33 +1119,19 @@ impl Connection {
                             }
                         }
                     } else {
+                        // 换流竞态防护：同上——中继被对端换流打断时，
+                        // 若直连流已就绪则换流而不是判连接死亡。
+                        if conn.try_apply_punch_stream(&punch_stream).await {
+                            continue;
+                        }
                         conn.on_close("Reset by the peer", true).await;
                         break;
                     }
                 },
                 _ = punch_notify.notified() => {
-                    let mut guard = punch_stream.lock().await;
-                    if let Some(new_stream) = guard.take() {
-                        // 防二次换流：已升级过则丢弃新流
-                        let already_upgraded = conn.phase3_upgraded.as_ref()
-                            .map_or(false, |u| u.swap(true, std::sync::atomic::Ordering::SeqCst));
-                        if already_upgraded {
-                            log::info!("Phase3(Host): already upgraded, drop duplicate stream");
-                        } else {
-                            let saved_key = conn.stream.take_key();
-                            log::info!("Phase3(Host): Relay upgraded to direct connection!");
-                            conn.stream = new_stream;
-                            if let Some(enc) = saved_key {
-                                // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
-                                // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
-                                // 两侧都在换流时刻归零，新流上序号自洽
-                                conn.stream.set_key(enc.0);
-                                log::info!("Phase3(Host): encryption key transferred to new stream (seq reset)");
-                            } else {
-                                log::warn!("Phase3(Host): no encryption key from old stream!");
-                            }
-                        }
-                    }
+                    // 换流逻辑与中继读失败分支共用（换流竞态防护）：
+                    // 无就绪流时静默返回（通知已消费但流已被取走属正常）
+                    conn.try_apply_punch_stream(&punch_stream).await;
                 },
                 Some(phase3_my_info) = phase3_out_rx.recv() => {
                     // Phase 3: Forward host's STUN-discovered address (+同步信号) to connector via relay
@@ -2553,16 +2627,26 @@ impl Connection {
             }
             // Phase 3: Received connector's public address (+同步信号) through relay
             if let Some(misc::Union::PunchPeerAddr(ppa)) = &misc.union {
-                if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>()
-                {
+                // 会话类型门控：文件传输/终端/端口转发会话控制端不会打洞，
+                // 主机收到地址也直接忽略（登录判定完成前默认放行）
+                let punchable = self
+                    .phase3_useful
+                    .as_ref()
+                    .map_or(true, |u| u.load(std::sync::atomic::Ordering::SeqCst));
+                if !punchable {
+                    log::info!("Phase3(Host): session type not punchable, ignore peer address");
+                } else if let Ok(peer_addr) = ppa.addr.parse::<std::net::SocketAddr>() {
                     log::info!("Phase3(Host): received peer address: {} (ready={}, delta={}, sync_at={}, type={})",
                         peer_addr, ppa.ready, ppa.delta, ppa.sync_at_ms, ppa.addr_type);
-                    // 忽略不可用地址：0.0.0.0 不可打洞，IPv6 与 v4 punch_socket 不匹配
-                    if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
+                    // 忽略不可用地址：0.0.0.0/端口 0 不可打洞，链路本地/ULA v6 不可路由。
+                    // 公网全球单播 v6 现在可以打（主机有 v6 punch socket，双栈互通）。
+                    if crate::common::is_unusable_punch_addr(&peer_addr) {
                         log::info!("Phase3(Host): ignore unusable address {}", peer_addr);
-                    } else if self.phase3_upgraded.as_ref().map_or(false, |u| {
-                        u.load(std::sync::atomic::Ordering::SeqCst)
-                    }) {
+                    } else if self
+                        .phase3_upgraded
+                        .as_ref()
+                        .map_or(false, |u| u.load(std::sync::atomic::Ordering::SeqCst))
+                    {
                         log::info!("Phase3(Host): already upgraded, ignore {}", peer_addr);
                     } else {
                         // 地址入队（携带同步信号与显式类型），由唯一打洞任务消费
@@ -2577,25 +2661,36 @@ impl Connection {
                         if let Some(ref targets) = self.phase3_targets {
                             targets.lock().await.push(info);
                         }
-                        let already_started = self.phase3_started.as_ref().map_or(true, |s| {
-                            s.swap(true, std::sync::atomic::Ordering::SeqCst)
-                        });
+                        let already_started = self
+                            .phase3_started
+                            .as_ref()
+                            .map_or(true, |s| s.swap(true, std::sync::atomic::Ordering::SeqCst));
                         if !already_started {
                             let punch_stream = self.punch_stream.clone();
                             let punch_notify = self.punch_notify.clone();
                             let punch_socket = self.punch_socket.clone();
+                            let punch_socket_v6 = self.punch_socket_v6.clone();
                             let targets = self.phase3_targets.clone().unwrap();
                             let upgraded = self.phase3_upgraded.clone().unwrap();
                             let tcp_listener = self.phase3_tcp_listener.clone();
                             let stun_done = self.phase3_stun_done.clone().unwrap();
-                            let kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>> =
-                                Arc::new(std::sync::Mutex::new(None));
+                            let kcp_handle: Arc<
+                                std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>,
+                            > = Arc::new(std::sync::Mutex::new(None));
                             // KcpStream 随 Connection 存活，避免打洞任务结束后被 drop 停掉 kcp_io
                             self.phase3_kcp = Some(kcp_handle.clone());
                             self.phase3_task = Some(tokio::spawn(async move {
                                 match relay_phase3_punch_to_peer(
-                                    targets, kcp_handle, punch_socket, tcp_listener, upgraded, stun_done,
-                                ).await {
+                                    targets,
+                                    kcp_handle,
+                                    punch_socket,
+                                    punch_socket_v6,
+                                    tcp_listener,
+                                    upgraded,
+                                    stun_done,
+                                )
+                                .await
+                                {
                                     Ok(stream) => {
                                         if let Some(s) = punch_stream {
                                             let mut guard = s.lock().await;
@@ -2618,6 +2713,22 @@ impl Connection {
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            // Phase3 会话类型判定（放在 handle_login_request_without_validation 之前，
+            // 因为它可能置位 authorized 导致下面的提前返回）：只有桌面控制/摄像头
+            // 会话值得打洞——文件传输/终端/端口转发控制端不会发起 Phase3。
+            let phase3_useful = match &lr.union {
+                Some(login_request::Union::FileTransfer(_)) => false,
+                Some(login_request::Union::ViewCamera(_)) => true,
+                Some(login_request::Union::Terminal(_)) => false,
+                Some(login_request::Union::PortForward(_)) => false,
+                _ => true,
+            };
+            if let Some(u) = self.phase3_useful.as_ref() {
+                u.store(phase3_useful, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(s) = self.phase3_login_seen.as_ref() {
+                s.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
@@ -4634,6 +4745,44 @@ impl Connection {
                 impl_key,
             ),
         }
+    }
+
+    /// 换流竞态防护：若打洞流已就绪，完成换流并返回 true。
+    ///
+    /// 对端可能先换流并 drop 了中继连接，导致本端在旧中继流上读到错误/EOF；
+    /// 此时直连流已经打好，不能把连接判死。punch_notify 分支与中继读失败
+    /// 分支都走这里，保证"已升级"判定与流替换是同一段原子逻辑。
+    /// 无就绪流时返回 false（调用方按原逻辑处理）。
+    async fn try_apply_punch_stream(
+        &mut self,
+        punch_stream: &Arc<hbb_common::tokio::sync::Mutex<Option<super::Stream>>>,
+    ) -> bool {
+        let new_stream = match punch_stream.lock().await.take() {
+            Some(s) => s,
+            None => return false,
+        };
+        // 防二次换流：已升级过则丢弃新流
+        let already_upgraded = self
+            .phase3_upgraded
+            .as_ref()
+            .map_or(false, |u| u.swap(true, std::sync::atomic::Ordering::SeqCst));
+        if already_upgraded {
+            log::info!("Phase3(Host): already upgraded, drop duplicate stream");
+        } else {
+            let saved_key = self.stream.take_key();
+            log::info!("Phase3(Host): Relay upgraded to direct connection!");
+            self.stream = new_stream;
+            if let Some(enc) = saved_key {
+                // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
+                // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
+                // 两侧都在换流时刻归零，新流上序号自洽
+                self.stream.set_key(enc.0);
+                log::info!("Phase3(Host): encryption key transferred to new stream (seq reset)");
+            } else {
+                log::warn!("Phase3(Host): no encryption key from old stream!");
+            }
+        }
+        true
     }
 
     async fn on_close(&mut self, reason: &str, lock: bool) {

@@ -77,10 +77,6 @@ pub struct Session<T: InvokeUiSession> {
     pub displays_empty_retries: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
-    // Upgrade notification channels, set by io_loop for background LAN/Phase3 upgrade.
-    // Shared via Arc/RwLock so the clone passed into Client::start sees the same channels.
-    pub upgrade_stream: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>>>,
-    pub upgrade_notify: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>>>,
 }
 
 #[derive(Clone)]
@@ -1795,25 +1791,6 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         self.ui_handler.set_multiple_windows_session(sessions);
     }
 
-    fn set_upgrade_channels(
-        &self,
-        stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
-        notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
-    ) {
-        *self.upgrade_stream.write().unwrap() = Some(stream);
-        *self.upgrade_notify.write().unwrap() = Some(notify);
-    }
-    fn get_upgrade_channels(
-        &self,
-    ) -> (
-        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
-        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
-    ) {
-        (
-            self.upgrade_stream.read().unwrap().clone(),
-            self.upgrade_notify.read().unwrap().clone(),
-        )
-    }
 
     fn handle_peer_info(&self, mut pi: PeerInfo) {
         log::debug!("handle_peer_info :{:?}", pi);

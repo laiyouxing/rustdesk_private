@@ -208,15 +208,16 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
-        // Initialize upgrade channels BEFORE connection start so that background
-        // LAN test (spawned inside _start_inner) can push direct streams here for
-        // seamless in-session replacement (same mechanism as Phase3 upgrade).
+        // Phase3 打洞通道：后台打洞任务（relay_upgrade_task / LAN 测试）把直连流
+        // 推进 punch_stream 并通知 punch_notify，由下面的 select 循环换流。
+        // 注意：io_loop 直接使用这两个本地 Arc，不再向 handler 镜像一份
+        // （旧的 set_upgrade_channels/get_upgrade_channels 机制无任何读取方，
+        // 属于僵尸功能，已移除）。
         let punch_notify = Arc::new(Notify::new());
         let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
             Arc::new(hbb_common::tokio::sync::Mutex::new(None));
         self.punch_notify = Some(punch_notify.clone());
         self.punch_stream = Some(punch_stream.clone());
-        self.handler.set_upgrade_channels(punch_stream.clone(), punch_notify.clone());
         // 重连时丢弃上一会话的 KcpStream（其 kcp_io 泵随 drop 停止）
         self.phase3_kcp = None;
 
@@ -371,6 +372,17 @@ impl<T: InvokeUiSession> Remote<T> {
                             if let Some(res) = res {
                                 match res {
                                     Err(err) => {
+                                        // 换流竞态防护：打洞流已就绪时优先完成换流——
+                                        // 对端可能刚换流并 drop 了中继，导致这里读到错误，
+                                        // 但直连流已经打好，不能重连（否则"升级成功却断线"）。
+                                        if self
+                                            .try_apply_punch_upgrade(
+                                                &mut peer, &mut kcp, &punch_stream, &relay_server,
+                                            )
+                                            .await
+                                        {
+                                            continue;
+                                        }
                                         if received {
                                             log::info!("Connection lost, reconnecting...");
                                         } else {
@@ -392,6 +404,16 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 }
                             } else {
+                                // 换流竞态防护：中继被对端换流打断（EOF）时，
+                                // 若直连流已就绪则换流而不是重连。
+                                if self
+                                    .try_apply_punch_upgrade(
+                                        &mut peer, &mut kcp, &punch_stream, &relay_server,
+                                    )
+                                    .await
+                                {
+                                    continue;
+                                }
                                 if self.handler.is_restarting_remote_device() {
                                     log::info!("Restart remote device");
                                     self.handler.msgbox("restarting", "Restarting remote device", "remote_restarting_tip", "");
@@ -417,38 +439,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.handle_local_clipboard_msg(&mut peer, _msg).await;
                         }
                         _ = punch_notify.notified() => {
-                            let mut guard = punch_stream.lock().await;
-                            if let Some(new_peer) = guard.take() {
-                                log::info!("Relay upgraded to direct connection!");
-                                // 先让 relay 刷新挂起的消息，减少切流丢包
-                                allow_err!(peer.send(&Message::new()).await);
-                                let saved_key = peer.take_key();
-                                peer = new_peer;
-                                if let Some(enc) = saved_key {
-                                    // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
-                                    // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
-                                    // 两侧都在换流时刻归零，新流上序号自洽
-                                    peer.set_key(enc.0);
-                                    log::info!("Phase3: encryption key transferred to new stream (seq reset)");
-                                } else {
-                                    log::warn!("Phase3: no encryption key from old stream!");
-                                }
-                                // 给新流 50ms 稳定时间
-                                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
-                                crate::common::record_phase3_success();
-                                self.handler.update_direct(Some(true));
-                                self.handler.set_connection_type(
-                                    peer.is_secured(), true, "UDP", &relay_server
-                                );
-                                self.handler.set_punch_status("succeeded", "UDP");
-                                // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start
-                                // 返回的 kcp 恒为 None，不更新的话断连时不会发 close_reason，
-                                // 对端要等 60s KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
-                                kcp = self
-                                    .phase3_kcp
-                                    .as_ref()
-                                    .and_then(|h| h.lock().ok().and_then(|mut g| g.take()));
-                            }
+                            // 换流逻辑与中继读失败分支共用（换流竞态防护）：
+                            // 无就绪流时静默返回（通知已消费但流已被取走属正常）
+                            self.try_apply_punch_upgrade(
+                                &mut peer, &mut kcp, &punch_stream, &relay_server,
+                            )
+                            .await;
                         }
                         _ = punch_done.notified() => {
                             // 单一换流路径在 punch_notify 分支；这里只处理打洞任务结束
@@ -789,6 +785,53 @@ impl<T: InvokeUiSession> Remote<T> {
         msg.set_misc(misc);
         allow_err!(peer.send(&msg).await);
         self.sent_close_reason = true;
+    }
+
+    /// 换流竞态防护：若打洞流已就绪，把会话切换到直连流并返回 true。
+    ///
+    /// 对端可能先换流并 drop 了中继，导致本端在旧中继流上读到错误/EOF；
+    /// 此时直连流已经打好，不能重连（否则"升级成功却断线"）。
+    /// punch_notify 分支与中继读失败分支都走这里。无就绪流时返回 false。
+    async fn try_apply_punch_upgrade(
+        &mut self,
+        peer: &mut Stream,
+        kcp: &mut Option<crate::kcp_stream::KcpStream>,
+        punch_stream: &Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+        relay_server: &str,
+    ) -> bool {
+        let new_peer = match punch_stream.lock().await.take() {
+            Some(s) => s,
+            None => return false,
+        };
+        log::info!("Relay upgraded to direct connection!");
+        // 先让 relay 刷新挂起的消息，减少切流丢包
+        allow_err!(peer.send(&Message::new()).await);
+        let saved_key = peer.take_key();
+        *peer = new_peer;
+        if let Some(enc) = saved_key {
+            // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途报文若保留
+            // 旧序号会使新流收发序号永久错位、解密失败；两侧都在换流时刻归零，
+            // 新流上序号自洽
+            peer.set_key(enc.0);
+            log::info!("Phase3: encryption key transferred to new stream (seq reset)");
+        } else {
+            log::warn!("Phase3: no encryption key from old stream!");
+        }
+        // 给新流 50ms 稳定时间
+        hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
+        crate::common::record_phase3_success();
+        self.handler.update_direct(Some(true));
+        self.handler
+            .set_connection_type(peer.is_secured(), true, "UDP", relay_server);
+        self.handler.set_punch_status("succeeded", "UDP");
+        // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start 返回的
+        // kcp 恒为 None，不更新的话断连时不会发 close_reason，对端要等 60s
+        // KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
+        *kcp = self
+            .phase3_kcp
+            .as_ref()
+            .and_then(|h| h.lock().ok().and_then(|mut g| g.take()));
+        true
     }
 
     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {

@@ -3790,24 +3790,6 @@ pub trait Interface: Send + Clone + 'static + Sized {
         self.get_lch().write().unwrap().received = received;
     }
 
-    /// Set upgrade notification channels for post-relay LAN/Phase3 direct upgrade.
-    /// Called by io_loop before connection start to provide a communication path
-    /// for background LAN test tasks to notify the main loop of a new direct stream.
-    fn set_upgrade_channels(
-        &self,
-        _stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
-        _notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
-    ) {
-    }
-    /// Retrieve upgrade notification channels, if previously set via set_upgrade_channels.
-    fn get_upgrade_channels(
-        &self,
-    ) -> (
-        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
-        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
-    ) {
-        (None, None)
-    }
 
     fn on_establish_connection_error(&self, err: String) {
         let title = "Connection Error";
