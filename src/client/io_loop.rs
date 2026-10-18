@@ -857,7 +857,9 @@ impl<T: InvokeUiSession> Remote<T> {
         // 可用；超时未确认则由主循环断开，让自动重连回退到中继，而不是
         // 僵死在一条不通的流上（表现为换流后无法操作远程主机）。
         let mut probe = Message::new();
-        probe.set_test_delay(message::TestDelay {
+        // 注意：TestDelay 在 message_proto 顶层（message_proto::TestDelay），
+        // 不在 message 子模块下；本文件已 glob 导入 message_proto::*。
+        probe.set_test_delay(TestDelay {
             from_client: true,
             ..Default::default()
         });

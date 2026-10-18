@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, RwLock},
     task::Poll,
 };
@@ -31,7 +31,7 @@ use hbb_common::{
     tokio::{
         self,
         net::UdpSocket,
-        sync::{mpsc, oneshot},
+        sync::mpsc,
         time::{Duration, Instant, Interval},
     },
     ResultType, Stream,
@@ -3228,7 +3228,8 @@ pub fn is_unusable_punch_addr(addr: &std::net::SocketAddr) -> bool {
 /// 起始时刻相差数十秒，窗口仍有大量重叠，双方能真正同时向对方发包。
 async fn punch_target_sustained(
     socket: &Arc<UdpSocket>,
-    target: std::net::SocketAddr,
+    // socket 调用前已 connect 到目标地址，此处无需再用 target
+    _target: std::net::SocketAddr,
     duration_ms: u64,
     prefer_connect: bool,
 ) -> Option<(crate::kcp_stream::KcpStream, Stream)> {
@@ -4237,7 +4238,7 @@ pub async fn relay_phase3_punch_to_peer(
 
         // ===== 阶段 B：统一偏移序列扫描（对端 delta 预测 + 小幅漂移）=====
         // 对称低强度模式下 scan_offsets 为空，整段跳过（预测端口已在阶段 A 打过）
-        let mut scan_offsets: Vec<i32> = if symmetric_mode {
+        let scan_offsets: Vec<i32> = if symmetric_mode {
             Vec::new()
         } else {
             let mut v = PUNCH_OFFSETS.to_vec();
