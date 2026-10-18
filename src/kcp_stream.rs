@@ -130,10 +130,15 @@ impl KcpStream {
     /// to be eaten by the wrong endpoint.
     ///
     /// `prefer_connect`: the connector side prefers outbound connect, the
-    /// host side prefers accept. If the non-preferred direction finishes
-    /// first with Ok, its result is kept as a fallback while we keep waiting
-    /// for the preferred direction until it completes: a preferred Ok wins,
-    /// otherwise the saved non-preferred Ok is used. Both Err -> Err.
+    /// host side prefers accept. **Only the preferred direction's result is
+    /// used** — the connector always takes the stream it connected, the host
+    /// always takes the stream it accepted, so both sides land on the *same*
+    /// KCP stream (the one the connector initiated). Falling back to the
+    /// non-preferred direction would pair the two sides on different streams
+    /// (different conv), which never carry traffic: the classic
+    /// "punch succeeded but the remote is uncontrollable" symptom.
+    /// A failed preferred direction simply fails this round; the next round
+    /// retries (the empty-packet burst keeps opening the NAT hole).
     pub async fn race(
         udp_socket: Arc<UdpSocket>,
         timeout: std::time::Duration,
@@ -163,45 +168,37 @@ impl KcpStream {
         Self::kcp_io(udp_socket.clone(), input, output, stop_receiver).await;
 
         // Drive connect and accept concurrently on the same endpoint (both &self).
+        // Both directions must run to completion even though only one result is
+        // used: connect sends the packets that open the peer's NAT hole, and
+        // accept keeps the endpoint receiving. `join!` waits for both (each is
+        // bounded by `timeout`), which also matches the previous timing.
         let conn_id = {
-            let mut connect_fut = Box::pin(endpoint.connect(timeout, 0, 0, Bytes::new()));
-            let mut accept_fut = Box::pin(async {
+            let connect_fut = Box::pin(endpoint.connect(timeout, 0, 0, Bytes::new()));
+            let accept_fut = Box::pin(async {
                 match tokio::time::timeout(timeout, endpoint.accept()).await {
                     Ok(r) => r,
                     Err(_) => Err(kcp_sys::error::Error::ConnectTimeout),
                 }
             });
-            let mut conn_res = None;
-            let mut accept_res = None;
-            tokio::select! {
-                res = &mut connect_fut => conn_res = Some(res),
-                res = &mut accept_fut => accept_res = Some(res),
-            }
-            // 非优先方向先完成时保存结果，继续等优先方向完成再决定采用哪条路
-            if conn_res.is_none() {
-                conn_res = Some(connect_fut.await);
-            }
-            if accept_res.is_none() {
-                accept_res = Some(accept_fut.await);
-            }
-            let conn_res = conn_res.unwrap();
-            let accept_res = accept_res.unwrap();
+            let (conn_res, accept_res) = tokio::join!(connect_fut, accept_fut);
             if prefer_connect {
-                match conn_res {
-                    Ok(id) => id,
-                    Err(e) => match accept_res {
-                        Ok(id) => id,
-                        Err(_) => return Err(e.into()),
-                    },
-                }
+                // 控制端：只用自己 connect 的那条流（主机端 accept 的正是它）。
+                // 失败绝不 fallback 到 accept 的流——主机会用它自己 accept 到的
+                // 流（conv 不同），两条流之间不通，换流后即"无法操作"。
+                log::debug!(
+                    "KCP race (connector side): connect={:?}, accept(discarded)={:?}",
+                    conn_res.as_ref().map(|_| "ok"),
+                    accept_res.as_ref().map(|_| "ok")
+                );
+                conn_res?
             } else {
-                match accept_res {
-                    Ok(id) => id,
-                    Err(e) => match conn_res {
-                        Ok(id) => id,
-                        Err(_) => return Err(e.into()),
-                    },
-                }
+                // 主机端：只用自己 accept 到的那条流（控制端 connect 的正是它）。
+                log::debug!(
+                    "KCP race (host side): accept={:?}, connect(discarded)={:?}",
+                    accept_res.as_ref().map(|_| "ok"),
+                    conn_res.as_ref().map(|_| "ok")
+                );
+                accept_res?
             }
         };
         if let Some(stream) = stream::KcpStream::new(&endpoint, conn_id) {

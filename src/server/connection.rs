@@ -362,6 +362,11 @@ pub struct Connection {
     // Phase 3: handle of the single punch task, aborted on connection close
     // to avoid leaking the task (180s budget) across reconnections.
     phase3_task: Option<hbb_common::tokio::task::JoinHandle<()>>,
+    // Phase3 换流确认：换到直连流后置位。主机每秒会发 TestDelay，若 5s 内
+    // 收不到对端在直连上的任何数据，说明直连流实际不通（KCP 配对错误或
+    // 单向 NAT），主动断开让控制端自动重连回退中继——僵死在不通的直连上
+    // 表现为"直连成功但无法操作远程主机"。
+    phase3_verify_at: Option<Instant>,
 }
 
 impl ConnInner {
@@ -555,6 +560,7 @@ impl Connection {
             phase3_useful: None,
             phase3_login_seen: None,
             phase3_task: None,
+            phase3_verify_at: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -1103,6 +1109,11 @@ impl Connection {
                             },
                             Ok(bytes) => {
                                 last_recv_time = Instant::now();
+                                // 直连换流确认：对端能在刚建立的直连流上发来数据，
+                                // 即证明这条流双向可用（配对正确、NAT 洞已开）。
+                                if conn.phase3_verify_at.take().is_some() {
+                                    log::info!("Phase3(Host): direct stream verified (peer data received)");
+                                }
                                 conn.session_last_recv_time.as_mut().map(|t| *t.lock().unwrap() = Instant::now());
                                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
                                     if !conn.on_message(msg_in).await {
@@ -1279,6 +1290,20 @@ impl Connection {
                     if last_recv_time.elapsed() >= SEC30 {
                         conn.on_close("Timeout", true).await;
                         break;
+                    }
+                    // 直连换流确认看门狗：换流后 5s 内没收到对端在直连上的任何
+                    // 数据，说明直连流实际不通（KCP 配对错误或单向 NAT）。
+                    // 主动断开，让控制端自动重连回退到中继——僵死在不通的直连上
+                    // 会导致用户完全无法操作远程主机。
+                    if let Some(at) = conn.phase3_verify_at {
+                        if at.elapsed() >= Duration::from_secs(5) {
+                            conn.phase3_verify_at = None;
+                            log::warn!(
+                                "Phase3(Host): direct stream not verified within 5s (no peer data), closing to fall back to relay"
+                            );
+                            conn.on_close("Phase3 direct stream not verified", true).await;
+                            break;
+                        }
                     }
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
                     if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
@@ -4781,6 +4806,20 @@ impl Connection {
             } else {
                 log::warn!("Phase3(Host): no encryption key from old stream!");
             }
+            // 换流确认（看门狗）：直连流可能因 KCP 配对错误或单向 NAT 实际
+            // 不通，而两端都认为"打洞成功"。这里强制发一个 TestDelay（控制端
+            // 收到会回传），5s 内收到对端在直连上的任何数据即确认双向可用；
+            // 超时则由 second_timer 断开，让控制端自动重连回退中继，而不是
+            // 僵死在一条不通的流上（表现为换流后无法操作远程主机）。
+            let mut probe = Message::new();
+            probe.set_test_delay(TestDelay {
+                last_delay: self.network_delay,
+                target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
+                ..Default::default()
+            });
+            self.last_test_delay = Some(Instant::now());
+            self.send(probe).await;
+            self.phase3_verify_at = Some(Instant::now() + Duration::from_secs(5));
         }
         true
     }

@@ -92,6 +92,11 @@ pub struct Remote<T: InvokeUiSession> {
     // relay_upgrade_task stores the KcpStream here; without this the stream
     // would be dropped (and its kcp_io pump stopped) when the task exits.
     phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
+    // Phase3 换流确认：换到直连流后置位，用于"新流是否真的双向可用"看门狗。
+    // 直连 KCP 配对错误时两端会各用各的流（KCP 层面不通），表现为换流后
+    // 无法操作远程主机。收到对端在直连上的任何数据即清除；超时未确认则
+    // 主动断开让自动重连重建中继，而不是僵死在一条不通的流上。
+    punch_verify_deadline: Option<Instant>,
     // Inactivity timeout: track last user input for auto-disconnect
     last_input_time: Instant,
     inactivity_warning_remaining: Option<u32>,
@@ -150,6 +155,7 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_tcp_addrs: None,
             phase3_cancel: None,
             phase3_kcp: None,
+            punch_verify_deadline: None,
             last_input_time: Instant::now(),
             inactivity_warning_remaining: None,
         }
@@ -220,6 +226,8 @@ impl<T: InvokeUiSession> Remote<T> {
         self.punch_stream = Some(punch_stream.clone());
         // 重连时丢弃上一会话的 KcpStream（其 kcp_io 泵随 drop 停止）
         self.phase3_kcp = None;
+        // 重置上一会话遗留的换流确认状态
+        self.punch_verify_deadline = None;
 
         match Client::start(
             &self.handler.get_id(),
@@ -393,6 +401,11 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                     Ok(ref bytes) => {
                                         last_recv_time = Instant::now();
+                                        // 直连换流确认：对端能在刚建立的直连流上发来数据，
+                                        // 即证明这条流双向可用（配对正确、NAT 洞已开）。
+                                        if self.punch_verify_deadline.take().is_some() {
+                                            log::info!("Phase3: direct stream verified (peer data received)");
+                                        }
                                         if !received {
                                             received = true;
                                             self.handler.update_received(true);
@@ -491,6 +504,20 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = status_timer.tick() => {
+                            // 直连换流确认看门狗：换流后 5s 内没收到对端在直连上的
+                            // 任何数据，说明这条直连流实际不通（KCP 配对错误或
+                            // 单向 NAT）。此时主动断开，让自动重连重建中继会话，
+                            // 避免僵死在不通的流上——否则用户完全无法操作远程主机。
+                            if let Some(deadline) = self.punch_verify_deadline {
+                                if Instant::now() >= deadline {
+                                    log::warn!(
+                                        "Phase3: direct stream not verified within 5s (no peer data), reconnecting to fall back to relay"
+                                    );
+                                    self.punch_verify_deadline = None;
+                                    self.handler.set_punch_status("reconnecting", "");
+                                    break;
+                                }
+                            }
                             let elapsed = fps_instant.elapsed().as_millis();
                             if elapsed < 1000 {
                                 continue;
@@ -824,6 +851,20 @@ impl<T: InvokeUiSession> Remote<T> {
         self.handler
             .set_connection_type(peer.is_secured(), true, "UDP", relay_server);
         self.handler.set_punch_status("succeeded", "UDP");
+        // 换流确认（看门狗）：直连流可能因 KCP 配对错误或单向 NAT 实际不通，
+        // 而两端都认为"打洞成功"。这里主动发一个 from_client 的 TestDelay
+        // （主机收到必原样回传），5s 内在新流上收到对端任何数据即确认双向
+        // 可用；超时未确认则由主循环断开，让自动重连回退到中继，而不是
+        // 僵死在一条不通的流上（表现为换流后无法操作远程主机）。
+        let mut probe = Message::new();
+        probe.set_test_delay(message::TestDelay {
+            from_client: true,
+            ..Default::default()
+        });
+        if let Err(e) = peer.send(&probe).await {
+            log::warn!("Phase3: failed to send direct-stream probe: {}", e);
+        }
+        self.punch_verify_deadline = Some(Instant::now() + Duration::from_secs(5));
         // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start 返回的
         // kcp 恒为 None，不更新的话断连时不会发 close_reason，对端要等 60s
         // KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
