@@ -3247,7 +3247,7 @@ pub async fn create_punch_socket_v4() -> ResultType<Arc<tokio::net::UdpSocket>> 
 /// 探测本 socket 的公网映射地址并返回 (地址, 对称delta)。
 /// delta=0 表示锥形 NAT（端口恒定）；对称 NAT 时换一台 STUN 服务器复测，
 /// 端口差即 delta，对端用它预测我们的映射端口。
-async fn stun_probe_with_delta(
+pub async fn stun_probe_with_delta(
     socket: &tokio::net::UdpSocket,
 ) -> ResultType<(SocketAddr, i32)> {
     let (addr, _) = stun_query_with_socket(socket).await?;
@@ -3271,10 +3271,156 @@ async fn stun_probe_with_delta(
     Ok((addr, 0))
 }
 
+/// direct-access-port（被控端 TCP 直连监听端口；LAN 与 TCP fallback 都用它）
+fn get_direct_access_port() -> u16 {
+    let p = Config::get_option("direct-access-port")
+        .parse::<i32>()
+        .unwrap_or(0);
+    if p > 0 {
+        p as u16
+    } else {
+        (hbb_common::config::RENDEZVOUS_PORT + 2) as u16
+    }
+}
+
+/// 收集本机的全部候选打洞地址与网络环境（尽可能多的信息交换，提高成功率）。
+///
+/// 地址按优先级：
+/// - `last_success`  上一会话成功用过的映射（重连时 NAT 映射通常仍在，命中率最高）
+/// - `stun_primary`  主 STUN 服务器看到的映射
+/// - `stun_alt`      备 STUN 服务器看到的映射（对称 NAT 下与主不同，附带 delta）
+/// - `lan`           本机各网卡内网地址 + direct-access-port（双方同网段时直连）
+/// - `tcp`           主映射 IP + direct-access-port（UDP 全封时的 TCP 同步打开）
+///
+/// `socket` 传入时复用它做 STUN（保证探测到的映射与后续打洞同一个 socket）；
+/// 被控端周期上报传 None（内部自建）。
+pub async fn collect_punch_addrs(
+    socket: Option<&Arc<tokio::net::UdpSocket>>,
+) -> (
+    Vec<crate::hbbs_http::punch_exchange::PunchAddr>,
+    crate::hbbs_http::punch_exchange::PunchMeta,
+) {
+    use crate::hbbs_http::punch_exchange::{
+        PunchAddr, PunchMeta, KIND_LAN, KIND_LAST_SUCCESS, KIND_STUN_ALT, KIND_STUN_PRIMARY,
+        KIND_TCP, PRIO_LAN, PRIO_LAST_SUCCESS, PRIO_STUN_ALT, PRIO_STUN_PRIMARY, PRIO_TCP,
+    };
+
+    let mut addrs: Vec<PunchAddr> = Vec::new();
+    let mut primary_ip: Option<std::net::IpAddr> = None;
+
+    // 1. 上一会话成功的映射地址（本机 NAT 映射通常仍在，命中率最高）
+    let last_ok = LocalConfig::get_option("punch-last-success");
+    if !last_ok.is_empty() {
+        if let Ok(sa) = last_ok.parse::<SocketAddr>() {
+            if !is_unusable_punch_addr(&sa) {
+                addrs.push(PunchAddr::new(
+                    last_ok,
+                    "udp",
+                    KIND_LAST_SUCCESS,
+                    PRIO_LAST_SUCCESS,
+                    0,
+                ));
+            }
+        }
+    }
+
+    // 2. 主/备 STUN 映射（同一 socket，保证与后续打洞的 NAT 映射一致）
+    let owned_socket;
+    let sock: Option<&Arc<tokio::net::UdpSocket>> = match socket {
+        Some(s) => Some(s),
+        None => match create_punch_socket_v4().await {
+            Ok(s) => {
+                owned_socket = s;
+                Some(&owned_socket)
+            }
+            Err(_) => None,
+        },
+    };
+    if let Some(sock) = sock {
+        if let Ok((primary, _)) = stun_query_with_socket(sock).await {
+            primary_ip = Some(primary.ip());
+            addrs.push(PunchAddr::new(
+                primary.to_string(),
+                "udp",
+                KIND_STUN_PRIMARY,
+                PRIO_STUN_PRIMARY,
+                0,
+            ));
+            // 备 STUN：对称 NAT 下不同目的地址的映射不同，对端可一并尝试
+            let servers = get_stun_servers_v4();
+            let alt_srv = servers.get(1).or_else(|| servers.first());
+            if let Some(alt_srv) = alt_srv {
+                let alt_addr = std::net::ToSocketAddrs::to_socket_addrs(alt_srv)
+                    .ok()
+                    .and_then(|mut i| i.find(|a| a.is_ipv4()));
+                if let Some(alt_addr) = alt_addr {
+                    if sock.connect(alt_addr).await.is_ok() {
+                        sock.send(&[]).await.ok();
+                        if let Ok((alt_res, _)) = stun_query_single_server(sock, alt_srv).await {
+                            if alt_res != primary {
+                                let delta = alt_res.port() as i32 - primary.port() as i32;
+                                addrs.push(PunchAddr::new(
+                                    alt_res.to_string(),
+                                    "udp",
+                                    KIND_STUN_ALT,
+                                    PRIO_STUN_ALT,
+                                    delta,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. LAN 网卡地址 + direct-access-port（双方同网段时根本不用穿透）
+    let direct_port = get_direct_access_port();
+    for ip in crate::common::get_all_ipv4_addrs() {
+        addrs.push(PunchAddr::new(
+            format!("{}:{}", ip, direct_port),
+            "tcp",
+            KIND_LAN,
+            PRIO_LAN,
+            0,
+        ));
+    }
+
+    // 4. TCP 同步打开候选：主映射 IP + direct-access-port（UDP 全封时用）
+    if let Some(ip) = primary_ip {
+        addrs.push(PunchAddr::new(
+            format!("{}:{}", ip, direct_port),
+            "tcp",
+            KIND_TCP,
+            PRIO_TCP,
+            0,
+        ));
+    }
+
+    // 5. 网络环境 meta：对端据此选策略
+    let nat_type = match Config::get_nat_type() {
+        2 => "symmetric",
+        1 => "cone",
+        _ => "unknown",
+    };
+    let meta = PunchMeta {
+        nat_type: nat_type.to_owned(),
+        upnp: get_upnp_port() > 0,
+        via_proxy: Config::get_socks().is_some() || hbb_common::config::use_ws(),
+    };
+
+    (addrs, meta)
+}
+
+/// 记录上一会话成功的本机映射地址（下次上报为 last_success，优先被打）
+pub fn save_punch_last_success(addr: &std::net::SocketAddr) {
+    LocalConfig::set_option("punch-last-success".to_owned(), addr.to_string());
+}
+
 /// 控制端：通过 api-server 交换地址，在**建立中继之前**完成 UDP 打洞。
 ///
-/// 流程：创建打洞 socket → STUN 探测公网地址 → 上报（target=对端）→
-/// 拉取对端地址 → 双方约定时刻同时发起 → 持续打洞。
+/// 流程：收集本机全部候选地址 → 上报（target=对端）→ 拉取对端地址与环境 →
+/// 双方约定时刻同时发起 → 多地址轮转打洞（含对称 NAT 端口预测）。
 /// 成功返回 (KcpStream, Stream, 对端地址)；失败返回 Err，调用方回退中继流程。
 ///
 /// 这样连接建立时就直接是直连会话：不存在"先中继再换流"，也就没有双连接
@@ -3285,73 +3431,70 @@ pub async fn punch_direct_via_api(
 ) -> ResultType<(crate::kcp_stream::KcpStream, Stream, std::net::SocketAddr)> {
     use std::time::Duration;
 
-    // 1. 打洞 socket
+    // 1. 打洞 socket（后续 STUN 探测与打洞复用，保证 NAT 映射一致）
     let socket_v4 = create_punch_socket_v4().await?;
-    let socket = socket_v4.clone();
 
-    // 2. STUN 探测本 socket 的公网映射地址（对端要打的就是这个地址）
-    let (my_addr, my_delta) = match stun_probe_with_delta(&socket).await {
-        Ok(x) => x,
-        Err(e) => {
-            log::info!("punch_direct_via_api: STUN probe failed: {:?}", e);
-            return Err(e);
-        }
-    };
+    // 2. 收集本机全部候选地址 + 网络环境
+    let (my_addrs, my_meta) = collect_punch_addrs(Some(&socket_v4)).await;
+    if my_addrs.is_empty() {
+        bail!("punch_direct_via_api: no local punch address");
+    }
+    let my_primary = my_addrs
+        .iter()
+        .find(|a| a.kind == crate::hbbs_http::punch_exchange::KIND_STUN_PRIMARY)
+        .and_then(|a| a.addr.parse::<SocketAddr>().ok());
     log::info!(
-        "punch_direct_via_api: our mapped addr {} (delta {})",
-        my_addr,
-        my_delta
+        "punch_direct_via_api: collected {} local candidate addr(s), nat_type={}",
+        my_addrs.len(),
+        my_meta.nat_type
     );
 
     // 3. 上报自己的地址（target=对端，让被控端发现连接请求）
     let ntp_offset = ntp_offset_ms().await;
     let sync_at_ms = punch_sync_boundary(now_ms_local() + ntp_offset.unwrap_or(0));
-    let addrs = vec![(
-        my_addr.to_string(),
-        "udp".to_owned(),
-        my_delta,
-        sync_at_ms,
-    )];
+    let addrs: Vec<_> = my_addrs
+        .into_iter()
+        .map(|mut a| {
+            a.sync_at_ms = sync_at_ms;
+            a
+        })
+        .collect();
     if let Err(e) =
-        crate::hbbs_http::punch_exchange::report(&Config::get_id(), peer_id, addrs).await
+        crate::hbbs_http::punch_exchange::report(&Config::get_id(), peer_id, &my_meta, addrs)
+            .await
     {
         log::info!("punch_direct_via_api: report failed: {:?}", e);
         return Err(e);
     }
 
-    // 4. 拉取对端地址（对端可能还没上报，轮询等待）。
+    // 4. 拉取对端地址与环境（对端可能还没上报，轮询等待）。
     // 等待上限 12s：被控端每 10s 上报一次，12s 足够覆盖一个周期；
     // 超过则多半是对端没配 api-server（旧版），早退回退中继，不白等。
-    let addr_wait_cap = std::time::Duration::from_secs(12);
-    let deadline = std::time::Instant::now() + total_budget.min(addr_wait_cap + Duration::from_secs(3));
-    let mut peer_addrs: Vec<(SocketAddr, i64)> = Vec::new();
+    let addr_wait_cap = Duration::from_secs(12);
+    let deadline =
+        std::time::Instant::now() + total_budget.min(addr_wait_cap + Duration::from_secs(3));
+    let mut peer_info = crate::hbbs_http::punch_exchange::PeerPunchInfo::default();
     while std::time::Instant::now() < deadline {
-        for a in crate::hbbs_http::punch_exchange::get_peer_addrs(peer_id).await {
-            let Ok(sa) = a.addr.parse::<SocketAddr>() else {
-                continue;
-            };
-            if is_unusable_punch_addr(&sa) {
-                continue;
-            }
-            if !peer_addrs.iter().any(|(x, _)| *x == sa) {
-                peer_addrs.push((sa, a.sync_at_ms));
-            }
-        }
-        if !peer_addrs.is_empty() {
+        peer_info = crate::hbbs_http::punch_exchange::get_peer_info(peer_id).await;
+        if !peer_info.addrs.is_empty() {
             break;
         }
         hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let peer_addrs = crate::hbbs_http::punch_exchange::sort_addrs(peer_info.addrs.clone());
     if peer_addrs.is_empty() {
         bail!("punch_direct_via_api: no peer address from api-server");
     }
+    let peer_symmetric = peer_info.meta.nat_type == "symmetric";
     log::info!(
-        "punch_direct_via_api: got {} peer address(es) via api-server",
-        peer_addrs.len()
+        "punch_direct_via_api: got {} peer candidate addr(s), peer nat_type={} (symmetric={})",
+        peer_addrs.len(),
+        peer_info.meta.nat_type,
+        peer_symmetric
     );
 
     // 5. 双方约定起始时刻取较大值，两端才会在同一绝对时刻同时发起
-    let peer_sync_at = peer_addrs.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
     let target_sync = sync_at_ms.max(peer_sync_at);
     if target_sync > 0 {
         let wait = target_sync - now_ms_local();
@@ -3367,70 +3510,124 @@ pub async fn punch_direct_via_api(
         }
     }
 
-    // 6. 持续打洞：阶段 A 在精确地址上长时间打（两端同时发包打开 NAT 映射）
-    let exact = peer_addrs[0].0;
+    // 6. 组装打洞目标列表（按对端建议优先级）：
+    //    - UDP 类地址全部纳入
+    //    - 对端对称 NAT 时：用对端上报的 stun_alt（不同映射）+ delta 预测 +
+    //      小幅漂移偏移，覆盖其端口变化
+    let mut targets: Vec<SocketAddr> = Vec::new();
+    for a in &peer_addrs {
+        if !a.is_udp() {
+            continue;
+        }
+        let Ok(sa) = a.addr.parse::<SocketAddr>() else {
+            continue;
+        };
+        if is_unusable_punch_addr(&sa) {
+            continue;
+        }
+        if !targets.contains(&sa) {
+            targets.push(sa);
+        }
+        if peer_symmetric && a.delta != 0 {
+            let p = sa.port() as i32 + a.delta;
+            if (1..=65535).contains(&p) {
+                let mut t = sa;
+                t.set_port(p as u16);
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+        }
+    }
+    // 对称 NAT 下对前几个主要地址补充 ±1/±2 的小幅漂移（映射可能逐目的微增）
+    if peer_symmetric {
+        let base: Vec<SocketAddr> = targets.iter().take(3).cloned().collect();
+        for b in base {
+            for off in [-2i32, -1, 1, 2] {
+                let p = b.port() as i32 + off;
+                if (1..=65535).contains(&p) {
+                    let mut t = b;
+                    t.set_port(p as u16);
+                    if !targets.contains(&t) {
+                        targets.push(t);
+                    }
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        bail!("punch_direct_via_api: no usable peer UDP target");
+    }
+    log::info!(
+        "punch_direct_via_api: {} UDP target(s) to try: {:?}",
+        targets.len(),
+        targets
+    );
+
+    // 7. 多地址轮转打洞：每个地址分配一段时间（优先级高的先试），预算内轮换
     let started = std::time::Instant::now();
-    let exact_deadline = started + Duration::from_millis(PUNCH_EXACT_MS);
-    while std::time::Instant::now() < exact_deadline {
-        if started.elapsed() >= total_budget {
+    let total_deadline = started + total_budget;
+    for target in targets {
+        if std::time::Instant::now() >= total_deadline {
             break;
         }
-        let sock = socket_v4.clone();
-        if sock.connect(exact).await.is_err() {
-            break;
-        }
-        let remain_ms = total_budget
-            .saturating_sub(started.elapsed())
-            .as_millis() as u64;
-        let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
-        if let Some((kcp, stream)) =
-            punch_target_sustained(&sock, exact, round_ms, true).await
-        {
-            log::info!(
-                "[NAT穿透] 中继前打洞成功(exact {}), 耗时={:?}",
-                exact,
-                started.elapsed()
-            );
-            return Ok((kcp, stream, exact));
+        // 每个目标最多 5s；优先级高的目标（列表前面）在预算充足时会先试完
+        let per_target = Duration::from_millis(5_000).min(total_budget / 3);
+        let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
+        while std::time::Instant::now() < target_deadline {
+            let sock = socket_v4.clone();
+            if sock.connect(target).await.is_err() {
+                break;
+            }
+            let remain_ms = total_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+            if let Some((kcp, stream)) =
+                punch_target_sustained(&sock, target, round_ms, true).await
+            {
+                log::info!(
+                    "[NAT穿透] 中继前打洞成功({}), 耗时={:?}",
+                    target,
+                    started.elapsed()
+                );
+                // 记录本机映射为 last_success，下次重连优先被打
+                if let Some(mine) = my_primary {
+                    save_punch_last_success(&mine);
+                }
+                return Ok((kcp, stream, target));
+            }
         }
     }
     bail!("punch_direct_via_api: punch failed after {:?}", started.elapsed())
 }
 
-/// 被控端：上报自己的打洞地址（STUN 映射 + delta）。控制端据此拉取。
+/// 被控端：上报自己的全部候选打洞地址与网络环境。控制端据此拉取。
 /// 返回是否上报成功（api-server 未配置/探测失败均返回 false）。
 pub async fn punch_report_own_addrs() -> bool {
     if !crate::hbbs_http::punch_exchange::available() {
         return false;
     }
-    let socket = match create_punch_socket_v4().await {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("punch_report_own_addrs: bind failed: {:?}", e);
-            return false;
-        }
-    };
-    let (my_addr, my_delta) = match stun_probe_with_delta(&socket).await {
-        Ok(x) => x,
-        Err(e) => {
-            log::debug!("punch_report_own_addrs: STUN failed: {:?}", e);
-            return false;
-        }
-    };
+    let (addrs, meta) = collect_punch_addrs(None).await;
+    if addrs.is_empty() {
+        return false;
+    }
     let ntp_offset = ntp_offset_ms().await;
     let sync_at_ms = punch_sync_boundary(now_ms_local() + ntp_offset.unwrap_or(0));
-    let addrs = vec![(
-        my_addr.to_string(),
-        "udp".to_owned(),
-        my_delta,
-        sync_at_ms,
-    )];
-    match crate::hbbs_http::punch_exchange::report(&Config::get_id(), "", addrs).await {
+    let addrs: Vec<_> = addrs
+        .into_iter()
+        .map(|mut a| {
+            a.sync_at_ms = sync_at_ms;
+            a
+        })
+        .collect();
+    let count = addrs.len();
+    match crate::hbbs_http::punch_exchange::report(&Config::get_id(), "", &meta, addrs).await {
         Ok(_) => {
             log::debug!(
-                "punch_report_own_addrs: reported {} (delta {})",
-                my_addr,
-                my_delta
+                "punch_report_own_addrs: reported {} candidate addr(s), nat_type={}",
+                count,
+                meta.nat_type
             );
             true
         }

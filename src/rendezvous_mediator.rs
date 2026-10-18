@@ -953,9 +953,13 @@ async fn punch_inbound_once(
 ) {
     use std::time::Duration;
 
-    // 过滤不可用地址并去重
+    // 按对端建议优先级排序，并过滤不可用地址
+    let peer_addrs = crate::hbbs_http::punch_exchange::sort_addrs(addrs);
     let mut targets: Vec<std::net::SocketAddr> = Vec::new();
-    for a in &addrs {
+    for a in &peer_addrs {
+        if !a.is_udp() {
+            continue;
+        }
         let Ok(sa) = a.addr.parse::<std::net::SocketAddr>() else {
             continue;
         };
@@ -964,6 +968,17 @@ async fn punch_inbound_once(
         }
         if !targets.contains(&sa) {
             targets.push(sa);
+        }
+        // 对端（疑似）对称 NAT：用 delta 预测其映射邻居端口
+        if a.delta != 0 {
+            let p = sa.port() as i32 + a.delta;
+            if (1..=65535).contains(&p) {
+                let mut t = sa;
+                t.set_port(p as u16);
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
         }
     }
     if targets.is_empty() {
@@ -983,9 +998,14 @@ async fn punch_inbound_once(
             return;
         }
     };
+    // 记录本机主映射（成功后存为 last_success）
+    let my_primary = crate::common::stun_probe_with_delta(&socket)
+        .await
+        .ok()
+        .map(|(a, _)| a);
 
     // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）
-    let peer_sync_at = addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
+    let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
     let ntp_offset = crate::common::ntp_offset_ms().await;
     let own_sync = crate::common::punch_sync_boundary(
         std::time::SystemTime::now()
@@ -1010,44 +1030,53 @@ async fn punch_inbound_once(
         }
     }
 
-    // 持续打洞（主机侧 prefer_connect=false，accept 控制端发起的流）
+    // 多地址轮转打洞（主机侧 prefer_connect=false，accept 控制端发起的流）。
+    // 每个目标最多 5s，预算 45s 内按优先级轮换。
     let budget = Duration::from_secs(45);
     let started = std::time::Instant::now();
-    let exact_deadline = started + Duration::from_millis(crate::common::PUNCH_EXACT_MS);
-    let exact = targets[0];
-    while std::time::Instant::now() < exact_deadline {
-        if started.elapsed() >= budget {
+    let total_deadline = started + budget;
+    for target in targets {
+        if std::time::Instant::now() >= total_deadline {
             break;
         }
-        let sock = socket.clone();
-        if sock.connect(exact).await.is_err() {
-            break;
-        }
-        let remain_ms = budget.saturating_sub(started.elapsed()).as_millis() as u64;
-        let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
-        if let Some((_kcp, stream)) =
-            crate::common::punch_target_sustained(&sock, exact, round_ms, false).await
-        {
-            log::info!(
-                "pre-relay punch(host): KCP punch to {} succeeded after {:?}, handing over to connection",
-                exact,
-                started.elapsed()
-            );
-            let server = server.clone();
-            tokio::spawn(async move {
-                allow_err!(
-                    crate::server::create_tcp_connection(
-                        server,
-                        stream,
-                        exact,
-                        true,
-                        None,
-                        false,
-                    )
-                    .await
+        let per_target = Duration::from_millis(5_000);
+        let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
+        while std::time::Instant::now() < target_deadline {
+            let sock = socket.clone();
+            if sock.connect(target).await.is_err() {
+                break;
+            }
+            let remain_ms = total_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
+            if let Some((_kcp, stream)) =
+                crate::common::punch_target_sustained(&sock, target, round_ms, false).await
+            {
+                log::info!(
+                    "pre-relay punch(host): KCP punch to {} succeeded after {:?}, handing over to connection",
+                    target,
+                    started.elapsed()
                 );
-            });
-            return;
+                if let Some(mine) = my_primary {
+                    crate::common::save_punch_last_success(&mine);
+                }
+                let server = server.clone();
+                tokio::spawn(async move {
+                    allow_err!(
+                        crate::server::create_tcp_connection(
+                            server,
+                            stream,
+                            target,
+                            true,
+                            None,
+                            false,
+                        )
+                        .await
+                    );
+                });
+                return;
+            }
         }
     }
     log::info!(
@@ -1055,7 +1084,6 @@ async fn punch_inbound_once(
         peer_id,
         started.elapsed()
     );
-    let _ = my_id;
 }
 
 enum Sink<'a> {
