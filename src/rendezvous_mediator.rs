@@ -835,6 +835,17 @@ fn get_direct_port() -> i32 {
 async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
+    // ===== 中继前打洞（被控端）=====
+    // 周期上报自己的 STUN 地址到 api-server；轮询"谁想连我"，发现控制端请求后
+    // 立即主动打洞（主机侧 prefer_connect=false，即 accept 控制端发起的流），
+    // 成功则直接交给 ConnInner 接管——连接从一开始就是直连会话。
+    let mut last_report = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap_or_else(std::time::Instant::now);
+    let mut last_inbox = last_report;
+    // 已发起过打洞的请求方 -> 发起时间（避免重复 spawn；120s 后允许再次发起）
+    let mut handled: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
     loop {
         let disabled = !option2bool(
             OPTION_DIRECT_SERVER,
@@ -866,6 +877,38 @@ async fn direct_server(server: ServerPtr) {
                 }
             }
         }
+
+        // ---- 中继前打洞：上报 + inbox（不依赖 direct-server 监听是否可用）----
+        if crate::hbbs_http::punch_exchange::available() {
+            // 每 10s 上报一次自己的打洞地址
+            if last_report.elapsed() >= std::time::Duration::from_secs(10) {
+                last_report = std::time::Instant::now();
+                tokio::spawn(crate::common::punch_report_own_addrs());
+            }
+            // 每 2s 检查一次连接请求
+            if last_inbox.elapsed() >= std::time::Duration::from_secs(2) {
+                last_inbox = std::time::Instant::now();
+                let entries =
+                    crate::hbbs_http::punch_exchange::get_inbox(&Config::get_id()).await;
+                for e in entries {
+                    if let Some(t) = handled.get(&e.peer_id) {
+                        if t.elapsed() < std::time::Duration::from_secs(120) {
+                            continue;
+                        }
+                    }
+                    handled.insert(e.peer_id.clone(), std::time::Instant::now());
+                    log::info!(
+                        "pre-relay punch(host): connection request from {} via api-server, punching {} addr(s)",
+                        e.peer_id,
+                        e.addrs.len()
+                    );
+                    let server = server.clone();
+                    tokio::spawn(punch_inbound_once(server, e.peer_id, e.addrs));
+                }
+                handled.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(300));
+            }
+        }
+
         if let Some(l) = listener.as_mut() {
             if disabled || port != get_direct_port() {
                 log::info!("Exit direct access listen");
@@ -899,6 +942,120 @@ async fn direct_server(server: ServerPtr) {
             sleep(1.).await;
         }
     }
+}
+
+/// 被控端：对一台控制端的公网地址主动打洞（中继前打洞的一次性任务）。
+/// 成功则把直连流交给 `create_tcp_connection`（ConnInner 接管，等 Login）。
+async fn punch_inbound_once(
+    server: ServerPtr,
+    peer_id: String,
+    addrs: Vec<crate::hbbs_http::punch_exchange::PunchAddr>,
+) {
+    use std::time::Duration;
+
+    // 过滤不可用地址并去重
+    let mut targets: Vec<std::net::SocketAddr> = Vec::new();
+    for a in &addrs {
+        let Ok(sa) = a.addr.parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        if crate::common::is_unusable_punch_addr(&sa) {
+            continue;
+        }
+        if !targets.contains(&sa) {
+            targets.push(sa);
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    log::info!(
+        "pre-relay punch(host): punching {} for {} target(s)",
+        peer_id,
+        targets.len()
+    );
+
+    // 打洞 socket + STUN 上报（让控制端也能拉到我们的最新映射）
+    let socket = match crate::common::create_punch_socket_v4().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::info!("pre-relay punch(host): bind failed: {:?}", e);
+            return;
+        }
+    };
+
+    // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）
+    let peer_sync_at = addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
+    let ntp_offset = crate::common::ntp_offset_ms().await;
+    let own_sync = crate::common::punch_sync_boundary(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64 + ntp_offset.unwrap_or(0))
+            .unwrap_or(0),
+    );
+    let target_sync = own_sync.max(peer_sync_at);
+    if target_sync > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let wait = target_sync - now;
+        if wait > 0 && wait <= 30_000 {
+            log::info!(
+                "pre-relay punch(host): waiting {}ms until sync_at {}",
+                wait,
+                target_sync
+            );
+            hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+        }
+    }
+
+    // 持续打洞（主机侧 prefer_connect=false，accept 控制端发起的流）
+    let budget = Duration::from_secs(45);
+    let started = std::time::Instant::now();
+    let exact_deadline = started + Duration::from_millis(crate::common::PUNCH_EXACT_MS);
+    let exact = targets[0];
+    while std::time::Instant::now() < exact_deadline {
+        if started.elapsed() >= budget {
+            break;
+        }
+        let sock = socket.clone();
+        if sock.connect(exact).await.is_err() {
+            break;
+        }
+        let remain_ms = budget.saturating_sub(started.elapsed()).as_millis() as u64;
+        let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
+        if let Some((_kcp, stream)) =
+            crate::common::punch_target_sustained(&sock, exact, round_ms, false).await
+        {
+            log::info!(
+                "pre-relay punch(host): KCP punch to {} succeeded after {:?}, handing over to connection",
+                exact,
+                started.elapsed()
+            );
+            let server = server.clone();
+            tokio::spawn(async move {
+                allow_err!(
+                    crate::server::create_tcp_connection(
+                        server,
+                        stream,
+                        exact,
+                        true,
+                        None,
+                        false,
+                    )
+                    .await
+                );
+            });
+            return;
+        }
+    }
+    log::info!(
+        "pre-relay punch(host): punch to {} failed after {:?} (will rely on normal relay/accept path)",
+        peer_id,
+        started.elapsed()
+    );
+    let _ = my_id;
 }
 
 enum Sink<'a> {

@@ -570,6 +570,71 @@ impl Client {
             relay_server = best;
         }
 
+        // ===== 中继前打洞（优先直连）=====
+        // 通过 api-server 交换 STUN 地址后立即打洞：成功则本连接从一开始就是
+        // 直连会话（secure_connection + Login 都走直连），不再"先建中继、再
+        // 打洞、再换流"——双连接与换流竞态（切换后无法操作）由此消除。
+        // 打洞失败/超时则无缝回退到下面的中继流程，功能不受影响。
+        // 仅桌面控制/摄像头会话打洞；强制中继或未配置 api-server 时跳过。
+        let punchable_conn = conn_type == ConnType::DEFAULT_CONN
+            || conn_type == ConnType::VIEW_CAMERA;
+        // 同局域网（is_local）时不走 api-server 打洞：公网映射地址在局域网内
+        // 反而绕远，直接走下面的 LAN 并行测试更快。
+        if punchable_conn
+            && !is_local
+            && !interface.is_force_relay()
+            && crate::hbbs_http::punch_exchange::available()
+        {
+            log::info!("pre-relay punch: trying direct UDP punch via api-server before relay");
+            match crate::common::punch_direct_via_api(
+                &peer,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok((kcp, mut direct_stream, punched_peer_addr)) => {
+                    log::info!(
+                        "pre-relay punch succeeded: {}, doing key exchange on direct stream",
+                        punched_peer_addr
+                    );
+                    // 直连上与 LAN 直连相同的完整握手
+                    match Self::secure_connection(
+                        &peer,
+                        signed_id_pk.clone(),
+                        &key,
+                        &mut direct_stream,
+                    )
+                    .await
+                    {
+                        Ok(pk) => {
+                            log::info!("pre-relay punch: direct connection established (UDP)");
+                            return Ok((
+                                (direct_stream, true, pk, Some(kcp), "UDP"),
+                                (
+                                    my_nat_type,
+                                    rendezvous_server,
+                                    relay_server,
+                                    punched_peer_addr,
+                                    Vec::new(),
+                                    udp_nat_port,
+                                ),
+                                false,
+                            ));
+                        }
+                        Err(e) => {
+                            log::info!(
+                                "pre-relay punch: key exchange on direct stream failed: {:?}, fallback to relay",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::info!("pre-relay punch failed, fallback to relay: {:?}", e);
+                }
+            }
+        }
+
         // Relay 先稳定建立（request_relay + secure_connection），保证 B 端无异常。
         // 如果 relay 建连过程中被 cancel，会触发 relay server 通知 B 端断连，
         // 导致后续 LAN 直连成功的 Session 也被 B 端关闭（登录中断）。

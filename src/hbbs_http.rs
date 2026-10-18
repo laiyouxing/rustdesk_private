@@ -10,6 +10,8 @@ mod http_client;
 // 避免 APK 二进制包含进程枚举/上报等特征代码被误报为病毒。
 #[cfg(not(target_os = "android"))]
 pub mod process_monitor;
+// 打洞地址交换（走 api-server，中继前打洞用）
+pub mod punch_exchange;
 pub mod record_upload;
 pub mod sync;
 pub use http_client::{

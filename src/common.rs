@@ -3221,12 +3221,232 @@ pub fn is_unusable_punch_addr(addr: &std::net::SocketAddr) -> bool {
     false
 }
 
+fn now_ms_local() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 创建一个打洞 UDP socket：优先绑 UPnP 本地端口（保持 NAT 映射稳定），
+/// 失败则回退随机端口。IPv4 only（v6 打洞由旧 Phase3 路径负责）。
+pub async fn create_punch_socket_v4() -> ResultType<Arc<tokio::net::UdpSocket>> {
+    let upnp_local = crate::common::get_upnp_local_port();
+    let bind_addr = if upnp_local > 0 {
+        SocketAddr::from(([0u8; 4], upnp_local))
+    } else {
+        SocketAddr::from(([0u8; 4], 0u16))
+    };
+    match UdpSocket::bind(bind_addr).await {
+        Ok(s) => Ok(Arc::new(s)),
+        Err(_) if upnp_local > 0 => Ok(Arc::new(UdpSocket::bind("0.0.0.0:0").await?)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 探测本 socket 的公网映射地址并返回 (地址, 对称delta)。
+/// delta=0 表示锥形 NAT（端口恒定）；对称 NAT 时换一台 STUN 服务器复测，
+/// 端口差即 delta，对端用它预测我们的映射端口。
+async fn stun_probe_with_delta(
+    socket: &tokio::net::UdpSocket,
+) -> ResultType<(SocketAddr, i32)> {
+    let (addr, _) = stun_query_with_socket(socket).await?;
+    let servers = get_stun_servers_v4();
+    let alt = match servers.get(1).or_else(|| servers.first()) {
+        Some(s) => s,
+        None => return Ok((addr, 0)),
+    };
+    // socket 未 connect 时才能向任意服务器发包；探测期间短暂 connect
+    if let Some(alt_addr) = std::net::ToSocketAddrs::to_socket_addrs(alt)
+        .ok()
+        .and_then(|mut i| i.find(|a| a.is_ipv4()))
+    {
+        if socket.connect(alt_addr).await.is_ok() {
+            socket.send(&[]).await.ok();
+            if let Ok((alt_res, _)) = stun_query_single_server(socket, alt).await {
+                return Ok((addr, alt_res.port() as i32 - addr.port() as i32));
+            }
+        }
+    }
+    Ok((addr, 0))
+}
+
+/// 控制端：通过 api-server 交换地址，在**建立中继之前**完成 UDP 打洞。
+///
+/// 流程：创建打洞 socket → STUN 探测公网地址 → 上报（target=对端）→
+/// 拉取对端地址 → 双方约定时刻同时发起 → 持续打洞。
+/// 成功返回 (KcpStream, Stream, 对端地址)；失败返回 Err，调用方回退中继流程。
+///
+/// 这样连接建立时就直接是直连会话：不存在"先中继再换流"，也就没有双连接
+/// 与换流竞态（切换后无法操作的根因）。
+pub async fn punch_direct_via_api(
+    peer_id: &str,
+    total_budget: std::time::Duration,
+) -> ResultType<(crate::kcp_stream::KcpStream, Stream, std::net::SocketAddr)> {
+    use std::time::Duration;
+
+    // 1. 打洞 socket
+    let socket_v4 = create_punch_socket_v4().await?;
+    let socket = socket_v4.clone();
+
+    // 2. STUN 探测本 socket 的公网映射地址（对端要打的就是这个地址）
+    let (my_addr, my_delta) = match stun_probe_with_delta(&socket).await {
+        Ok(x) => x,
+        Err(e) => {
+            log::info!("punch_direct_via_api: STUN probe failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    log::info!(
+        "punch_direct_via_api: our mapped addr {} (delta {})",
+        my_addr,
+        my_delta
+    );
+
+    // 3. 上报自己的地址（target=对端，让被控端发现连接请求）
+    let ntp_offset = ntp_offset_ms().await;
+    let sync_at_ms = punch_sync_boundary(now_ms_local() + ntp_offset.unwrap_or(0));
+    let addrs = vec![(
+        my_addr.to_string(),
+        "udp".to_owned(),
+        my_delta,
+        sync_at_ms,
+    )];
+    if let Err(e) =
+        crate::hbbs_http::punch_exchange::report(&Config::get_id(), peer_id, addrs).await
+    {
+        log::info!("punch_direct_via_api: report failed: {:?}", e);
+        return Err(e);
+    }
+
+    // 4. 拉取对端地址（对端可能还没上报，轮询等待）。
+    // 等待上限 12s：被控端每 10s 上报一次，12s 足够覆盖一个周期；
+    // 超过则多半是对端没配 api-server（旧版），早退回退中继，不白等。
+    let addr_wait_cap = std::time::Duration::from_secs(12);
+    let deadline = std::time::Instant::now() + total_budget.min(addr_wait_cap + Duration::from_secs(3));
+    let mut peer_addrs: Vec<(SocketAddr, i64)> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        for a in crate::hbbs_http::punch_exchange::get_peer_addrs(peer_id).await {
+            let Ok(sa) = a.addr.parse::<SocketAddr>() else {
+                continue;
+            };
+            if is_unusable_punch_addr(&sa) {
+                continue;
+            }
+            if !peer_addrs.iter().any(|(x, _)| *x == sa) {
+                peer_addrs.push((sa, a.sync_at_ms));
+            }
+        }
+        if !peer_addrs.is_empty() {
+            break;
+        }
+        hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if peer_addrs.is_empty() {
+        bail!("punch_direct_via_api: no peer address from api-server");
+    }
+    log::info!(
+        "punch_direct_via_api: got {} peer address(es) via api-server",
+        peer_addrs.len()
+    );
+
+    // 5. 双方约定起始时刻取较大值，两端才会在同一绝对时刻同时发起
+    let peer_sync_at = peer_addrs.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let target_sync = sync_at_ms.max(peer_sync_at);
+    if target_sync > 0 {
+        let wait = target_sync - now_ms_local();
+        if wait > 0 && wait <= 30_000 {
+            log::info!(
+                "punch_direct_via_api: waiting {}ms until sync_at {} (own={}, peer={})",
+                wait,
+                target_sync,
+                sync_at_ms,
+                peer_sync_at
+            );
+            hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+        }
+    }
+
+    // 6. 持续打洞：阶段 A 在精确地址上长时间打（两端同时发包打开 NAT 映射）
+    let exact = peer_addrs[0].0;
+    let started = std::time::Instant::now();
+    let exact_deadline = started + Duration::from_millis(PUNCH_EXACT_MS);
+    while std::time::Instant::now() < exact_deadline {
+        if started.elapsed() >= total_budget {
+            break;
+        }
+        let sock = socket_v4.clone();
+        if sock.connect(exact).await.is_err() {
+            break;
+        }
+        let remain_ms = total_budget
+            .saturating_sub(started.elapsed())
+            .as_millis() as u64;
+        let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
+        if let Some((kcp, stream)) =
+            punch_target_sustained(&sock, exact, round_ms, true).await
+        {
+            log::info!(
+                "[NAT穿透] 中继前打洞成功(exact {}), 耗时={:?}",
+                exact,
+                started.elapsed()
+            );
+            return Ok((kcp, stream, exact));
+        }
+    }
+    bail!("punch_direct_via_api: punch failed after {:?}", started.elapsed())
+}
+
+/// 被控端：上报自己的打洞地址（STUN 映射 + delta）。控制端据此拉取。
+/// 返回是否上报成功（api-server 未配置/探测失败均返回 false）。
+pub async fn punch_report_own_addrs() -> bool {
+    if !crate::hbbs_http::punch_exchange::available() {
+        return false;
+    }
+    let socket = match create_punch_socket_v4().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("punch_report_own_addrs: bind failed: {:?}", e);
+            return false;
+        }
+    };
+    let (my_addr, my_delta) = match stun_probe_with_delta(&socket).await {
+        Ok(x) => x,
+        Err(e) => {
+            log::debug!("punch_report_own_addrs: STUN failed: {:?}", e);
+            return false;
+        }
+    };
+    let ntp_offset = ntp_offset_ms().await;
+    let sync_at_ms = punch_sync_boundary(now_ms_local() + ntp_offset.unwrap_or(0));
+    let addrs = vec![(
+        my_addr.to_string(),
+        "udp".to_owned(),
+        my_delta,
+        sync_at_ms,
+    )];
+    match crate::hbbs_http::punch_exchange::report(&Config::get_id(), "", addrs).await {
+        Ok(_) => {
+            log::debug!(
+                "punch_report_own_addrs: reported {} (delta {})",
+                my_addr,
+                my_delta
+            );
+            true
+        }
+        Err(e) => {
+            log::debug!("punch_report_own_addrs: report failed: {:?}", e);
+            false
+        }
+    }
+}
+
 /// 在单个 target 上"持续打洞"：整个时长内并行维持空包（防止 NAT 映射老化），
 /// 同时 KCP 在该时长内反复握手。返回 Some 表示打洞成功。
 ///
 /// 这是修复成功率≈0 的关键：改成"长时间持续打同一个精确地址"后，即使两端
 /// 起始时刻相差数十秒，窗口仍有大量重叠，双方能真正同时向对方发包。
-async fn punch_target_sustained(
+pub async fn punch_target_sustained(
     socket: &Arc<UdpSocket>,
     // socket 调用前已 connect 到目标地址，此处无需再用 target
     _target: std::net::SocketAddr,
