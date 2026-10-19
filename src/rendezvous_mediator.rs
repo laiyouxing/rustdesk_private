@@ -1235,6 +1235,10 @@ async fn udp_nat_listen(
             res,
         )
         .await?;
+        // KcpStream 必须活到会话结束：它的 Drop 会关掉 stop_sender，kcp_io
+        // 泵随之退出，这条 LAN 直连会立刻不通（表现为连上就卡住）。
+        // create_tcp_connection 内部 await 到会话结束，所以一起留着即可。
+        let kcp_keepalive = stream.0;
         crate::server::create_tcp_connection(
             server,
             stream.1,
@@ -1244,6 +1248,7 @@ async fn udp_nat_listen(
             false,
         )
         .await?;
+        drop(kcp_keepalive);
         Ok(())
     };
     func.await.map_err(|e: anyhow::Error| {

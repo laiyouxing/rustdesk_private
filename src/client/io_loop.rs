@@ -92,6 +92,11 @@ pub struct Remote<T: InvokeUiSession> {
     // relay_upgrade_task stores the KcpStream here; without this the stream
     // would be dropped (and its kcp_io pump stopped) when the task exits.
     phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
+    // Phase3 临时运行时的"保活"信号：打洞成功后该线程的 tokio 运行时必须
+    // 继续存活（kcp_io 与 KCP 更新循环都 spawn 在它上面），直到本会话结束，
+    // 否则 rt 一 drop，这些任务被立即取消，表现为"换流后直连秒断、无法操作"。
+    // 打洞失败时不保活（线程立即退出，不泄漏）。
+    phase3_rt_stop: Option<hbb_common::tokio::sync::oneshot::Sender<()>>,
     // Phase3 换流确认：换到直连流后置位，用于"新流是否真的双向可用"看门狗。
     // 直连 KCP 配对错误时两端会各用各的流（KCP 层面不通），表现为换流后
     // 无法操作远程主机。收到对端在直连上的任何数据即清除；超时未确认则
@@ -155,6 +160,7 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_tcp_addrs: None,
             phase3_cancel: None,
             phase3_kcp: None,
+            phase3_rt_stop: None,
             punch_verify_deadline: None,
             last_input_time: Instant::now(),
             inactivity_warning_remaining: None,
@@ -247,6 +253,15 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
+                // 预打洞直连（中继前 punch_direct_via_api 成功）同样需要"连通性
+                // 确认"：这条流从第一秒起就是直连，没有换流动作，若 KCP 实际不通
+                // （配对错误/单向 NAT/对称 NAT 假成功），用户侧就是画面卡住、
+                // 无任何提示。这里复用 Phase3 的看门狗：5s 内收到对端任何数据即
+                // 清除，超时则主动断开让自动重连重建中继。
+                if direct && kcp.is_some() {
+                    self.punch_verify_deadline = Some(Instant::now() + Duration::from_secs(5));
+                    log::info!("pre-relay direct connection: armed 5s liveness watchdog");
+                }
                 // Phase3-specific channels (punch_stream/punch_notify already initialized before Client::start)
                 let punch_done = Arc::new(Notify::new());
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -319,6 +334,15 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                         let cancel = hbb_common::tokio_util::sync::CancellationToken::new();
                         self.phase3_cancel = Some(cancel.clone());
+                        // 打洞成功时：临时运行时必须继续存活。
+                        // kcp_io 泵和 KcpEndpoint::run() 内部的更新循环都是
+                        // tokio::spawn 到这个运行时上的；relay_upgrade_task 一旦
+                        // return，block_on 结束、rt 被 drop，这些任务会**立即被
+                        // 取消**——换流后新流随即 "stream closed"，表现为打洞
+                        // 成功却瞬间无法操作远程主机。因此成功后在这里阻塞等待
+                        // 会话结束信号，io_loop 退出时再发送（见本函数末尾）。
+                        let (rt_stop_tx, rt_stop_rx) = hbb_common::tokio::sync::oneshot::channel::<()>();
+                        self.phase3_rt_stop = Some(rt_stop_tx);
                         std::thread::spawn(move || {
                             let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
@@ -331,6 +355,11 @@ impl<T: InvokeUiSession> Remote<T> {
                                 ).await;
                                 succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                                 d.notify_one();
+                                if ok {
+                                    // 打洞成功：保住运行时，直到会话结束/重连。
+                                    // 发送端被 drop（io_loop 退出）同样会唤醒。
+                                    let _ = rt_stop_rx.await;
+                                }
                             });
                         });
                     } // end else
@@ -608,6 +637,12 @@ impl<T: InvokeUiSession> Remote<T> {
                     // KCP does not send messages immediately, so wait to ensure the last message is sent.
                     // 1ms works in my test, but 30ms is more reliable.
                     tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                // 最后才释放 Phase3 临时运行时（打洞成功时它一直保活到现在）。
+                // 必须放在 send_close_reason 之后——后者要靠该运行时上的
+                // kcp_io 把报文发出去。发信号让线程退出，运行时不泄漏。
+                if let Some(t) = self.phase3_rt_stop.take() {
+                    let _ = t.send(());
                 }
             }
             Err(err) => {
