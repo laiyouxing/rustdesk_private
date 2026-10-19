@@ -3468,11 +3468,13 @@ pub async fn punch_direct_via_api(
     }
 
     // 4. 拉取对端地址与环境（对端可能还没上报，轮询等待）。
-    // 等待上限 12s：被控端每 10s 上报一次，12s 足够覆盖一个周期；
-    // 超过则多半是对端没配 api-server（旧版），早退回退中继，不白等。
-    let addr_wait_cap = Duration::from_secs(12);
-    let deadline =
-        std::time::Instant::now() + total_budget.min(addr_wait_cap + Duration::from_secs(3));
+    // 等待上限 10s：正好覆盖被控端一个上报周期；超过则多半是对端没配
+    // api-server（旧版），早退回退中继，不白等——等太久会把打洞窗口挤没。
+    let addr_wait_cap = Duration::from_secs(10);
+    // 总死线从函数入口算起：后面的 sync 等待与打洞都受它约束，
+    // 保证任何情况下打洞窗口都不为零。
+    let total_deadline = std::time::Instant::now() + total_budget;
+    let deadline = (std::time::Instant::now() + addr_wait_cap).min(total_deadline);
     let mut peer_info = crate::hbbs_http::punch_exchange::PeerPunchInfo::default();
     while std::time::Instant::now() < deadline {
         peer_info = crate::hbbs_http::punch_exchange::get_peer_info(peer_id).await;
@@ -3493,20 +3495,33 @@ pub async fn punch_direct_via_api(
         peer_symmetric
     );
 
-    // 5. 双方约定起始时刻取较大值，两端才会在同一绝对时刻同时发起
+    // 5. 双方约定起始时刻取较大值，两端才会在同一绝对时刻同时发起。
+    // 关键约束：等待必须为打洞留出至少 PUNCH_MIN_WINDOW 的窗口——
+    // 否则"等地址 10s + sync 对齐 10s"会把 30s 预算吃光，打洞只剩 0-3s，
+    // 多地址轮转形同虚设。因此 sync 等待最多等到"死线前 10s"。
+    const PUNCH_MIN_WINDOW: Duration = Duration::from_secs(10);
     let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
     let target_sync = sync_at_ms.max(peer_sync_at);
     if target_sync > 0 {
         let wait = target_sync - now_ms_local();
         if wait > 0 && wait <= 30_000 {
-            log::info!(
-                "punch_direct_via_api: waiting {}ms until sync_at {} (own={}, peer={})",
-                wait,
-                target_sync,
-                sync_at_ms,
-                peer_sync_at
-            );
-            hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+            let now = std::time::Instant::now();
+            let wanted = now + Duration::from_millis(wait as u64);
+            // 最晚等到"死线前保留最小打洞窗口"的时刻
+            let latest = total_deadline.saturating_sub(PUNCH_MIN_WINDOW);
+            let until = wanted.min(latest);
+            let actual_ms = until.saturating_duration_since(now).as_millis() as u64;
+            if actual_ms > 0 {
+                log::info!(
+                    "punch_direct_via_api: waiting {}ms until sync_at {} (own={}, peer={}, clipped to keep {}s punch window)",
+                    actual_ms,
+                    target_sync,
+                    sync_at_ms,
+                    peer_sync_at,
+                    PUNCH_MIN_WINDOW.as_secs()
+                );
+                hbb_common::tokio::time::sleep(Duration::from_millis(actual_ms)).await;
+            }
         }
     }
 
@@ -3564,15 +3579,20 @@ pub async fn punch_direct_via_api(
         targets
     );
 
-    // 7. 多地址轮转打洞：每个地址分配一段时间（优先级高的先试），预算内轮换
+    // 7. 多地址轮转打洞：预算内轮换。时间向高优先级倾斜——列表前两个
+    //    （last_success / stun_primary，命中率最高）各 8s，其后每个 3s
+    //    （覆盖 stun_alt 与对称 NAT 预测地址）。total_deadline 统一截断。
     let started = std::time::Instant::now();
-    let total_deadline = started + total_budget;
-    for target in targets {
+    for (idx, target) in targets.iter().enumerate() {
+        let target = *target;
         if std::time::Instant::now() >= total_deadline {
             break;
         }
-        // 每个目标最多 5s；优先级高的目标（列表前面）在预算充足时会先试完
-        let per_target = Duration::from_millis(5_000).min(total_budget / 3);
+        let per_target = if idx < 2 {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(3)
+        };
         let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
         while std::time::Instant::now() < target_deadline {
             let sock = socket_v4.clone();

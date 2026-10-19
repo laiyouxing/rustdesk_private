@@ -1004,7 +1004,13 @@ async fn punch_inbound_once(
         .ok()
         .map(|(a, _)| a);
 
-    // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）
+    // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）。
+    // 约束：sync 等待不得吃掉打洞窗口——最晚等到"预算死线前 10s"，
+    // 否则被控端可能等到控制端早已放弃（控制端总预算 30s）。
+    let budget = Duration::from_secs(45);
+    let started = std::time::Instant::now();
+    let total_deadline = started + budget;
+    const HOST_PUNCH_MIN_WINDOW: Duration = Duration::from_secs(10);
     let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
     let ntp_offset = crate::common::ntp_offset_ms().await;
     let own_sync = crate::common::punch_sync_boundary(
@@ -1015,26 +1021,31 @@ async fn punch_inbound_once(
     );
     let target_sync = own_sync.max(peer_sync_at);
     if target_sync > 0 {
-        let now = std::time::SystemTime::now()
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let wait = target_sync - now;
+        let wait = target_sync - now_ms;
         if wait > 0 && wait <= 30_000 {
-            log::info!(
-                "pre-relay punch(host): waiting {}ms until sync_at {}",
-                wait,
-                target_sync
-            );
-            hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+            let now = std::time::Instant::now();
+            let wanted = now + Duration::from_millis(wait as u64);
+            let latest = total_deadline.saturating_sub(HOST_PUNCH_MIN_WINDOW);
+            let until = wanted.min(latest);
+            let actual_ms = until.saturating_duration_since(now).as_millis() as u64;
+            if actual_ms > 0 {
+                log::info!(
+                    "pre-relay punch(host): waiting {}ms until sync_at {} (clipped to keep {}s punch window)",
+                    actual_ms,
+                    target_sync,
+                    HOST_PUNCH_MIN_WINDOW.as_secs()
+                );
+                hbb_common::tokio::time::sleep(Duration::from_millis(actual_ms)).await;
+            }
         }
     }
 
     // 多地址轮转打洞（主机侧 prefer_connect=false，accept 控制端发起的流）。
     // 每个目标最多 5s，预算 45s 内按优先级轮换。
-    let budget = Duration::from_secs(45);
-    let started = std::time::Instant::now();
-    let total_deadline = started + budget;
     for target in targets {
         if std::time::Instant::now() >= total_deadline {
             break;
