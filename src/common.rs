@@ -4111,6 +4111,9 @@ pub async fn relay_upgrade_task(
 
     // TCP simultaneous open 目标列表：每轮从 phase3_tcp_rx drain 累积，限量保新
     let mut tcp_targets: Vec<std::net::SocketAddr> = Vec::new();
+    // 始终没收到对端地址的计时：超过 45s 就早失败，别空转满 180s
+    // （否则 UI 的穿透状态会一直显示"正在穿透"）
+    let mut no_peer_addr_since: Option<std::time::Instant> = None;
     for _round in 0..6 {
         if cancel.is_cancelled() {
             log::info!("[NAT穿透] Phase3 已取消（重连/断连）, 退出打洞");
@@ -4159,7 +4162,15 @@ pub async fn relay_upgrade_task(
         let exact = match peer_exact {
             Some(a) => a,
             None => {
-                // 还没收到对端地址，短暂等待后重试
+                // 还没收到对端地址（对端 STUN 任务没跑/被会话门控挡下/旧版对端），
+                // 短暂等待后重试；但超过 45s 仍拿不到就早失败，让 UI 及时得到终态
+                let since = *no_peer_addr_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(45) {
+                    log::info!(
+                        "[NAT穿透] 45s 未收到对端地址, 放弃本轮 (relay 已可用, 不影响使用)"
+                    );
+                    return false;
+                }
                 hbb_common::tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }

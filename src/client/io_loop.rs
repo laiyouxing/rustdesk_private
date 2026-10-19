@@ -275,6 +275,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     // Only app restart or a successful Phase3 will reset this.
                     if crate::common::should_skip_phase3() {
                         log::info!("Phase3: skipped (previously failed in this session)");
+                        // 跳过时也要给终态，否则 UI 的穿透状态会停留在上次的
+                        // "正在穿透"（trying）不消失
+                        self.handler.set_punch_status("failed", "skipped");
                     } else {
                         let n = punch_notify.clone();
                         let d = punch_done.clone();

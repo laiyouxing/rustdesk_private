@@ -586,6 +586,9 @@ impl Client {
             && crate::hbbs_http::punch_exchange::available()
         {
             log::info!("pre-relay punch: trying direct UDP punch via api-server before relay");
+            // 状态上报：让 UI 知道正在尝试中继前直连（此前新流程完全不发状态，
+            // 失败回退中继后用户只看到 Phase3 的"穿透中"，无法区分是哪一轮）
+            interface.set_punch_status("trying", "pre-relay");
             match crate::common::punch_direct_via_api(
                 &peer,
                 std::time::Duration::from_secs(30),
@@ -608,6 +611,9 @@ impl Client {
                     {
                         Ok(pk) => {
                             log::info!("pre-relay punch: direct connection established (UDP)");
+                            // set_connection_type(direct=true) 会让 flutter 把
+                            // punch_status 置为 succeeded，这里再显式确认一次
+                            interface.set_punch_status("succeeded", "UDP");
                             return Ok((
                                 (direct_stream, true, pk, Some(kcp), "UDP"),
                                 (
@@ -626,11 +632,14 @@ impl Client {
                                 "pre-relay punch: key exchange on direct stream failed: {:?}, fallback to relay",
                                 e
                             );
+                            interface.set_punch_status("failed", "pre-relay key exchange");
                         }
                     }
                 }
                 Err(e) => {
                     log::info!("pre-relay punch failed, fallback to relay: {:?}", e);
+                    // 明确告知"中继前直连没成功"，随后 Phase3 会接手并置 trying
+                    interface.set_punch_status("failed", "pre-relay");
                 }
             }
         }
