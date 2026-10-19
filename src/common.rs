@@ -3293,6 +3293,9 @@ const PUNCH_MAPPED_TTL: std::time::Duration = std::time::Duration::from_secs(60)
 // 附带上报节流：30s。连接时带 target 的上报不走此节流（必须让对端发现请求）。
 // 心跳（sync.rs）与本地 IP 变化都会触发附带上报，30s 足以去重。
 const PUNCH_REPORT_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
+// 映射看门狗探测间隔：与缓存 TTL 对齐（缓存永热，连接时零探测）。
+// 只做 UDP STUN（几个小包），不产生 HTTP；映射变化才上报，最长 60s 发现。
+const PUNCH_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 获取进程级共享打洞 socket（若已创建）。
 pub fn shared_punch_socket() -> Option<Arc<tokio::net::UdpSocket>> {
@@ -3360,7 +3363,7 @@ pub async fn ensure_punch_mapped() -> Option<(SocketAddr, i32)> {
     }
 }
 
-/// 上报节流：3s 内已上报过返回 true（调用方跳过本次上报）。
+/// 上报节流：30s 内已上报过返回 true（调用方跳过本次上报）。
 pub fn punch_report_throttled() -> bool {
     let now = std::time::Instant::now();
     if let Ok(mut g) = LAST_PUNCH_REPORT_AT.lock() {
@@ -3372,6 +3375,103 @@ pub fn punch_report_throttled() -> bool {
         *g = Some(now);
     }
     false
+}
+
+/// 记录一次上报（变化上报绕过节流时也调用，避免与附带上报叠加）。
+fn mark_punch_reported() {
+    if let Ok(mut g) = LAST_PUNCH_REPORT_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// 映射看门狗：定时轻量探测共享 socket 的公网映射，**仅在变化时** HTTP 上报。
+///
+/// 为什么需要它（纯事件触发的盲区）：路由器 NAT 表老化、CGNAPT 重新分配、
+/// WAN 口重拨等情况下，**公网映射会变而本地网卡 IP 不变**——direct_server
+/// 里的 IP 变化检测看不到，心跳挂点又要等周期 + 缓存 TTL，最长 90-120s 才
+/// 恢复正确上报。这期间被控端 inbox 打洞用的是旧映射，控制端打不进来。
+///
+/// 成本设计（"最优自动更新时间"的关键）：探测 = 每台 STUN 服务器 1 个 20 字节
+/// UDP 请求，可忽略；上报 = HTTP+TLS，贵。因此：
+///   - 每 `PUNCH_WATCHDOG_INTERVAL` 探测一次（与缓存 TTL 对齐，缓存永热，
+///     连接时永远零探测）；
+///   - 映射未变 → **零 HTTP 请求**，只刷新缓存时间戳；
+///   - 映射变化 → 立即上报（绕过节流，对端必须尽快知道）。
+pub async fn punch_mapped_watchdog() {
+    // 启动后先让一次启动上报走完，避免与它抢着探测
+    hbb_common::tokio::time::sleep(Duration::from_secs(5)).await;
+    loop {
+        hbb_common::tokio::time::sleep(PUNCH_WATCHDOG_INTERVAL).await;
+        if !crate::hbbs_http::punch_exchange::available() {
+            continue;
+        }
+        let sock = match ensure_shared_punch_socket().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // 打洞进行中（已 connect）时不能发包探测；共享 socket 在新流程下
+        // 不 connect，正常情况下不会触发
+        if sock.peer_addr().is_ok() {
+            continue;
+        }
+        let Ok((addr, delta)) = stun_probe_with_delta(&sock).await else {
+            continue;
+        };
+        let changed = match cached_punch_mapped() {
+            Some((a, d)) => a != addr || d != delta,
+            None => true,
+        };
+        // 无论是否变化都刷新缓存时间戳（保证连接时缓存是热的）
+        if let Ok(mut g) = SHARED_PUNCH_MAPPED.lock() {
+            *g = Some((addr, delta, std::time::Instant::now()));
+        }
+        if !changed {
+            continue; // 未变化：零 HTTP 请求
+        }
+        log::info!(
+            "punch watchdog: mapped addr changed to {} (delta {}), reporting",
+            addr,
+            delta
+        );
+        report_own_addrs_inner().await;
+    }
+}
+
+/// 实际执行一次上报（绕过节流；映射变化时必须让对端尽快知道）。
+async fn report_own_addrs_inner() -> bool {
+    let known_mapped = ensure_punch_mapped().await;
+    let Some((primary, _)) = known_mapped else {
+        return false;
+    };
+    let (addrs, meta) = collect_punch_addrs(None, Some((primary, 0))).await;
+    if addrs.is_empty() {
+        return false;
+    }
+    let ntp_offset = ntp_offset_ms().await;
+    let sync_at_ms = punch_sync_boundary(now_ms_local() + ntp_offset.unwrap_or(0));
+    let addrs: Vec<_> = addrs
+        .into_iter()
+        .map(|mut a| {
+            a.sync_at_ms = sync_at_ms;
+            a
+        })
+        .collect();
+    let count = addrs.len();
+    mark_punch_reported();
+    match crate::hbbs_http::punch_exchange::report(&Config::get_id(), "", &meta, addrs).await {
+        Ok(_) => {
+            log::debug!(
+                "punch report: reported {} candidate addr(s), nat_type={}",
+                count,
+                meta.nat_type
+            );
+            true
+        }
+        Err(e) => {
+            log::debug!("punch report failed: {:?}", e);
+            false
+        }
+    }
 }
 
 /// direct-access-port（被控端 TCP 直连监听端口；LAN 与 TCP fallback 都用它）
@@ -3747,43 +3847,12 @@ pub async fn punch_report_own_addrs() -> bool {
     if !crate::hbbs_http::punch_exchange::available() {
         return false;
     }
-    // 3s 内刚上报过则跳过（连接重试会连续调用，避免反复打 API）
+    // 30s 内刚上报过则跳过（启动/IP 变化/心跳附带都会调用，避免反复打 API）。
+    // 注意：映射看门狗检测到变化时走 report_own_addrs_inner，绕开此节流。
     if punch_report_throttled() {
         return true;
     }
-    // 共享 socket + 映射缓存：启动后首次探测，之后 60s 内零 STUN 直接上报
-    let known_mapped = ensure_punch_mapped().await;
-    let Some((primary, _)) = known_mapped else {
-        return false;
-    };
-    let (addrs, meta) = collect_punch_addrs(None, Some((primary, 0))).await;
-    if addrs.is_empty() {
-        return false;
-    }
-    let ntp_offset = ntp_offset_ms().await;
-    let sync_at_ms = punch_sync_boundary(now_ms_local() + ntp_offset.unwrap_or(0));
-    let addrs: Vec<_> = addrs
-        .into_iter()
-        .map(|mut a| {
-            a.sync_at_ms = sync_at_ms;
-            a
-        })
-        .collect();
-    let count = addrs.len();
-    match crate::hbbs_http::punch_exchange::report(&Config::get_id(), "", &meta, addrs).await {
-        Ok(_) => {
-            log::debug!(
-                "punch_report_own_addrs: reported {} candidate addr(s), nat_type={}",
-                count,
-                meta.nat_type
-            );
-            true
-        }
-        Err(e) => {
-            log::debug!("punch_report_own_addrs: report failed: {:?}", e);
-            false
-        }
-    }
+    report_own_addrs_inner().await
 }
 
 /// 在单个 target 上"持续打洞"：整个时长内并行维持空包（防止 NAT 映射老化），

@@ -853,6 +853,9 @@ async fn direct_server(server: ServerPtr) {
     let mut last_inbox = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
+    // 映射看门狗：定时轻量探测映射、仅变化时上报（覆盖路由器 NAT 老化等
+    // 本地 IP 不变的静默变化）。整个进程一个实例，随 mediator 生命周期。
+    tokio::spawn(crate::common::punch_mapped_watchdog());
     // 本地 IP 集合（变化检测基线；纯本地枚举，无网络开销）
     let mut last_local_ips = local_ip_set();
     // 已发起过打洞的请求方 -> 发起时间（避免重复 spawn；120s 后允许再次发起）
