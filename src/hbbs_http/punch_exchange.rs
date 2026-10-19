@@ -280,6 +280,10 @@ pub struct InboxEntry {
     pub peer_id: String,
     pub addrs: Vec<PunchAddr>,
     pub meta: PunchMeta,
+    /// 该请求上次被刷新的时间（Unix 秒；旧版 api-server 不返回，为 0）。
+    /// 用来区分"同一请求的重复轮询"与"控制端重新发起的新请求"——sync_at 对齐
+    /// 到 8s 边界，同一边界内的两次连接尝试指纹会相同。
+    pub updated_at: i64,
 }
 
 /// 拉取"想连我的设备"列表（被控端用：peer_id = 自己）
@@ -326,6 +330,9 @@ pub async fn get_inbox(peer_id: &str) -> Vec<InboxEntry> {
                     upnp: meta.upnp,
                     via_proxy: meta.via_proxy,
                 },
+                // 旧版 api-server 不返回该字段时为 0，此时客户端退化为用
+                // 地址集合 + sync_at 做请求指纹。
+                updated_at: item.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0),
             });
         }
     }

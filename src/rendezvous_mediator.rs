@@ -844,8 +844,8 @@ async fn direct_server(server: ServerPtr) {
     //   1) 启动后上报一次——保证"打开软件即就绪"；
     //   2) 本地 IP 集合变化（切换 WiFi/有线/VPN）时上报——循环内纯本地检测，
     //      零带宽，同时作废映射缓存强制重探测；
-    //   3) 每次 api-server 心跳成功后附带上报（sync.rs 挂点，节流 30s），
-    //      掉线重连后网络恢复时心跳成功即自动覆盖；
+    //   3) 每次 api-server 心跳成功后附带上报（sync.rs 挂点，节流见
+    //      PUNCH_REPORT_THROTTLE），掉线重连后网络恢复时心跳成功即自动覆盖；
     //   4) 控制端连接时必带 target 上报（punch_direct_via_api，不节流）。
     // inbox（"谁想连我"）每 3s 拉一次：这是被控端发现连接请求的唯一途径，
     // 3s 内可发现；控制端等对端地址上限 10s，足以覆盖。
@@ -858,8 +858,12 @@ async fn direct_server(server: ServerPtr) {
     tokio::spawn(crate::common::punch_mapped_watchdog());
     // 本地 IP 集合（变化检测基线；纯本地枚举，无网络开销）
     let mut last_local_ips = local_ip_set();
-    // 已发起过打洞的请求方 -> 发起时间（避免重复 spawn；120s 后允许再次发起）
-    let mut handled: std::collections::HashMap<String, std::time::Instant> =
+    // 已发起过打洞的请求 -> (请求指纹, 发起时间)。
+    // 去重必须按"请求"而不是"请求方"：inbox 的 TTL 只有 60s，控制端断开重连
+    // 时会生成新请求，若按 peer_id 屏蔽 120s，重连在 60~120s 内会被静默忽略，
+    // 控制端白等到超时才回退中继。指纹 = 请求刷新时间(updated_at) + 地址集合
+    // + 最大 sync_at，详见 inbox_request_key；同一请求被轮询到多次才去重。
+    let mut handled: std::collections::HashMap<String, (String, std::time::Instant)> =
         std::collections::HashMap::new();
     loop {
         let disabled = !option2bool(
@@ -900,7 +904,7 @@ async fn direct_server(server: ServerPtr) {
                 reported_startup = true;
                 tokio::spawn(crate::common::punch_report_own_addrs());
             }
-            // 2) 本地 IP 集合变化（网络切换）→ 上报 + 作废映射缓存
+            // 2) 本地 IP 集合变化（网络切换）→ 立即上报（绕过节流）
             let cur_ips = local_ip_set();
             if cur_ips != last_local_ips {
                 log::info!(
@@ -910,7 +914,10 @@ async fn direct_server(server: ServerPtr) {
                 );
                 last_local_ips = cur_ips;
                 crate::common::invalidate_punch_mapped_cache();
-                tokio::spawn(crate::common::punch_report_own_addrs());
+                // 走 report_own_addrs_inner 绕开 20s 节流：缓存刚被作废，
+                // 若刚好在节流窗口内，punch_report_own_addrs 会直接 return，
+                // 新地址要再等最多 20s 才上报，期间对端拿旧映射打不进来。
+                tokio::spawn(crate::common::report_own_addrs_inner());
             }
             // 3) inbox：每 3s 检查一次连接请求
             if last_inbox.elapsed() >= std::time::Duration::from_secs(3) {
@@ -918,12 +925,17 @@ async fn direct_server(server: ServerPtr) {
                 let entries =
                     crate::hbbs_http::punch_exchange::get_inbox(&Config::get_id()).await;
                 for e in entries {
-                    if let Some(t) = handled.get(&e.peer_id) {
-                        if t.elapsed() < std::time::Duration::from_secs(120) {
+                    // 请求指纹：地址集合 + 最大 sync_at。同一请求的重复轮询去重，
+                    // 新请求（重连/换网络）指纹不同，立即重新打洞。
+                    let req_key = inbox_request_key(&e);
+                    if let Some((last_key, t)) = handled.get(&e.peer_id) {
+                        if *last_key == req_key
+                            && t.elapsed() < std::time::Duration::from_secs(120)
+                        {
                             continue;
                         }
                     }
-                    handled.insert(e.peer_id.clone(), std::time::Instant::now());
+                    handled.insert(e.peer_id.clone(), (req_key, std::time::Instant::now()));
                     log::info!(
                         "pre-relay punch(host): connection request from {} via api-server, punching {} addr(s)",
                         e.peer_id,
@@ -932,7 +944,7 @@ async fn direct_server(server: ServerPtr) {
                     let server = server.clone();
                     tokio::spawn(punch_inbound_once(server, e.peer_id, e.addrs));
                 }
-                handled.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(300));
+                handled.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
             }
         }
 
@@ -982,6 +994,18 @@ fn local_ip_set() -> Vec<String> {
     v
 }
 
+/// inbox 请求指纹：同一控制端重新连接会生成新请求，靠它区分"重复轮询同
+/// 一个请求"和"这是一次新的连接请求"。
+/// 组成：api-server 的请求刷新时间（updated_at，秒级，最可靠）+ 地址集合 +
+/// 最大 sync_at。updated_at 在旧版 api-server 上为 0，此时退化为后两项——
+/// 注意 sync_at 对齐到 8s 边界，同一边界内的两次连接指纹会相同（见下）。
+fn inbox_request_key(e: &crate::hbbs_http::punch_exchange::InboxEntry) -> String {
+    let mut addrs: Vec<&str> = e.addrs.iter().map(|a| a.addr.as_str()).collect();
+    addrs.sort();
+    let sync_at = e.addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
+    format!("{}|{}|{}", e.updated_at, addrs.join(","), sync_at)
+}
+
 /// 被控端：对一台控制端的公网地址主动打洞（中继前打洞的一次性任务）。
 /// 成功则把直连流交给 `create_tcp_connection`（ConnInner 接管，等 Login）。
 async fn punch_inbound_once(
@@ -989,7 +1013,11 @@ async fn punch_inbound_once(
     peer_id: String,
     addrs: Vec<crate::hbbs_http::punch_exchange::PunchAddr>,
 ) {
-    use std::time::Duration;
+    // 预算从函数入口算：下面的 STUN 探测（ensure_punch_mapped）可能花几秒，
+    // 也要计入，否则打洞窗口比预期短、或整体耗时超出预算。
+    let budget = Duration::from_secs(45);
+    let started = std::time::Instant::now();
+    let total_deadline = started + budget;
 
     // 按对端建议优先级排序，并过滤不可用地址
     let peer_addrs = crate::hbbs_http::punch_exchange::sort_addrs(addrs);
@@ -1037,17 +1065,19 @@ async fn punch_inbound_once(
             return;
         }
     };
-    // 记录本机主映射（成功后存为 last_success）；缓存热则零探测
+    // 记录本机主映射（成功后存为 last_success）；缓存热则零探测。
+    // 注意顺序：先探测、后申领共享 socket 使用权——否则 ensure_punch_mapped
+    // 会因"socket 忙"而跳过探测（只拿到可能已过期的旧缓存）。
     let my_primary = crate::common::ensure_punch_mapped()
         .await
         .map(|(a, _)| a);
+    // 共享 socket 使用凭证：持有到函数返回（含整个打洞过程），期间看门狗/
+    // 其它 STUN 探测会跳过，不会 recv_from 抢走我们的报文。
+    let _shared_use = crate::common::shared_socket_acquire();
 
     // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）。
     // 约束：sync 等待不得吃掉打洞窗口——最晚等到"预算死线前 10s"，
     // 否则被控端可能等到控制端早已放弃（控制端总预算 30s）。
-    let budget = Duration::from_secs(45);
-    let started = std::time::Instant::now();
-    let total_deadline = started + budget;
     const HOST_PUNCH_MIN_WINDOW: Duration = Duration::from_secs(10);
     let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
     let ntp_offset = crate::common::ntp_offset_ms().await;
@@ -1067,7 +1097,11 @@ async fn punch_inbound_once(
         if wait > 0 && wait <= 30_000 {
             let now = std::time::Instant::now();
             let wanted = now + Duration::from_millis(wait as u64);
-            let latest = total_deadline.saturating_sub(HOST_PUNCH_MIN_WINDOW);
+            // 最晚等到"死线前保留最小打洞窗口"的时刻
+            // （Instant 没有 saturating_sub，用 checked_sub + 兜底）
+            let latest = total_deadline
+                .checked_sub(HOST_PUNCH_MIN_WINDOW)
+                .unwrap_or(total_deadline);
             let until = wanted.min(latest);
             let actual_ms = until.saturating_duration_since(now).as_millis() as u64;
             if actual_ms > 0 {
@@ -1101,7 +1135,7 @@ async fn punch_inbound_once(
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis() as u64;
             let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
-            if let Some((_kcp, stream)) =
+            if let Some((kcp, stream)) =
                 crate::common::punch_target_sustained(&sock, target, round_ms, false, Some(target)).await
             {
                 log::info!(
@@ -1113,6 +1147,11 @@ async fn punch_inbound_once(
                     crate::common::save_punch_last_success(&mine);
                 }
                 let server = server.clone();
+                // KcpStream 必须活到会话结束：它的 Drop 会关掉 stop_sender，
+                // kcp_io 泵随之退出，直连会话立刻无法收发包（原来这里绑成
+                // `_kcp`，函数返回即 drop，打洞成功也用不了）。
+                // create_tcp_connection 内部 await Connection::start，直到
+                // 会话结束才返回，所以把 kcp 一起 move 进同一个任务即可。
                 tokio::spawn(async move {
                     allow_err!(
                         crate::server::create_tcp_connection(
@@ -1125,6 +1164,7 @@ async fn punch_inbound_once(
                         )
                         .await
                     );
+                    drop(kcp);
                 });
                 return;
             }

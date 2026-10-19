@@ -3277,25 +3277,67 @@ pub async fn stun_probe_with_delta(
 // UDP socket 可随时 connect 切换到新目标，无需"断开"。
 //
 // STUN 探测（send_to）不能在 connect 状态进行，故：
-//   - 缓存热（<60s）时任何路径都不再探测；
+//   - 缓存热（<PUNCH_MAPPED_TTL）时任何路径都不再探测；
 //   - 缓存过期且 socket 已 connect（打洞中）时跳过刷新，沿用旧缓存。
+//
+// 注意：一个 socket 上会有多个读循环（每个打洞/每条直连会话一个 kcp_io），
+// 再加不定期的 STUN 探测，多个 recv_from 会互相抢包（收到对方的报文后按
+// txid/conv 丢弃）。因此：
+//   - 所有 STUN 探测用 PUNCH_PROBE_LOCK 单飞（并发只探测一次，其余等待复用）；
+//   - 共享 socket 使用凭证（SharedSocketUse）由打洞函数与已建立的直连会话
+//     （KcpStream）持有，看门狗在"有人使用"时跳过本轮探测——它是唯一长期
+//     周期性的探测源，跳过它就不会反复干扰活动会话；
+//   - 连接前/心跳触发的探测是偶发的，且 KCP 可靠重传，抢走一两个报文代价
+//     可忽略，因此不做跳过（否则一对多远程时第二个控制端会拿不到本地映射）。
 
 static SHARED_PUNCH_SOCKET: std::sync::Mutex<Option<Arc<tokio::net::UdpSocket>>> =
     std::sync::Mutex::new(None);
 // (映射地址, 对称 delta, 探测时间)
 static SHARED_PUNCH_MAPPED: std::sync::Mutex<Option<(SocketAddr, i32, std::time::Instant)>> =
     std::sync::Mutex::new(None);
-// 上次上报时间（3s 内不重复上报，避免重连时反复打 API）
+// 上次上报时间（附带上报在此窗口内跳过，避免反复打 API）
 static LAST_PUNCH_REPORT_AT: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
+// 正在使用共享打洞 socket 的读循环数量（kcp_io / STUN 探测）
+static SHARED_SOCKET_USERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-const PUNCH_MAPPED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-// 附带上报节流：30s。连接时带 target 的上报不走此节流（必须让对端发现请求）。
-// 心跳（sync.rs）与本地 IP 变化都会触发附带上报，30s 足以去重。
-const PUNCH_REPORT_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
-// 映射看门狗探测间隔：与缓存 TTL 对齐（缓存永热，连接时零探测）。
-// 只做 UDP STUN（几个小包），不产生 HTTP；映射变化才上报，最长 60s 发现。
+// 缓存 TTL 取 2x 看门狗间隔：看门狗每 60s 刷新一次，缓存永远不会过期，
+// 连接路径因此永远零现场探测。注意它只是"要不要重新探测"的门槛，与
+// api-server 侧的 PunchAddrTTL(60s) 无关——地址实际新鲜度由看门狗保证。
+const PUNCH_MAPPED_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+// 附带上报节流。连接时带 target 的上报不走此节流（必须让对端发现请求）。
+// 心跳（sync.rs，15s 一次）与本地 IP 变化都会触发附带上报；api-server 侧
+// 打洞地址 TTL 是 60s（punch_exchange.go: PunchAddrTTL），20s 节流留 3x 余量。
+const PUNCH_REPORT_THROTTLE: std::time::Duration = std::time::Duration::from_secs(20);
+// 映射看门狗探测间隔（< PUNCH_MAPPED_TTL，缓存因此永热）。
 const PUNCH_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+// STUN 探测单飞锁：保证同一时刻只有一个探测在跑（多路并发只探测一次）。
+lazy_static::lazy_static! {
+    static ref PUNCH_PROBE_LOCK: hbb_common::tokio::sync::Mutex<()> =
+        hbb_common::tokio::sync::Mutex::new(());
+}
+
+/// 共享 socket 使用凭证：持有期间共享 socket 被视为"忙"（看门狗跳过探测）。
+/// Drop 时释放计数。
+pub struct SharedSocketUse(());
+
+impl Drop for SharedSocketUse {
+    fn drop(&mut self) {
+        SHARED_SOCKET_USERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 当前是否有人在用共享打洞 socket（打洞/直连会话/STUN 探测）。
+pub fn shared_socket_in_use() -> bool {
+    SHARED_SOCKET_USERS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// 申领共享 socket 使用权（持有期间看门狗/其它 STUN 探测会跳过）。
+pub fn shared_socket_acquire() -> SharedSocketUse {
+    SHARED_SOCKET_USERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    SharedSocketUse(())
+}
 
 /// 获取进程级共享打洞 socket（若已创建）。
 pub fn shared_punch_socket() -> Option<Arc<tokio::net::UdpSocket>> {
@@ -3310,11 +3352,11 @@ pub async fn ensure_shared_punch_socket() -> ResultType<Arc<tokio::net::UdpSocke
     let s = create_punch_socket_v4().await?;
     let mut g = SHARED_PUNCH_SOCKET
         .lock()
-        .map_err(|_| anyhow::anyhow!("shared punch socket lock poisoned"))?;
+        .map_err(|_| anyhow!("shared punch socket lock poisoned"))?;
     Ok(g.get_or_insert(s).clone())
 }
 
-/// 读取缓存的 STUN 映射（60s 内有效）。
+/// 读取缓存的 STUN 映射（TTL 内有效）。
 pub fn cached_punch_mapped() -> Option<(SocketAddr, i32)> {
     let g = SHARED_PUNCH_MAPPED.lock().ok()?;
     g.as_ref().and_then(|(a, d, t)| {
@@ -3324,6 +3366,14 @@ pub fn cached_punch_mapped() -> Option<(SocketAddr, i32)> {
             None
         }
     })
+}
+
+/// 读取缓存的映射（不看 TTL）：仅供"是否变化"的比较使用。
+/// 直接用 cached_punch_mapped() 判断变化是错的——探测间隔 >= TTL 时缓存必然
+/// 已过期，每次都会被判成"变化"而重复 HTTP 上报。
+fn cached_punch_mapped_any_ttl() -> Option<(SocketAddr, i32)> {
+    let g = SHARED_PUNCH_MAPPED.lock().ok()?;
+    g.as_ref().map(|(a, d, _)| (*a, *d))
 }
 
 /// 作废映射缓存（网络切换时调用）：下次 ensure_punch_mapped 会重新 STUN
@@ -3337,16 +3387,26 @@ pub fn invalidate_punch_mapped_cache() {
 }
 
 /// 确保共享 socket 的映射已知：缓存热直接返回；否则探测一次并缓存。
-/// socket 已 connect（打洞进行中）时无法发包探测，返回 None（调用方沿用
-/// 旧缓存或放弃本次上报）。
+/// 探测用单飞锁串行化：看门狗 / 心跳附带上报 / 连接前打洞可能同时调用，
+/// 若各自发 STUN 会互相 recv_from 抢走对方的响应，双双超时。
+///
+/// 这里**不**因"共享 socket 正被使用"而跳过探测：一对多远程时第二个控制端
+/// 连接就发生在已有直连会话期间，跳过会让它拿不到本地映射而无法打洞。
+/// 探测期间可能零星抢走活动会话的一两个报文，但 KCP 本身可靠重传，代价可忽略；
+/// 真正需要避免的是"长时间周期性探测"（看门狗），那个才在忙时跳过。
 pub async fn ensure_punch_mapped() -> Option<(SocketAddr, i32)> {
     if let Some(c) = cached_punch_mapped() {
         return Some(c);
     }
     let sock = ensure_shared_punch_socket().await.ok()?;
     if sock.peer_addr().is_ok() {
-        // 打洞中：不能 send_to 探测
+        // socket 已 connect（旧 Phase3 路径）：不能 send_to 探测
         return None;
+    }
+    // 单飞：等锁期间别人可能已经探测并写好缓存
+    let _guard = PUNCH_PROBE_LOCK.lock().await;
+    if let Some(c) = cached_punch_mapped() {
+        return Some(c);
     }
     match stun_probe_with_delta(&sock).await {
         Ok((addr, delta)) => {
@@ -3363,7 +3423,7 @@ pub async fn ensure_punch_mapped() -> Option<(SocketAddr, i32)> {
     }
 }
 
-/// 上报节流：30s 内已上报过返回 true（调用方跳过本次上报）。
+/// 上报节流：`PUNCH_REPORT_THROTTLE` 内已上报过返回 true（调用方跳过本次上报）。
 pub fn punch_report_throttled() -> bool {
     let now = std::time::Instant::now();
     if let Ok(mut g) = LAST_PUNCH_REPORT_AT.lock() {
@@ -3393,10 +3453,12 @@ fn mark_punch_reported() {
 ///
 /// 成本设计（"最优自动更新时间"的关键）：探测 = 每台 STUN 服务器 1 个 20 字节
 /// UDP 请求，可忽略；上报 = HTTP+TLS，贵。因此：
-///   - 每 `PUNCH_WATCHDOG_INTERVAL` 探测一次（与缓存 TTL 对齐，缓存永热，
+///   - 每 `PUNCH_WATCHDOG_INTERVAL` 探测一次（小于缓存 TTL，缓存永热，
 ///     连接时永远零探测）；
 ///   - 映射未变 → **零 HTTP 请求**，只刷新缓存时间戳；
-///   - 映射变化 → 立即上报（绕过节流，对端必须尽快知道）。
+///   - 映射变化 → 立即上报（绕过节流，对端必须尽快知道）；
+///   - 共享 socket 正被使用（打洞中 / 已建立直连会话 / 另一路探测）时
+///     **跳过本轮**，绝不 recv_from 抢走别人的报文。
 pub async fn punch_mapped_watchdog() {
     // 启动后先让一次启动上报走完，避免与它抢着探测
     hbb_common::tokio::time::sleep(Duration::from_secs(5)).await;
@@ -3405,19 +3467,33 @@ pub async fn punch_mapped_watchdog() {
         if !crate::hbbs_http::punch_exchange::available() {
             continue;
         }
+        // 有人在打洞/直连会话中：不能探测（会抢包），下一轮再来
+        if shared_socket_in_use() {
+            continue;
+        }
         let sock = match ensure_shared_punch_socket().await {
             Ok(s) => s,
             Err(_) => continue,
         };
-        // 打洞进行中（已 connect）时不能发包探测；共享 socket 在新流程下
-        // 不 connect，正常情况下不会触发
+        // 旧 Phase3 路径可能把共享 socket connect 到目标，此时不能 send_to 探测
         if sock.peer_addr().is_ok() {
             continue;
         }
-        let Ok((addr, delta)) = stun_probe_with_delta(&sock).await else {
+        // 与其它探测（连接前 STUN、附带上报）串行：多个 recv_from 同时跑会
+        // 互相抢走对方的 STUN 响应，双双超时。
+        // 注意锁的作用域：report_own_addrs_inner 内部还会走 ensure_punch_mapped
+        // 再取一次这把锁，tokio::Mutex 不可重入，必须在这里就释放。
+        let probe_res = {
+            let _probe = PUNCH_PROBE_LOCK.lock().await;
+            stun_probe_with_delta(&sock).await
+        };
+        let Ok((addr, delta)) = probe_res else {
             continue;
         };
-        let changed = match cached_punch_mapped() {
+        // 与缓存比较时不能走 cached_punch_mapped()：它带 TTL 过滤，一旦探测
+        // 间隔 >= TTL，缓存必然已过期，每轮都会被误判成"变化"而重复上报。
+        // 直接读底层缓存比较最稳（探测间隔就是 refresh 间隔，不存在这个陷阱）。
+        let changed = match cached_punch_mapped_any_ttl() {
             Some((a, d)) => a != addr || d != delta,
             None => true,
         };
@@ -3437,12 +3513,14 @@ pub async fn punch_mapped_watchdog() {
     }
 }
 
-/// 实际执行一次上报（绕过节流；映射变化时必须让对端尽快知道）。
-async fn report_own_addrs_inner() -> bool {
+/// 实际执行一次上报（绕过节流；映射变化/网络切换时必须让对端尽快知道）。
+pub async fn report_own_addrs_inner() -> bool {
     let known_mapped = ensure_punch_mapped().await;
     let Some((primary, _)) = known_mapped else {
         return false;
     };
+    // known_mapped 已知时不需要 socket：传 None 会白白再 bind 一个 UDP socket
+    // （还会重复抢 UPnP 本地端口）。socket 仅用于"现场探测 STUN"。
     let (addrs, meta) = collect_punch_addrs(None, Some((primary, 0))).await;
     if addrs.is_empty() {
         return false;
@@ -3457,9 +3535,11 @@ async fn report_own_addrs_inner() -> bool {
         })
         .collect();
     let count = addrs.len();
-    mark_punch_reported();
     match crate::hbbs_http::punch_exchange::report(&Config::get_id(), "", &meta, addrs).await {
         Ok(_) => {
+            // 只在成功后才记账：失败也要允许尽快重试，否则一次抖动就会让
+            // 打洞地址在 TTL 内没人刷新。
+            mark_punch_reported();
             log::debug!(
                 "punch report: reported {} candidate addr(s), nat_type={}",
                 count,
@@ -3530,18 +3610,21 @@ pub async fn collect_punch_addrs(
     }
 
     // 2. 主/备 STUN 映射。
-    //    known_mapped 有值（启动时已探测缓存）→ 直接用，跳过现场 STUN；
+    //    known_mapped 有值（启动时已探测缓存）→ 直接用，跳过现场 STUN，
+    //    也就不需要 socket——避免每次上报都白 bind 一个 UDP socket（还会
+    //    重复抢一次 UPnP 本地端口）；
     //    否则现场探测（同一 socket，保证与后续打洞的 NAT 映射一致）。
     let owned_socket;
     let sock: Option<&Arc<tokio::net::UdpSocket>> = match socket {
-        Some(s) => Some(s),
-        None => match create_punch_socket_v4().await {
+        Some(s) if known_mapped.is_none() => Some(s),
+        None if known_mapped.is_none() => match create_punch_socket_v4().await {
             Ok(s) => {
                 owned_socket = s;
                 Some(&owned_socket)
             }
             Err(_) => None,
         },
+        _ => None,
     };
     match known_mapped {
         Some((primary, _delta)) => {
@@ -3642,20 +3725,29 @@ pub async fn punch_direct_via_api(
     peer_id: &str,
     total_budget: std::time::Duration,
 ) -> ResultType<(crate::kcp_stream::KcpStream, Stream, std::net::SocketAddr)> {
-    use std::time::Duration;
-
     // 1. 打洞 socket：用进程级共享 socket（启动时已创建并完成 STUN，
     //    映射已缓存），保证 NAT 映射一致且无需重新探测。
     let socket_v4 = ensure_shared_punch_socket().await?;
 
+    // 总死线**从函数入口算起**：STUN、report、等对端地址、sync 等待与打洞
+    // 全部计入预算，保证任何情况下打洞窗口都不为零。调用方按 `total_budget`
+    // 控制用户等待时长，超支会让"回退中继"迟迟不发生（原来死线是在
+    // STUN + report 之后才创建的，最坏多花 8s 以上）。
+    let total_deadline = std::time::Instant::now() + total_budget;
+
     // 2. 收集本机全部候选地址 + 网络环境。
-    //    缓存热（<60s）时直接复用启动时探测的映射，跳过现场 1-4s STUN；
+    //    缓存热时直接复用启动时探测的映射，跳过现场 1-4s STUN；
     //    缓存过期或缺失时才探测（ensure_punch_mapped 内部处理）。
+    //    顺序：先探测/收集，再申领共享 socket 使用权——提前申领会让我们
+    //    自己的探测被"socket 忙"判断挡掉。
     let known_mapped = ensure_punch_mapped().await;
     let (my_addrs, my_meta) = collect_punch_addrs(Some(&socket_v4), known_mapped).await;
     if my_addrs.is_empty() {
         bail!("punch_direct_via_api: no local punch address");
     }
+    // 共享 socket 使用凭证：从这里一直持有到函数返回（含整个打洞过程），
+    // 期间看门狗/其它 STUN 探测会跳过，不会 recv_from 抢走我们的报文。
+    let _shared_use = shared_socket_acquire();
     let my_primary = my_addrs
         .iter()
         .find(|a| a.kind == crate::hbbs_http::punch_exchange::KIND_STUN_PRIMARY)
@@ -3688,9 +3780,6 @@ pub async fn punch_direct_via_api(
     // 等待上限 10s：正好覆盖被控端一个上报周期；超过则多半是对端没配
     // api-server（旧版），早退回退中继，不白等——等太久会把打洞窗口挤没。
     let addr_wait_cap = Duration::from_secs(10);
-    // 总死线从函数入口算起：后面的 sync 等待与打洞都受它约束，
-    // 保证任何情况下打洞窗口都不为零。
-    let total_deadline = std::time::Instant::now() + total_budget;
     let deadline = (std::time::Instant::now() + addr_wait_cap).min(total_deadline);
     let mut peer_info = crate::hbbs_http::punch_exchange::PeerPunchInfo::default();
     while std::time::Instant::now() < deadline {
@@ -3725,7 +3814,10 @@ pub async fn punch_direct_via_api(
             let now = std::time::Instant::now();
             let wanted = now + Duration::from_millis(wait as u64);
             // 最晚等到"死线前保留最小打洞窗口"的时刻
-            let latest = total_deadline.saturating_sub(PUNCH_MIN_WINDOW);
+            // （Instant 没有 saturating_sub，用 checked_sub + 兜底）
+            let latest = total_deadline
+                .checked_sub(PUNCH_MIN_WINDOW)
+                .unwrap_or(total_deadline);
             let until = wanted.min(latest);
             let actual_ms = until.saturating_duration_since(now).as_millis() as u64;
             if actual_ms > 0 {
@@ -3847,8 +3939,10 @@ pub async fn punch_report_own_addrs() -> bool {
     if !crate::hbbs_http::punch_exchange::available() {
         return false;
     }
-    // 30s 内刚上报过则跳过（启动/IP 变化/心跳附带都会调用，避免反复打 API）。
-    // 注意：映射看门狗检测到变化时走 report_own_addrs_inner，绕开此节流。
+    // 附带上报节流（见 PUNCH_REPORT_THROTTLE）内刚上报过则跳过（启动/IP 变化/
+    // 心跳附带都会调用，避免反复打 API）。
+    // 注意：映射看门狗检测到变化、以及 IP 变化都走 report_own_addrs_inner，
+    // 绕开此节流——那两种情况下必须让对端尽快拿到新地址。
     if punch_report_throttled() {
         return true;
     }
@@ -3879,7 +3973,7 @@ pub async fn punch_target_sustained(
         while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
             let send_res = match peer_addr {
                 Some(a) => sock.send_to(&[], a).await.map(|_| ()),
-                None => sock.send(&[]).await,
+                None => sock.send(&[]).await.map(|_| ()),
             };
             if send_res.is_err() {
                 break;

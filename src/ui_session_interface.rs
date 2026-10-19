@@ -1757,6 +1757,10 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         return self.lc.clone();
     }
 
+    fn report_punch_status(&self, status: &str, info: &str) {
+        self.ui_handler.set_punch_status(status, info);
+    }
+
     fn send(&self, data: Data) {
         if let Some(sender) = self.sender.read().unwrap().as_ref() {
             sender.send(data).ok();

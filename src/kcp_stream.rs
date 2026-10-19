@@ -18,6 +18,10 @@ use std::{net::SocketAddr, sync::Arc};
 pub struct KcpStream {
     _endpoint: KcpEndpoint,
     stop_sender: Option<oneshot::Sender<()>>,
+    /// 共享打洞 socket 使用凭证（仅未 connect 模式持有）。
+    /// 随 KcpStream 生命周期生效：会话存活期间看门狗/其它 STUN 探测会跳过，
+    /// 不会 recv_from 抢走本会话的报文。
+    _shared_use: Option<crate::common::SharedSocketUse>,
 }
 
 impl KcpStream {
@@ -72,6 +76,7 @@ impl KcpStream {
                 Self {
                     _endpoint: endpoint,
                     stop_sender: Some(stop_sender),
+                    _shared_use: None,
                 },
                 Self::create_framed(stream, udp_socket.local_addr().ok()),
             ))
@@ -116,6 +121,7 @@ impl KcpStream {
                 Self {
                     _endpoint: endpoint,
                     stop_sender: Some(stop_sender),
+                    _shared_use: None,
                 },
                 Self::create_framed(stream, udp_socket.local_addr().ok()),
             ))
@@ -207,11 +213,20 @@ impl KcpStream {
                 accept_res?
             }
         };
+        // 未 connect 模式（peer_addr 为 Some）使用的是进程级共享打洞 socket：
+        // 立即申领使用凭证并随本 KcpStream 存活，期间看门狗/其它 STUN 探测
+        // 会跳过，不会 recv_from 抢走本会话的报文。
+        let shared_use = if peer_addr.is_some() {
+            Some(crate::common::shared_socket_acquire())
+        } else {
+            None
+        };
         if let Some(stream) = stream::KcpStream::new(&endpoint, conn_id) {
             Ok((
                 Self {
                     _endpoint: endpoint,
                     stop_sender: Some(stop_sender),
+                    _shared_use: shared_use,
                 },
                 Self::create_framed(stream, udp_socket.local_addr().ok()),
             ))
@@ -244,7 +259,7 @@ impl KcpStream {
                     Some(data) = output.recv() => {
                         let send_res = match peer_addr {
                             Some(a) => udp.send_to(&data.inner(), a).await.map(|_| ()),
-                            None => udp.send(&data.inner()).await,
+                            None => udp.send(&data.inner()).await.map(|_| ()),
                         };
                         if let Err(e) = send_res {
                             log::debug!("KCP send error: {:?}", e);
