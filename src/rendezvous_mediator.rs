@@ -836,13 +836,25 @@ async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
     // ===== 中继前打洞（被控端）=====
-    // 周期上报自己的 STUN 地址到 api-server；轮询"谁想连我"，发现控制端请求后
-    // 立即主动打洞（主机侧 prefer_connect=false，即 accept 控制端发起的流），
-    // 成功则直接交给 ConnInner 接管——连接从一开始就是直连会话。
-    let mut last_report = std::time::Instant::now()
+    // 发现控制端请求后立即主动打洞（主机侧 prefer_connect=false，即 accept
+    // 控制端发起的流），成功则直接交给 ConnInner 接管——连接从一开始就是
+    // 直连会话。
+    //
+    // 上报策略（事件触发，不做定时轮询，省带宽）：
+    //   1) 启动后上报一次——保证"打开软件即就绪"；
+    //   2) 本地 IP 集合变化（切换 WiFi/有线/VPN）时上报——循环内纯本地检测，
+    //      零带宽，同时作废映射缓存强制重探测；
+    //   3) 每次 api-server 心跳成功后附带上报（sync.rs 挂点，节流 30s），
+    //      掉线重连后网络恢复时心跳成功即自动覆盖；
+    //   4) 控制端连接时必带 target 上报（punch_direct_via_api，不节流）。
+    // inbox（"谁想连我"）每 3s 拉一次：这是被控端发现连接请求的唯一途径，
+    // 3s 内可发现；控制端等对端地址上限 10s，足以覆盖。
+    let mut reported_startup = false;
+    let mut last_inbox = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
-    let mut last_inbox = last_report;
+    // 本地 IP 集合（变化检测基线；纯本地枚举，无网络开销）
+    let mut last_local_ips = local_ip_set();
     // 已发起过打洞的请求方 -> 发起时间（避免重复 spawn；120s 后允许再次发起）
     let mut handled: std::collections::HashMap<String, std::time::Instant> =
         std::collections::HashMap::new();
@@ -878,15 +890,27 @@ async fn direct_server(server: ServerPtr) {
             }
         }
 
-        // ---- 中继前打洞：上报 + inbox（不依赖 direct-server 监听是否可用）----
+        // ---- 中继前打洞：事件触发上报 + inbox（不依赖 direct-server 监听是否可用）----
         if crate::hbbs_http::punch_exchange::available() {
-            // 每 10s 上报一次自己的打洞地址
-            if last_report.elapsed() >= std::time::Duration::from_secs(10) {
-                last_report = std::time::Instant::now();
+            // 1) 启动后上报一次（打开即就绪）
+            if !reported_startup {
+                reported_startup = true;
                 tokio::spawn(crate::common::punch_report_own_addrs());
             }
-            // 每 2s 检查一次连接请求
-            if last_inbox.elapsed() >= std::time::Duration::from_secs(2) {
+            // 2) 本地 IP 集合变化（网络切换）→ 上报 + 作废映射缓存
+            let cur_ips = local_ip_set();
+            if cur_ips != last_local_ips {
+                log::info!(
+                    "pre-relay punch(host): local IP set changed ({:?} -> {:?}), refreshing punch address",
+                    last_local_ips,
+                    cur_ips
+                );
+                last_local_ips = cur_ips;
+                crate::common::invalidate_punch_mapped_cache();
+                tokio::spawn(crate::common::punch_report_own_addrs());
+            }
+            // 3) inbox：每 3s 检查一次连接请求
+            if last_inbox.elapsed() >= std::time::Duration::from_secs(3) {
                 last_inbox = std::time::Instant::now();
                 let entries =
                     crate::hbbs_http::punch_exchange::get_inbox(&Config::get_id()).await;
@@ -942,6 +966,17 @@ async fn direct_server(server: ServerPtr) {
             sleep(1.).await;
         }
     }
+}
+
+/// 本机 IPv4 地址集合（排序去重，用于网络切换检测）。纯本地枚举，无网络开销。
+fn local_ip_set() -> Vec<String> {
+    let mut v: Vec<String> = crate::common::get_all_ipv4_addrs()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// 被控端：对一台控制端的公网地址主动打洞（中继前打洞的一次性任务）。

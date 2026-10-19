@@ -3290,7 +3290,9 @@ static LAST_PUNCH_REPORT_AT: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
 const PUNCH_MAPPED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-const PUNCH_REPORT_THROTTLE: std::time::Duration = std::time::Duration::from_secs(3);
+// 附带上报节流：30s。连接时带 target 的上报不走此节流（必须让对端发现请求）。
+// 心跳（sync.rs）与本地 IP 变化都会触发附带上报，30s 足以去重。
+const PUNCH_REPORT_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 获取进程级共享打洞 socket（若已创建）。
 pub fn shared_punch_socket() -> Option<Arc<tokio::net::UdpSocket>> {
@@ -3319,6 +3321,16 @@ pub fn cached_punch_mapped() -> Option<(SocketAddr, i32)> {
             None
         }
     })
+}
+
+/// 作废映射缓存（网络切换时调用）：下次 ensure_punch_mapped 会重新 STUN
+/// 探测，避免沿用旧网络的映射地址。
+pub fn invalidate_punch_mapped_cache() {
+    if let Ok(mut g) = SHARED_PUNCH_MAPPED.lock() {
+        if g.take().is_some() {
+            log::info!("punch: mapped addr cache invalidated, will re-probe");
+        }
+    }
 }
 
 /// 确保共享 socket 的映射已知：缓存热直接返回；否则探测一次并缓存。
