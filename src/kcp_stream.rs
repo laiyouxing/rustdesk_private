@@ -64,7 +64,7 @@ impl KcpStream {
                 input.send(packet.into()).await?;
             }
         }
-        Self::kcp_io(udp_socket.clone(), input, output, stop_receiver).await;
+        Self::kcp_io(udp_socket.clone(), input, output, stop_receiver, None).await;
 
         let conn_id = tokio::time::timeout(timeout, endpoint.accept()).await??;
         if let Some(stream) = stream::KcpStream::new(&endpoint, conn_id) {
@@ -108,7 +108,7 @@ impl KcpStream {
                 .ok_or_else(|| anyhow::anyhow!("Failed to get output receiver"))?,
         );
         let (stop_sender, stop_receiver) = oneshot::channel();
-        Self::kcp_io(udp_socket.clone(), input, output, stop_receiver).await;
+        Self::kcp_io(udp_socket.clone(), input, output, stop_receiver, None).await;
 
         let conn_id = endpoint.connect(timeout, 0, 0, Bytes::new()).await?;
         if let Some(stream) = stream::KcpStream::new(&endpoint, conn_id) {
@@ -143,6 +143,12 @@ impl KcpStream {
         udp_socket: Arc<UdpSocket>,
         timeout: std::time::Duration,
         prefer_connect: bool,
+        // Some(addr) = 未 connect 模式：KCP 包用 send_to 发往 addr。用于
+        // 中继前打洞的进程级共享 socket——同一 socket 可同时与多个对端
+        // 握手/收发（recv_from 收所有源，KCP 按 conv 分发），这对"一对多"
+        // 远程（多个控制端同时连同一被控端）是必需的。None = connect 模式
+        // （调用方已把 socket connect 到目标，旧 Phase3 路径使用）。
+        peer_addr: Option<std::net::SocketAddr>,
     ) -> ResultType<(Self, Stream)> {
         let mut endpoint = KcpEndpoint::new();
         // Same KCP tuning as connect()/accept() above.
@@ -165,7 +171,7 @@ impl KcpStream {
                 .ok_or_else(|| anyhow::anyhow!("Failed to get output receiver"))?,
         );
         let (stop_sender, stop_receiver) = oneshot::channel();
-        Self::kcp_io(udp_socket.clone(), input, output, stop_receiver).await;
+        Self::kcp_io(udp_socket.clone(), input, output, stop_receiver, peer_addr).await;
 
         // Drive connect and accept concurrently on the same endpoint (both &self).
         // Both directions must run to completion even though only one result is
@@ -219,6 +225,12 @@ impl KcpStream {
         input: mpsc::Sender<KcpPacket>,
         mut output: mpsc::Receiver<KcpPacket>,
         mut stop_receiver: oneshot::Receiver<()>,
+        // Some(addr) = 未 connect 模式：用 send_to 发往指定对端。这样同一个
+        // socket 可同时服务多个对端（recv_from 收所有源，KCP 按 conv 分发），
+        // 也不必先 connect——connect 会锁定唯一目标，导致第二个对端的包被
+        // 发去错误地址（一对多远程时 inbound 打洞互相覆盖的根因）。
+        // None = connect 模式：沿用 udp.send() 发往已 connect 的目标。
+        peer_addr: Option<std::net::SocketAddr>,
     ) {
         let udp = udp_socket.clone();
         tokio::spawn(async move {
@@ -230,7 +242,11 @@ impl KcpStream {
                         break;
                     }
                     Some(data) = output.recv() => {
-                        if let Err(e) = udp.send(&data.inner()).await {
+                        let send_res = match peer_addr {
+                            Some(a) => udp.send_to(&data.inner(), a).await.map(|_| ()),
+                            None => udp.send(&data.inner()).await,
+                        };
+                        if let Err(e) = send_res {
                             log::debug!("KCP send error: {:?}", e);
                             break;
                         }

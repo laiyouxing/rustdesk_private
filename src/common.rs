@@ -3247,6 +3247,9 @@ pub async fn create_punch_socket_v4() -> ResultType<Arc<tokio::net::UdpSocket>> 
 /// 探测本 socket 的公网映射地址并返回 (地址, 对称delta)。
 /// delta=0 表示锥形 NAT（端口恒定）；对称 NAT 时换一台 STUN 服务器复测，
 /// 端口差即 delta，对端用它预测我们的映射端口。
+///
+/// 全程使用未 connect 模式（send_to/recv_from，靠 txid 匹配响应）：connect
+/// 会锁定对端，之后既无法再向其它服务器探测，打洞前也必须先切目标。
 pub async fn stun_probe_with_delta(
     socket: &tokio::net::UdpSocket,
 ) -> ResultType<(SocketAddr, i32)> {
@@ -3256,19 +3259,107 @@ pub async fn stun_probe_with_delta(
         Some(s) => s,
         None => return Ok((addr, 0)),
     };
-    // socket 未 connect 时才能向任意服务器发包；探测期间短暂 connect
-    if let Some(alt_addr) = std::net::ToSocketAddrs::to_socket_addrs(alt)
-        .ok()
-        .and_then(|mut i| i.find(|a| a.is_ipv4()))
-    {
-        if socket.connect(alt_addr).await.is_ok() {
-            socket.send(&[]).await.ok();
-            if let Ok((alt_res, _)) = stun_query_single_server(socket, alt).await {
-                return Ok((addr, alt_res.port() as i32 - addr.port() as i32));
-            }
+    if let Ok((alt_res, _)) = stun_query_single_server(socket, alt).await {
+        if alt_res != addr {
+            return Ok((addr, alt_res.port() as i32 - addr.port() as i32));
         }
     }
     Ok((addr, 0))
+}
+
+// ===== 进程级共享打洞 socket + STUN 映射缓存 =====
+// 目的："软件打开即就绪"——启动后由 direct_server 循环提前完成 STUN 探测
+// 并周期上报到 api-server；开始远程时直接复用缓存的映射地址，跳过现场
+// 1-4s 的 STUN 与重复上报，立刻进入打洞。
+//
+// 单实例约束：打洞 socket 必须唯一（同端口双 socket 会互相抢收入站包），
+// 因此启动上报 / 连接前打洞 / 被控端 inbound 打洞共用这一个 socket。
+// UDP socket 可随时 connect 切换到新目标，无需"断开"。
+//
+// STUN 探测（send_to）不能在 connect 状态进行，故：
+//   - 缓存热（<60s）时任何路径都不再探测；
+//   - 缓存过期且 socket 已 connect（打洞中）时跳过刷新，沿用旧缓存。
+
+static SHARED_PUNCH_SOCKET: std::sync::Mutex<Option<Arc<tokio::net::UdpSocket>>> =
+    std::sync::Mutex::new(None);
+// (映射地址, 对称 delta, 探测时间)
+static SHARED_PUNCH_MAPPED: std::sync::Mutex<Option<(SocketAddr, i32, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+// 上次上报时间（3s 内不重复上报，避免重连时反复打 API）
+static LAST_PUNCH_REPORT_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+const PUNCH_MAPPED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const PUNCH_REPORT_THROTTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 获取进程级共享打洞 socket（若已创建）。
+pub fn shared_punch_socket() -> Option<Arc<tokio::net::UdpSocket>> {
+    SHARED_PUNCH_SOCKET.lock().ok().and_then(|g| g.clone())
+}
+
+/// 获取（必要时创建）进程级共享打洞 socket。
+pub async fn ensure_shared_punch_socket() -> ResultType<Arc<tokio::net::UdpSocket>> {
+    if let Some(s) = shared_punch_socket() {
+        return Ok(s);
+    }
+    let s = create_punch_socket_v4().await?;
+    let mut g = SHARED_PUNCH_SOCKET
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shared punch socket lock poisoned"))?;
+    Ok(g.get_or_insert(s).clone())
+}
+
+/// 读取缓存的 STUN 映射（60s 内有效）。
+pub fn cached_punch_mapped() -> Option<(SocketAddr, i32)> {
+    let g = SHARED_PUNCH_MAPPED.lock().ok()?;
+    g.as_ref().and_then(|(a, d, t)| {
+        if t.elapsed() < PUNCH_MAPPED_TTL {
+            Some((*a, *d))
+        } else {
+            None
+        }
+    })
+}
+
+/// 确保共享 socket 的映射已知：缓存热直接返回；否则探测一次并缓存。
+/// socket 已 connect（打洞进行中）时无法发包探测，返回 None（调用方沿用
+/// 旧缓存或放弃本次上报）。
+pub async fn ensure_punch_mapped() -> Option<(SocketAddr, i32)> {
+    if let Some(c) = cached_punch_mapped() {
+        return Some(c);
+    }
+    let sock = ensure_shared_punch_socket().await.ok()?;
+    if sock.peer_addr().is_ok() {
+        // 打洞中：不能 send_to 探测
+        return None;
+    }
+    match stun_probe_with_delta(&sock).await {
+        Ok((addr, delta)) => {
+            if let Ok(mut g) = SHARED_PUNCH_MAPPED.lock() {
+                *g = Some((addr, delta, std::time::Instant::now()));
+            }
+            log::info!("punch: shared socket mapped addr {} (delta {})", addr, delta);
+            Some((addr, delta))
+        }
+        Err(e) => {
+            log::debug!("ensure_punch_mapped: STUN failed: {:?}", e);
+            None
+        }
+    }
+}
+
+/// 上报节流：3s 内已上报过返回 true（调用方跳过本次上报）。
+pub fn punch_report_throttled() -> bool {
+    let now = std::time::Instant::now();
+    if let Ok(mut g) = LAST_PUNCH_REPORT_AT.lock() {
+        if let Some(last) = *g {
+            if now.duration_since(last) < PUNCH_REPORT_THROTTLE {
+                return true;
+            }
+        }
+        *g = Some(now);
+    }
+    false
 }
 
 /// direct-access-port（被控端 TCP 直连监听端口；LAN 与 TCP fallback 都用它）
@@ -3292,10 +3383,12 @@ fn get_direct_access_port() -> u16 {
 /// - `lan`           本机各网卡内网地址 + direct-access-port（双方同网段时直连）
 /// - `tcp`           主映射 IP + direct-access-port（UDP 全封时的 TCP 同步打开）
 ///
-/// `socket` 传入时复用它做 STUN（保证探测到的映射与后续打洞同一个 socket）；
-/// 被控端周期上报传 None（内部自建）。
+/// `known_mapped` 传入已知映射（启动时已探测并缓存）时**跳过 STUN**——这就是
+/// “打开软件即就绪”的关键：连接时不再现场花 1-4s 探测。为 None 时才探测。
+/// `socket` 传入时复用它做 STUN（保证探测到的映射与后续打洞同一个 socket）。
 pub async fn collect_punch_addrs(
     socket: Option<&Arc<tokio::net::UdpSocket>>,
+    known_mapped: Option<(SocketAddr, i32)>,
 ) -> (
     Vec<crate::hbbs_http::punch_exchange::PunchAddr>,
     crate::hbbs_http::punch_exchange::PunchMeta,
@@ -3324,7 +3417,9 @@ pub async fn collect_punch_addrs(
         }
     }
 
-    // 2. 主/备 STUN 映射（同一 socket，保证与后续打洞的 NAT 映射一致）
+    // 2. 主/备 STUN 映射。
+    //    known_mapped 有值（启动时已探测缓存）→ 直接用，跳过现场 STUN；
+    //    否则现场探测（同一 socket，保证与后续打洞的 NAT 映射一致）。
     let owned_socket;
     let sock: Option<&Arc<tokio::net::UdpSocket>> = match socket {
         Some(s) => Some(s),
@@ -3336,8 +3431,8 @@ pub async fn collect_punch_addrs(
             Err(_) => None,
         },
     };
-    if let Some(sock) = sock {
-        if let Ok((primary, _)) = stun_query_with_socket(sock).await {
+    match known_mapped {
+        Some((primary, _delta)) => {
             primary_ip = Some(primary.ip());
             addrs.push(PunchAddr::new(
                 primary.to_string(),
@@ -3346,16 +3441,22 @@ pub async fn collect_punch_addrs(
                 PRIO_STUN_PRIMARY,
                 0,
             ));
-            // 备 STUN：对称 NAT 下不同目的地址的映射不同，对端可一并尝试
-            let servers = get_stun_servers_v4();
-            let alt_srv = servers.get(1).or_else(|| servers.first());
-            if let Some(alt_srv) = alt_srv {
-                let alt_addr = std::net::ToSocketAddrs::to_socket_addrs(alt_srv)
-                    .ok()
-                    .and_then(|mut i| i.find(|a| a.is_ipv4()));
-                if let Some(alt_addr) = alt_addr {
-                    if sock.connect(alt_addr).await.is_ok() {
-                        sock.send(&[]).await.ok();
+        }
+        None => {
+            if let Some(sock) = sock {
+                if let Ok((primary, _)) = stun_query_with_socket(sock).await {
+                    primary_ip = Some(primary.ip());
+                    addrs.push(PunchAddr::new(
+                        primary.to_string(),
+                        "udp",
+                        KIND_STUN_PRIMARY,
+                        PRIO_STUN_PRIMARY,
+                        0,
+                    ));
+                    // 备 STUN：对称 NAT 下不同目的地址的映射不同，对端可一并尝试
+                    let servers = get_stun_servers_v4();
+                    let alt_srv = servers.get(1).or_else(|| servers.first());
+                    if let Some(alt_srv) = alt_srv {
                         if let Ok((alt_res, _)) = stun_query_single_server(sock, alt_srv).await {
                             if alt_res != primary {
                                 let delta = alt_res.port() as i32 - primary.port() as i32;
@@ -3431,11 +3532,15 @@ pub async fn punch_direct_via_api(
 ) -> ResultType<(crate::kcp_stream::KcpStream, Stream, std::net::SocketAddr)> {
     use std::time::Duration;
 
-    // 1. 打洞 socket（后续 STUN 探测与打洞复用，保证 NAT 映射一致）
-    let socket_v4 = create_punch_socket_v4().await?;
+    // 1. 打洞 socket：用进程级共享 socket（启动时已创建并完成 STUN，
+    //    映射已缓存），保证 NAT 映射一致且无需重新探测。
+    let socket_v4 = ensure_shared_punch_socket().await?;
 
-    // 2. 收集本机全部候选地址 + 网络环境
-    let (my_addrs, my_meta) = collect_punch_addrs(Some(&socket_v4)).await;
+    // 2. 收集本机全部候选地址 + 网络环境。
+    //    缓存热（<60s）时直接复用启动时探测的映射，跳过现场 1-4s STUN；
+    //    缓存过期或缺失时才探测（ensure_punch_mapped 内部处理）。
+    let known_mapped = ensure_punch_mapped().await;
+    let (my_addrs, my_meta) = collect_punch_addrs(Some(&socket_v4), known_mapped).await;
     if my_addrs.is_empty() {
         bail!("punch_direct_via_api: no local punch address");
     }
@@ -3596,7 +3701,9 @@ pub async fn punch_direct_via_api(
         let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
         while std::time::Instant::now() < target_deadline {
             let sock = socket_v4.clone();
-            if sock.connect(target).await.is_err() {
+            // 未 connect 模式：不 connect（共享 socket 要同时服务多个对端），
+            // 用一次 send_to 探测目标可达性，失败即换下一个目标
+            if sock.send_to(&[], target).await.is_err() {
                 break;
             }
             let remain_ms = total_deadline
@@ -3604,7 +3711,7 @@ pub async fn punch_direct_via_api(
                 .as_millis() as u64;
             let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
             if let Some((kcp, stream)) =
-                punch_target_sustained(&sock, target, round_ms, true).await
+                punch_target_sustained(&sock, target, round_ms, true, Some(target)).await
             {
                 log::info!(
                     "[NAT穿透] 中继前打洞成功({}), 耗时={:?}",
@@ -3628,7 +3735,16 @@ pub async fn punch_report_own_addrs() -> bool {
     if !crate::hbbs_http::punch_exchange::available() {
         return false;
     }
-    let (addrs, meta) = collect_punch_addrs(None).await;
+    // 3s 内刚上报过则跳过（连接重试会连续调用，避免反复打 API）
+    if punch_report_throttled() {
+        return true;
+    }
+    // 共享 socket + 映射缓存：启动后首次探测，之后 60s 内零 STUN 直接上报
+    let known_mapped = ensure_punch_mapped().await;
+    let Some((primary, _)) = known_mapped else {
+        return false;
+    };
+    let (addrs, meta) = collect_punch_addrs(None, Some((primary, 0))).await;
     if addrs.is_empty() {
         return false;
     }
@@ -3663,12 +3779,16 @@ pub async fn punch_report_own_addrs() -> bool {
 ///
 /// 这是修复成功率≈0 的关键：改成"长时间持续打同一个精确地址"后，即使两端
 /// 起始时刻相差数十秒，窗口仍有大量重叠，双方能真正同时向对方发包。
+///
+/// `peer_addr` 为 Some 时使用未 connect 模式（KCP 包 send_to 到该地址，
+/// 空包亦然）——进程级共享 socket 由此可同时服务多个对端（一对多远程）；
+/// 为 None 时沿用 connect 模式（调用方已 connect，旧 Phase3 路径）。
 pub async fn punch_target_sustained(
     socket: &Arc<UdpSocket>,
-    // socket 调用前已 connect 到目标地址，此处无需再用 target
-    _target: std::net::SocketAddr,
+    target: std::net::SocketAddr,
     duration_ms: u64,
     prefer_connect: bool,
+    peer_addr: Option<std::net::SocketAddr>,
 ) -> Option<(crate::kcp_stream::KcpStream, Stream)> {
     // 后台持续发空包维持 NAT 映射（打洞成败取决于双方是否都在持续发包）
     let sock = socket.clone();
@@ -3676,7 +3796,13 @@ pub async fn punch_target_sustained(
     let stop_flag = stop.clone();
     let burst = hbb_common::tokio::spawn(async move {
         while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = sock.send(&[]).await;
+            let send_res = match peer_addr {
+                Some(a) => sock.send_to(&[], a).await.map(|_| ()),
+                None => sock.send(&[]).await,
+            };
+            if send_res.is_err() {
+                break;
+            }
             hbb_common::tokio::time::sleep(Duration::from_millis(PUNCH_BURST_INTERVAL_MS)).await;
         }
     });
@@ -3685,6 +3811,7 @@ pub async fn punch_target_sustained(
         socket.clone(),
         Duration::from_millis(duration_ms),
         prefer_connect,
+        peer_addr,
     )
     .await;
 
@@ -4258,7 +4385,7 @@ pub async fn relay_upgrade_task(
                 let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, *target, round_ms, true).await
+                    punch_target_sustained(&sock, *target, round_ms, true, None).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
@@ -4340,7 +4467,7 @@ pub async fn relay_upgrade_task(
                         TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                     let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                     if let Some((kcp, stream)) =
-                        punch_target_sustained(&sock, target, round_ms, true).await
+                        punch_target_sustained(&sock, target, round_ms, true, None).await
                     {
                         if let Ok(mut h) = kcp_handle.lock() {
                             *h = Some(kcp);
@@ -4663,7 +4790,7 @@ pub async fn relay_phase3_punch_to_peer(
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&socket, *target, round_ms, false).await
+                    punch_target_sustained(&socket, *target, round_ms, false, None).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
@@ -4731,7 +4858,7 @@ pub async fn relay_phase3_punch_to_peer(
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, target, round_ms, false).await
+                    punch_target_sustained(&sock, target, round_ms, false, None).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);

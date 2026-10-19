@@ -990,18 +990,18 @@ async fn punch_inbound_once(
         targets.len()
     );
 
-    // 打洞 socket + STUN 上报（让控制端也能拉到我们的最新映射）
-    let socket = match crate::common::create_punch_socket_v4().await {
+    // 打洞 socket：用进程级共享 socket（启动时已创建 + STUN 缓存），
+    // 保证 NAT 映射与上报的一致，也省去现场探测。
+    let socket = match crate::common::ensure_shared_punch_socket().await {
         Ok(s) => s,
         Err(e) => {
             log::info!("pre-relay punch(host): bind failed: {:?}", e);
             return;
         }
     };
-    // 记录本机主映射（成功后存为 last_success）
-    let my_primary = crate::common::stun_probe_with_delta(&socket)
+    // 记录本机主映射（成功后存为 last_success）；缓存热则零探测
+    let my_primary = crate::common::ensure_punch_mapped()
         .await
-        .ok()
         .map(|(a, _)| a);
 
     // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）。
@@ -1054,7 +1054,9 @@ async fn punch_inbound_once(
         let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
         while std::time::Instant::now() < target_deadline {
             let sock = socket.clone();
-            if sock.connect(target).await.is_err() {
+            // 未 connect 模式：共享 socket 要同时服务多个控制端（一对多远程），
+            // 不能 connect 锁定单一目标；用 send_to 探测可达性
+            if sock.send_to(&[], target).await.is_err() {
                 break;
             }
             let remain_ms = total_deadline
@@ -1062,7 +1064,7 @@ async fn punch_inbound_once(
                 .as_millis() as u64;
             let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
             if let Some((_kcp, stream)) =
-                crate::common::punch_target_sustained(&sock, target, round_ms, false).await
+                crate::common::punch_target_sustained(&sock, target, round_ms, false, Some(target)).await
             {
                 log::info!(
                     "pre-relay punch(host): KCP punch to {} succeeded after {:?}, handing over to connection",
