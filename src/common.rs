@@ -72,32 +72,77 @@ pub const CUSTOM_TAG: &str = "rustdesk-custom";
 /// Up to 3 retries are allowed with exponential backoff (via auto-reconnect).
 static PHASE3_RETRY_COUNT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+// 最近一次失败时刻：用于"失败计数随时间衰减"，避免偶发误判（对端首帧慢、
+// 手动接受久）把打洞长期禁掉。
+static PHASE3_LAST_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
 const PHASE3_MAX_RETRIES: u32 = 3;
+// 失败计数窗口：距上次失败超过该时长则重新从 1 开始计。
+// 5 分钟 ≈ 用户换一个对端/网络环境的时间尺度，兼顾"连续失败快速熔断"与
+// "不要把一次误判固化成永久降级"。
+const PHASE3_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Record that Phase3 succeeded, clearing the retry counter.
 /// On subsequent reconnections, Phase3 will be attempted again.
 pub fn record_phase3_success() {
     PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = PHASE3_LAST_FAIL_AT.lock() {
+        *g = None;
+    }
 }
 
 /// Record that Phase3 failed. Increments retry counter; after
-/// PHASE3_MAX_RETRIES failures, Phase3 is permanently skipped until
-/// user actively disconnects (reset) or Phase3 succeeds.
+/// PHASE3_MAX_RETRIES failures within PHASE3_RETRY_WINDOW, Phase3 is skipped
+/// until user actively disconnects (reset), Phase3 succeeds, or the window
+/// elapses (decay).
 pub fn record_phase3_failure() {
-    PHASE3_RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let now = std::time::Instant::now();
+    let expired = if let Ok(mut g) = PHASE3_LAST_FAIL_AT.lock() {
+        let expired = matches!(*g, Some(last) if now.duration_since(last) >= PHASE3_RETRY_WINDOW);
+        *g = Some(now);
+        expired
+    } else {
+        false
+    };
+    if expired {
+        // 上一次失败已超出窗口：本轮算第 1 次失败，重新起算
+        PHASE3_RETRY_COUNT.store(1, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        PHASE3_RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Returns true if Phase3 should be skipped.
-/// Allows up to PHASE3_MAX_RETRIES attempts; auto-reconnect exponential
-/// backoff provides natural spacing between retries (1s→1.5s→2.3s→…).
+/// Allows up to PHASE3_MAX_RETRIES attempts within PHASE3_RETRY_WINDOW;
+/// auto-reconnect exponential backoff provides natural spacing between
+/// retries (1s→1.5s→2.3s→…).
 pub fn should_skip_phase3() -> bool {
-    PHASE3_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= PHASE3_MAX_RETRIES
+    if PHASE3_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= PHASE3_MAX_RETRIES {
+        // 计数已达上限，但若距上次失败已超过窗口，视为衰减、放行
+        let expired = if let Ok(g) = PHASE3_LAST_FAIL_AT.lock() {
+            matches!(*g, Some(last) if last.elapsed() >= PHASE3_RETRY_WINDOW)
+        } else {
+            false
+        };
+        if expired {
+            PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut g) = PHASE3_LAST_FAIL_AT.lock() {
+                *g = None;
+            }
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 /// Reset Phase3 state so the next connection will try punching again.
 /// Called when the user explicitly closes the connection.
 pub fn reset_phase3_state() {
     PHASE3_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = PHASE3_LAST_FAIL_AT.lock() {
+        *g = None;
+    }
 }
 
 pub const TIMER_OUT: Duration = Duration::from_secs(1);

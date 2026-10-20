@@ -580,9 +580,12 @@ impl Client {
             || conn_type == ConnType::VIEW_CAMERA;
         // 同局域网（is_local）时不走 api-server 打洞：公网映射地址在局域网内
         // 反而绕远，直接走下面的 LAN 并行测试更快。
+        // should_skip_phase3：直连连续失败（含"握手成功但 5s 无数据"的假成功）
+        // 已达熔断上限，不再白试——与 Phase3 共用同一个熔断器。
         if punchable_conn
             && !is_local
             && !interface.is_force_relay()
+            && !crate::common::should_skip_phase3()
             && crate::hbbs_http::punch_exchange::available()
         {
             log::info!("pre-relay punch: trying direct UDP punch via api-server before relay");

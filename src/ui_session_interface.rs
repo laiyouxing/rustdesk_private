@@ -2092,7 +2092,12 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
             delay = (delay * 1.5).min(15.0);
         }
         remote.io_loop(&key, &token, round).await;
-        if remote.sent_close_reason {
+        // 只有"会话彻底结束"才停止重连：用户主动关闭、或对端发来 CloseReason。
+        // 直连流出错/看门狗超时/网络波动都会走到这里，但那些情况应当继续
+        // 自动重连（退回中继重建会话）——原来判断 sent_close_reason 会把
+        // "已向对端发送关闭原因"误当成"会话结束"，导致 KCP 会话退出后
+        // 自动重连被静默终止，用户只能手动重连。
+        if remote.no_reconnect {
             break;
         }
         // 文件传输会话：重连前落盘当前进度并清空内存任务，

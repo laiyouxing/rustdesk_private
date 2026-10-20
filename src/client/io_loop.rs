@@ -79,6 +79,15 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     pub sent_close_reason: bool,
+    /// 会话是否"彻底结束"（用户主动关闭 / 对端发来 CloseReason）。
+    /// 只有这种情况才终止自动重连环；其余退出（看门狗超时、直连流出错、
+    /// 网络波动）都应当继续自动重连。
+    ///
+    /// 注意不能继续用 `sent_close_reason` 判断：它只表示"已向对端发送过
+    /// 关闭原因"，而 KCP 会话退出时我们仍会给对端发一次关闭原因（KCP 没有
+    /// FIN，对端只能这样知道我们走了）——用它的结果就是看门狗/网络波动后
+    /// 自动重连被静默终止，用户只能手动重连。
+    pub no_reconnect: bool,
     // Relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
     punch_notify: Option<Arc<Notify>>,
@@ -154,6 +163,7 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            no_reconnect: false,
             punch_stream: None,
             punch_notify: None,
             punch_peer_addrs: None,
@@ -234,6 +244,22 @@ impl<T: InvokeUiSession> Remote<T> {
         self.phase3_kcp = None;
         // 重置上一会话遗留的换流确认状态
         self.punch_verify_deadline = None;
+        // 这些是"每轮会话"级状态，必须按轮复位：Remote 跨轮存活，
+        // 不复位会导致第 2 轮起行为异常：
+        //   - sent_close_reason：是"已向对端发过关闭原因"的去重标志，
+        //     不复位则第 2 轮起 send_close_reason 直接 return，对端收不到
+        //     关闭原因、只能等 KCP 约 60s 超时才察觉我们走了；
+        //   - no_reconnect：上一轮用户/对端结束会话会置 true，不复位则
+        //     新一轮首次退出就会错误地终止自动重连。
+        self.sent_close_reason = false;
+        self.no_reconnect = false;
+        // is_connected 也是每轮会话级状态，必须复位：登录成功后它跨轮存活，
+        // 会让下一轮在"还没登录"时就呈已连接状态（影响空闲判定等逻辑）。
+        self.is_connected = false;
+        // 空闲计时也要按轮复位：否则上一轮遗留的倒计时/旧时间戳会让
+        // 新一轮刚连上就立刻判定空闲。
+        self.inactivity_warning_remaining = None;
+        self.last_input_time = Instant::now();
 
         match Client::start(
             &self.handler.get_id(),
@@ -253,15 +279,15 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
-                // 预打洞直连（中继前 punch_direct_via_api 成功）同样需要"连通性
-                // 确认"：这条流从第一秒起就是直连，没有换流动作，若 KCP 实际不通
-                // （配对错误/单向 NAT/对称 NAT 假成功），用户侧就是画面卡住、
-                // 无任何提示。这里复用 Phase3 的看门狗：5s 内收到对端任何数据即
-                // 清除，超时则主动断开让自动重连重建中继。
-                if direct && kcp.is_some() {
-                    self.punch_verify_deadline = Some(Instant::now() + Duration::from_secs(5));
-                    log::info!("pre-relay direct connection: armed 5s liveness watchdog");
-                }
+                // 注意：预打洞直连路径**不**在这里武装连通性看门狗。
+                // 那条路径的 Client::start 内部已经在直连流上做完 secure_connection
+                // （应用层双向密钥交换），失败会自己回退中继流程——等价于一次
+                // 真实的应用层连通性验证，不存在"僵死无提示"。
+                // 而在这里武装会带来两个问题：① 它早于登录成功（is_connected），
+                // 主机等用户"接受/2FA"超过 5s 就会被误判为直连通；② 误判后
+                // direct==true 的轮次不会进入 Phase3，没有任何路径记账，熔断器
+                // 永不跳闸，会变成"5s 掐断→重连→再掐断"的死循环。
+                // 断流（网络波动）由主循环的 30s 无数据超时兜底。
                 // Phase3-specific channels (punch_stream/punch_notify already initialized before Client::start)
                 let punch_done = Arc::new(Notify::new());
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -435,12 +461,23 @@ impl<T: InvokeUiSession> Remote<T> {
                                         last_recv_time = Instant::now();
                                         // 直连换流确认：对端能在刚建立的直连流上发来数据，
                                         // 即证明这条流双向可用（配对正确、NAT 洞已开）。
+                                        // 到这里才记 phase3 success——换流那一刻只代表
+                                        // KCP 握手完成，对称 NAT 下常有"假成功"。
                                         if self.punch_verify_deadline.take().is_some() {
                                             log::info!("Phase3: direct stream verified (peer data received)");
+                                            crate::common::record_phase3_success();
                                         }
                                         if !received {
                                             received = true;
                                             self.handler.update_received(true);
+                                            // 本会话首次收到对端数据：若本就是直连会话
+                                            // （预打洞成功，没有换流动作、也就没有
+                                            // punch_verify_deadline），这里同样证明直连
+                                            // 可用，应重置熔断器——否则之前累计的失败
+                                            // 次数会一直挂着，把可用的直连也熔断掉。
+                                            if direct {
+                                                crate::common::record_phase3_success();
+                                            }
                                         }
                                         self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
                                         if !self.handle_msg_from_peer(bytes, &mut peer).await {
@@ -546,6 +583,14 @@ impl<T: InvokeUiSession> Remote<T> {
                                         "Phase3: direct stream not verified within 5s (no peer data), reconnecting to fall back to relay"
                                     );
                                     self.punch_verify_deadline = None;
+                                    // 必须记失败：换流时不再记 success，这里不记的话
+                                    // 熔断器永远不跳闸，每次重连都重新打洞→假成功
+                                    // →5s stall→重连，无限循环，用户每次连接都白等。
+                                    // 此处必然发生在登录成功之后（看门狗只在 Phase3
+                                    // 换流时武装，而 Phase3 需要先登录），所以这次
+                                    // 判定是可信的：已登录却 5s 收不到任何对端数据，
+                                    // 等于直连流不通。
+                                    crate::common::record_phase3_failure();
                                     self.handler.set_punch_status("reconnecting", "");
                                     break;
                                 }
@@ -596,6 +641,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                         log::info!("Inactivity timeout: closing connection");
                                         self.handler.msgbox("error", "Connection Error",
                                             "Disconnected due to inactivity", "");
+                                        // 空闲自动断开是"会话结束"语义：不能自动重连，
+                                        // 否则重连后又空闲 30min、再断、再连，空转 30 轮。
+                                        self.no_reconnect = true;
                                         break;
                                     }
                                     let remain = remaining - 1;
@@ -843,7 +891,10 @@ impl<T: InvokeUiSession> Remote<T> {
         if self.sent_close_reason {
             return;
         }
-        crate::common::reset_phase3_state();
+        // 注意：这里**不**重置 Phase3 熔断器。reset_phase3_state 只在用户
+        // 主动断开时调用（见 Data::Close 分支）——自动重连（看门狗超时/网络
+        // 波动/对端关闭）也会走到这里，一旦在这里重置，熔断器永远不跳闸：
+        // 假成功→看门狗 5s→重连→重置→再打洞，无限循环，用户每次连接都白等。
         let mut misc = Misc::new();
         misc.set_close_reason(reason.to_owned());
         let mut msg = Message::new();
@@ -884,7 +935,10 @@ impl<T: InvokeUiSession> Remote<T> {
         }
         // 给新流 50ms 稳定时间
         hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
-        crate::common::record_phase3_success();
+        // 注意：这里**不**记 phase3 success。换流只说明 KCP 握手完成，不代表
+        // 这条流真的通（对称 NAT 下常见"假成功"）。成功记账改在真正收到对端
+        // 数据时做（见主循环 peer.next() 的 Ok 分支），否则一次假成功就把
+        // 熔断器计数清零，看门狗超时又不记失败，导致无限重试打洞。
         self.handler.update_direct(Some(true));
         self.handler
             .set_connection_type(peer.is_secured(), true, "UDP", relay_server);
@@ -918,6 +972,11 @@ impl<T: InvokeUiSession> Remote<T> {
     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
         match data {
             Data::Close => {
+                // 用户主动断开：重置 Phase3 熔断器，下次连接重新尝试打洞。
+                // 自动重连不走这里（见 send_close_reason 的说明）。
+                crate::common::reset_phase3_state();
+                // 会话彻底结束：终止自动重连环。
+                self.no_reconnect = true;
                 self.send_close_reason(peer, "").await;
                 return false;
             }
@@ -1765,12 +1824,17 @@ impl<T: InvokeUiSession> Remote<T> {
                         if self.handler.is_view_camera() {
                             if !self.check_view_camera_support(&peer_version, &peer_platform) {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                                // 对端版本过低/不支持摄像头：重连也只是再弹一次同样的
+                                // 对话框，属"会话结束"语义。
+                                self.no_reconnect = true;
                                 return false;
                             }
                         }
                         if self.handler.is_terminal() {
                             if !self.check_terminal_support(&peer_version) {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                                // 同上：终端不受支持，不自动重连以免无限弹窗。
+                                self.no_reconnect = true;
                                 return false;
                             }
                         }
@@ -2254,7 +2318,9 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::CloseReason(c)) => {
-                        self.sent_close_reason = true; // The controlled end will close, no need to send close reason
+                        // 对端主动关闭：会话结束，不再自动重连（也不需要回发关闭原因）
+                        self.sent_close_reason = true;
+                        self.no_reconnect = true;
                         self.handler.msgbox("error", "Connection Error", &c, "");
                         return false;
                     }
@@ -2720,6 +2786,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     "Someone turns on privacy mode, exit",
                     "",
                 );
+                // 他人已开隐私模式：本会话必须结束，自动重连只会与对方互相抢占
+                self.no_reconnect = true;
                 return false;
             }
             back_notification::PrivacyModeState::PrvNotSupported => {
