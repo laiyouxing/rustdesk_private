@@ -213,6 +213,16 @@ impl KcpStream {
                 accept_res?
             }
         };
+        // 关键诊断：记录**最终选用**的连接号（Conv）。两端日志里这一行的 conv
+        // 必须相同；如果控制端与主机端打出的 conv 不一样，就说明两端各用了
+        // 自己的流（配对错误），表现正是"换流后画面卡死、无法操作"。
+        log::info!(
+            "KCP stream selected: side={} conn={:?} (prefer_connect={}, peer_addr={:?})",
+            if prefer_connect { "connector(connect)" } else { "host(accept)" },
+            conn_id,
+            prefer_connect,
+            peer_addr
+        );
         // 未 connect 模式（peer_addr 为 Some）使用的是进程级共享打洞 socket：
         // 立即申领使用凭证并随本 KcpStream 存活，期间看门狗/其它 STUN 探测
         // 会跳过，不会 recv_from 抢走本会话的报文。
@@ -262,7 +272,10 @@ impl KcpStream {
                             None => udp.send(&data.inner()).await.map(|_| ()),
                         };
                         if let Err(e) = send_res {
-                            log::debug!("KCP send error: {:?}", e);
+                            // 提到 info：KCP 泵死掉后会话就再也收发不了任何东西，
+                            // 而日志里此前只有 debug，定位不到（表现为"连上了但
+                            // 画面卡住、无任何提示"）。
+                            log::warn!("KCP send error (pump will stop): {:?}", e);
                             break;
                         }
                     }
@@ -282,7 +295,7 @@ impl KcpStream {
                                 if e.kind() == std::io::ErrorKind::ConnectionReset {
                                     continue;
                                 }
-                                log::debug!("KCP recv_from error: {:?}", e);
+                                log::warn!("KCP recv_from error (pump will stop): {:?}", e);
                                 break;
                             }
                         }
