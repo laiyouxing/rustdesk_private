@@ -189,38 +189,27 @@ impl KcpStream {
         let (stop_sender, stop_receiver) = oneshot::channel();
         Self::kcp_io(udp_socket.clone(), input, output, stop_receiver, peer_addr).await;
 
-        // Drive connect and accept concurrently on the same endpoint (both &self).
-        // Both directions must run to completion even though only one result is
-        // used: connect sends the packets that open the peer's NAT hole, and
-        // accept keeps the endpoint receiving. `join!` waits for both (each is
-        // bounded by `timeout`), which also matches the previous timing.
-        let conn_id = {
-            let connect_fut = Box::pin(endpoint.connect(timeout, 0, 0, Bytes::new()));
-            let accept_fut = Box::pin(async {
-                match tokio::time::timeout(timeout, endpoint.accept()).await {
-                    Ok(r) => r,
-                    Err(_) => Err(kcp_sys::error::Error::ConnectTimeout),
-                }
-            });
-            let (conn_res, accept_res) = tokio::join!(connect_fut, accept_fut);
-            if prefer_connect {
-                // 控制端：只用自己 connect 的那条流（主机端 accept 的正是它）。
-                // 失败绝不 fallback 到 accept 的流——主机会用它自己 accept 到的
-                // 流（conv 不同），两条流之间不通，换流后即"无法操作"。
-                log::debug!(
-                    "KCP race (connector side): connect={:?}, accept(discarded)={:?}",
-                    conn_res.as_ref().map(|_| "ok"),
-                    accept_res.as_ref().map(|_| "ok")
-                );
-                conn_res?
-            } else {
-                // 主机端：只用自己 accept 到的那条流（控制端 connect 的正是它）。
-                log::debug!(
-                    "KCP race (host side): accept={:?}, connect(discarded)={:?}",
-                    accept_res.as_ref().map(|_| "ok"),
-                    conn_res.as_ref().map(|_| "ok")
-                );
-                accept_res?
+        // 关键：两端**只驱动自己会用到的那一个 future**，绝不能同时驱动
+        // connect + accept。原因（kcp-sys endpoint.rs:593-595）：
+        //   状态机每次进入 Established 都会 `new_conn_sender.try_send(conv)`，
+        //   **不区分入站连接还是本端主动 connect**。
+        // 而本端 connect 只需 1 个 RTT 就 Established（收到 SYN-ACK），入站连接
+        // 要 1.5 个 RTT（收到 ACK+DATA）。所以主机端若同时驱动 connect，
+        // `accept()` 会先把**自己 connect 的 conv** 返回给它——两端就此各用各的
+        // 流，KCP 层面永不相通，但两边 endpoint 的 ping/pong 照跑：表现为
+        // "打洞成功、泵没死、应用层零数据"（本机实测 100% 复现）。
+        // 打洞本身由 punch_target_sustained 的空包 burst 完成，KCP SYN 对开洞
+        // 没有额外贡献，去掉对端那个用不到的 future 无副作用。
+        let conn_id = if prefer_connect {
+            // 控制端：只发 connect（主机端 accept 的正是它）
+            log::debug!("KCP race (connector side): connect only");
+            endpoint.connect(timeout, 0, 0, Bytes::new()).await?
+        } else {
+            // 主机端：只 accept（控制端 connect 的正是它）
+            log::debug!("KCP race (host side): accept only");
+            match tokio::time::timeout(timeout, endpoint.accept()).await {
+                Ok(r) => r?,
+                Err(_) => return Err(anyhow::anyhow!("KCP accept timeout")),
             }
         };
         // 关键诊断：记录**最终选用**的连接号（Conv）。两端日志里这一行的 conv
