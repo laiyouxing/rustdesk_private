@@ -2364,6 +2364,94 @@ class _About extends StatefulWidget {
 }
 
 class _AboutState extends State<_About> {
+  /// 手动检查更新中（按钮转圈并禁用）
+  bool _checkingUpdate = false;
+  Timer? _updateCheckTimeout;
+  static const _updateEvent = kCheckSoftwareUpdateFinish;
+  static const _updateHandlerName = 'about_check_update';
+
+  @override
+  void initState() {
+    super.initState();
+    // 与 common.dart 里的全局 handler 并行注册：事件按 handlerName 区分，
+    // 互不覆盖（见 models/native_model.dart: registerEventHandler）。
+    platformFFI.registerEventHandler(_updateEvent, _updateHandlerName,
+        (evt) async {
+      _onUpdateCheckFinished(evt);
+    });
+  }
+
+  @override
+  void dispose() {
+    _updateCheckTimeout?.cancel();
+    platformFFI.unregisterEventHandler(_updateEvent, _updateHandlerName);
+    super.dispose();
+  }
+
+  void _checkForUpdates() {
+    setState(() => _checkingUpdate = true);
+    // 触发一次真实的版本检查（走 api-server 的 /api/version/latest）
+    bind.mainGetSoftwareUpdateUrl();
+    // 服务端/网络异常时不会回事件，超时兜底，避免按钮一直转圈
+    _updateCheckTimeout?.cancel();
+    _updateCheckTimeout = Timer(const Duration(seconds: 15), () {
+      if (!mounted || !_checkingUpdate) return;
+      setState(() => _checkingUpdate = false);
+      _showUpdateResultDialog(
+        title: '检查更新',
+        content: '检查超时，请检查网络或服务器配置后重试。',
+        url: '',
+      );
+    });
+  }
+
+  void _onUpdateCheckFinished(Map<String, dynamic> evt) {
+    if (!mounted || !_checkingUpdate) return;
+    _updateCheckTimeout?.cancel();
+    final url = evt['url'] is String ? evt['url'] as String : '';
+    setState(() => _checkingUpdate = false);
+    if (url.isNotEmpty) {
+      _showUpdateResultDialog(
+        title: '发现新版本',
+        content: '有新版本可用，是否现在前往下载？',
+        url: url,
+      );
+    } else {
+      _showUpdateResultDialog(
+        title: '检查更新',
+        content: '当前已是最新版本。',
+        url: '',
+      );
+    }
+  }
+
+  void _showUpdateResultDialog(
+      {required String title,
+      required String content,
+      required String url}) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(content),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('确定'),
+          ),
+          if (url.isNotEmpty)
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                launchUrlString(url);
+              },
+              child: const Text('下载'),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return futureBuilder(future: () async {
@@ -2423,6 +2511,21 @@ class _AboutState extends State<_About> {
                     translate('Website'),
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
+              // 手动检查更新
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _checkingUpdate ? null : _checkForUpdates,
+                  icon: _checkingUpdate
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.system_update_alt, size: 16),
+                  label: Text(_checkingUpdate ? '正在检查…' : '检查更新'),
+                ).marginSymmetric(vertical: 4.0),
+              ),
               Container(
                 decoration: const BoxDecoration(color: Color(0xFF2c8cff)),
                 padding:

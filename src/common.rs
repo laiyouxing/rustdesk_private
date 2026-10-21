@@ -1262,6 +1262,17 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     } else {
         *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
         *SOFTWARE_UPDATE_VERSION.lock().unwrap() = "".to_string();
+        // 无新版本时也要发一次结束事件：设置页的"检查更新"按钮需要确定的
+        // 结束信号，否则用户点了按钮只能靠超时才知道结果。
+        #[cfg(feature = "flutter")]
+        {
+            let mut m = std::collections::HashMap::new();
+            m.insert("name", "check_software_update_finish");
+            m.insert("url", "");
+            if let Ok(data) = serde_json::to_string(&m) {
+                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+            }
+        }
     }
     Ok(())
 }
