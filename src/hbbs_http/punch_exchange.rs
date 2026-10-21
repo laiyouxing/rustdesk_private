@@ -177,11 +177,14 @@ async fn client_for(url: &str) -> ResultType<reqwest::Client> {
     let tls_type = hbb_common::tls::get_cached_tls_type(&tls_url);
     let is_tls_not_cached = tls_type.is_none();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = crate::hbbs_http::create_http_client_async(tls_type, true);
+    // 是否接受无效证书优先用缓存值（与心跳/post_request 一致，缓存才能收敛到同一个
+    // client、共用一条连接）；未缓存时默认 true，保持原有的"兼容自签名证书"行为。
+    let danger = hbb_common::tls::get_cached_tls_accept_invalid_cert(&tls_url).unwrap_or(true);
+    let client = crate::hbbs_http::create_http_client_async(tls_type, danger);
     if is_tls_not_cached {
         let probe = client.get(url).send().await;
         if probe.is_err() {
-            let client2 = crate::hbbs_http::create_http_client_async(TlsType::NativeTls, true);
+            let client2 = crate::hbbs_http::create_http_client_async(TlsType::NativeTls, danger);
             if client2.get(url).send().await.is_ok() {
                 return Ok(client2);
             }

@@ -1200,11 +1200,15 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_not_cached = tls_type.is_none();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, true);
+    // 与心跳/打洞上报保持一致：优先用缓存的"是否接受无效证书"，未缓存时默认
+    // true（保持原有的兼容自签名证书行为）。硬编码 true 会让这条路径与心跳
+    // 落到不同的 client 缓存 key，各占一条连接。
+    let danger = get_cached_tls_accept_invalid_cert(tls_url).unwrap_or(true);
+    let client = create_http_client_async(tls_type, danger);
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(_) if is_tls_not_cached => {
-            let client = create_http_client_async(TlsType::NativeTls, true);
+            let client = create_http_client_async(TlsType::NativeTls, danger);
             client.get(&url).send().await?
         }
         Err(e) => return Err(e.into()),
