@@ -15,6 +15,16 @@ use kcp_sys::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
+/// 进程级累计收到的 KCP 数据报数（所有 kcp_io 收包循环共享）。
+/// 仅用于诊断：直连"握手成功但对端零数据"时，用它的增量区分
+/// 「对端根本没发/包到不了」与「收到了但应用层没数据」。
+static KCP_RX_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 读取累计收到的 KCP 数据报数（诊断用）。
+pub fn kcp_rx_total() -> usize {
+    KCP_RX_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct KcpStream {
     _endpoint: KcpEndpoint,
     stop_sender: Option<oneshot::Sender<()>>,
@@ -285,6 +295,10 @@ impl KcpStream {
                                 if size < std::mem::size_of::<KcpPacketHeader>() {
                                     continue;
                                 }
+                                // 全局计数：用于判断换流后"收方向是否真的一个包都没有"。
+                                // 直连假成功时这是单侧可判定的关键指标——rx 不增长说明
+                                // 对端根本没在发（或包到不了），而不是应用层/解密问题。
+                                KCP_RX_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 input
                                     .send(BytesMut::from(&buf[..size]).into())
                                     .await.ok();

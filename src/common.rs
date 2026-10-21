@@ -76,7 +76,11 @@ static PHASE3_RETRY_COUNT: std::sync::atomic::AtomicU32 =
 // 手动接受久）把打洞长期禁掉。
 static PHASE3_LAST_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
-const PHASE3_MAX_RETRIES: u32 = 3;
+// 只允许一次尝试：本机实测连续 6 次"KCP 握手成功但零数据"，每次要付
+// 2.5s 打洞 + 5s 看门狗 ≈ 7.5s 画面卡死。3 次意味着每次重连白卡 22s。
+// 直连要么一次就通，要么这个环境下根本不通——一次失败即熔断，5 分钟后
+// 再给一次机会（PHASE3_RETRY_WINDOW 衰减）。
+const PHASE3_MAX_RETRIES: u32 = 1;
 // 失败计数窗口：距上次失败超过该时长则重新从 1 开始计。
 // 5 分钟 ≈ 用户换一个对端/网络环境的时间尺度，兼顾"连续失败快速熔断"与
 // "不要把一次误判固化成永久降级"。

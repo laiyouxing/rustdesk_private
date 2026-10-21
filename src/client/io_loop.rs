@@ -111,6 +111,10 @@ pub struct Remote<T: InvokeUiSession> {
     // 无法操作远程主机。收到对端在直连上的任何数据即清除；超时未确认则
     // 主动断开让自动重连重建中继，而不是僵死在一条不通的流上。
     punch_verify_deadline: Option<Instant>,
+    /// 武装换流确认看门狗时，进程级 KCP 收包计数的快照。
+    /// 看门狗超时后用差值判断：rx 没增长 → 对端根本没发（或包到不了）；
+    /// rx 有增长但没应用数据 → 收到了但上层没用上（解密/配对问题）。
+    punch_verify_rx_base: usize,
     // Inactivity timeout: track last user input for auto-disconnect
     last_input_time: Instant,
     inactivity_warning_remaining: Option<u32>,
@@ -172,6 +176,7 @@ impl<T: InvokeUiSession> Remote<T> {
             phase3_kcp: None,
             phase3_rt_stop: None,
             punch_verify_deadline: None,
+            punch_verify_rx_base: 0,
             last_input_time: Instant::now(),
             inactivity_warning_remaining: None,
         }
@@ -579,8 +584,16 @@ impl<T: InvokeUiSession> Remote<T> {
                             // 避免僵死在不通的流上——否则用户完全无法操作远程主机。
                             if let Some(deadline) = self.punch_verify_deadline {
                                 if Instant::now() >= deadline {
+                                    // rx 增量是关键证据：
+                                    //   0   → 对端换流后一个包都没发过来（或到不了）
+                                    //   >0  → 包收到了，但没形成应用层数据（解密/配对/上层）
+                                    let rx_now = crate::kcp_stream::kcp_rx_total();
+                                    let rx_delta = rx_now.saturating_sub(self.punch_verify_rx_base);
                                     log::warn!(
-                                        "Phase3: direct stream not verified within 5s (no peer data), reconnecting to fall back to relay"
+                                        "Phase3: direct stream not verified within 5s (no peer data), kcp_rx delta={} (base={} now={}), reconnecting to fall back to relay",
+                                        rx_delta,
+                                        self.punch_verify_rx_base,
+                                        rx_now
                                     );
                                     self.punch_verify_deadline = None;
                                     // 必须记失败：换流时不再记 success，这里不记的话
@@ -959,6 +972,12 @@ impl<T: InvokeUiSession> Remote<T> {
             log::warn!("Phase3: failed to send direct-stream probe: {}", e);
         }
         self.punch_verify_deadline = Some(Instant::now() + Duration::from_secs(5));
+        // 记录此刻的收包计数，超时时用它判断收方向到底有没有包
+        self.punch_verify_rx_base = crate::kcp_stream::kcp_rx_total();
+        log::info!(
+            "Phase3: armed 5s verify watchdog (kcp_rx_total={})",
+            self.punch_verify_rx_base
+        );
         // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start 返回的
         // kcp 恒为 None，不更新的话断连时不会发 close_reason，对端要等 60s
         // KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
