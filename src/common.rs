@@ -1200,10 +1200,14 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let tls_type = get_cached_tls_type(tls_url);
     let is_tls_not_cached = tls_type.is_none();
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    // 与心跳/打洞上报保持一致：优先用缓存的"是否接受无效证书"，未缓存时默认
-    // true（保持原有的兼容自签名证书行为）。硬编码 true 会让这条路径与心跳
-    // 落到不同的 client 缓存 key，各占一条连接。
-    let danger = get_cached_tls_accept_invalid_cert(tls_url).unwrap_or(true);
+    // api-server 为自签名证书（IP:端口，证书 CN 不匹配），更新检查固定接受无效证书。
+    // 原先取 TLS 缓存值：若缓存被其他请求写为 false（create_http_client 成功后的
+    // upsert_tls_cache(_, _, unwrap_or(false))），会按 false 校验证书 → 自签名证书
+    // 校验失败；且此路径没有心跳 post_request_ 那样的 danger=true 重试，一失败就
+    // 直接返回错误，表现为"更新提示证书校验失败"。
+    // 固定 true 与 is_custom_client 的下载路径（create_http_client(_, true)）一致，
+    // 代价仅可能与 danger=false 的连接各占一条缓存，功能优先。
+    let danger = true;
     let client = create_http_client_async(tls_type, danger);
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
