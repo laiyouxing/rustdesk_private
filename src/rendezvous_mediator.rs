@@ -402,7 +402,12 @@ impl RendezvousMediator {
                 let peer_addr_bytes = ph.socket_addr.clone();
                 let provided_relay_server = ph.relay_server.clone();
                 let relay_servers: Vec<String> = ph.relay_servers.to_vec();
-                let punch_nat_type = ph.nat_type;
+                // 回显**本机（host）自己的** NAT 类型：hbbs 会把它写进给控制端的
+                // PunchHoleResponse.nat_type，控制端据此做 NAT 错峰判定（宽容端先打）。
+                // 原先回显 ph.nat_type（控制端发来的值），控制端收到的其实是自己的
+                // 类型，错峰条件恒不成立（offset 恒 0），功能失效。
+                let punch_nat_type = NatType::from_i32(Config::get_nat_type())
+                    .unwrap_or(NatType::UNKNOWN_NAT);
                 tokio::spawn(async move {
                     // If hbbs provided relay candidates, test latency and sort them.
                     // The sorted list (top 3) is sent back so A can also test and

@@ -3883,10 +3883,29 @@ pub async fn punch_direct_via_api(
     // 否则"等地址 10s + sync 对齐 10s"会把 30s 预算吃光，打洞只剩 0-3s，
     // 多地址轮转形同虚设。因此 sync 等待最多等到"死线前 10s"。
     const PUNCH_MIN_WINDOW: Duration = Duration::from_secs(10);
+    // NAT 类型错峰（与 relay_upgrade_task 同一规则）：宽容端（ASYMMETRIC）先打。
+    // 对端类型取自 api-server 交换的 meta.nat_type（比 PunchHoleResponse 回显可靠）。
+    let my_nat_type = crate::get_nat_type(100).await;
+    let mut sync_offset_ms: i64 = 0;
+    if my_nat_type == NatType::ASYMMETRIC as i32 && peer_symmetric {
+        sync_offset_ms = -(PUNCH_INITIATOR_LEAD_MS as i64);
+    } else if my_nat_type == NatType::SYMMETRIC as i32
+        && peer_info.meta.nat_type == "cone"
+    {
+        sync_offset_ms = PUNCH_FOLLOWER_DELAY_MS as i64;
+    }
+    if sync_offset_ms != 0 {
+        log::info!(
+            "punch_direct_via_api: NAT 错峰生效：本端 nat={} / 对端 {}，offset={}ms（宽容端先打）",
+            my_nat_type,
+            peer_info.meta.nat_type,
+            sync_offset_ms
+        );
+    }
     let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
     let target_sync = sync_at_ms.max(peer_sync_at);
     if target_sync > 0 {
-        let wait = target_sync - now_ms_local();
+        let wait = target_sync + sync_offset_ms - now_ms_local();
         if wait > 0 && wait <= 30_000 {
             let now = std::time::Instant::now();
             let wanted = now + Duration::from_millis(wait as u64);
@@ -4587,23 +4606,26 @@ pub async fn relay_upgrade_task(
         // 对端 Cone/PortRestricted 会因端口不匹配丢弃 → 打洞失败。
         // host 端（relay_phase3_punch_to_peer）保持按 sync 同时打，本端单方面偏移
         // 即可实现错峰；同类型/未知 offset=0，保持现有同步同时打不变。
-        let my_nat_type = Config::get_nat_type();
+        // 本端类型与 _start_inner 广播时同源（桌面端走 ipc service 探测，失败返回 0
+        // 即不错峰，安全降级），保证"广播什么就用什么判定"，避免两来源不一致导致错配。
+        let my_nat_type = crate::get_nat_type(100).await;
         let mut sync_offset_ms: i64 = 0;
         if my_nat_type == NatType::ASYMMETRIC as i32
             && peer_nat_type == NatType::SYMMETRIC as i32
         {
             sync_offset_ms = -(PUNCH_INITIATOR_LEAD_MS as i64);
-            log::info!(
-                "[NAT穿透] 本端 ASYMMETRIC(宽容) / 对端 SYMMETRIC(严格)：提前 {}ms 发起打洞",
-                PUNCH_INITIATOR_LEAD_MS
-            );
         } else if my_nat_type == NatType::SYMMETRIC as i32
             && peer_nat_type == NatType::ASYMMETRIC as i32
         {
             sync_offset_ms = PUNCH_FOLLOWER_DELAY_MS as i64;
+        }
+        // 错峰只影响第 1 轮的起始时刻（后续轮 target_sync 已过期），日志仅首轮打印
+        if _round == 0 && sync_offset_ms != 0 {
             log::info!(
-                "[NAT穿透] 本端 SYMMETRIC(严格) / 对端 ASYMMETRIC(宽容)：延迟 {}ms 配合打洞",
-                PUNCH_FOLLOWER_DELAY_MS
+                "[NAT穿透] NAT 错峰生效：本端 nat={} / 对端 nat={}，起始 offset={}ms（宽容端先打）",
+                my_nat_type,
+                peer_nat_type,
+                sync_offset_ms
             );
         }
         if target_sync > 0 {
