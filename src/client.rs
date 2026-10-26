@@ -620,7 +620,7 @@ impl Client {
                             return Ok((
                                 (direct_stream, true, pk, Some(kcp), "UDP"),
                                 (
-                                    my_nat_type,
+                                    feedback,
                                     rendezvous_server,
                                     relay_server,
                                     punched_peer_addr,
@@ -709,7 +709,7 @@ impl Client {
                     log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
                     return Ok((
                         (stream, true, lan_pk, None, "LAN"),
-                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type),
+                        (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type),
                         false,
                     ));
                 }
@@ -720,7 +720,7 @@ impl Client {
         }
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type),
+            (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type),
             false,
         ));
     }
