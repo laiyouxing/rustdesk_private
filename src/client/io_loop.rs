@@ -275,7 +275,7 @@ impl<T: InvokeUiSession> Remote<T> {
         )
         .await
         {
-            Ok(((mut peer, direct, pk, mut kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port))) => {
+            Ok(((mut peer, direct, pk, mut kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port, peer_nat_type))) => {
                 self.handler
                     .connection_round_state
                     .lock()
@@ -382,7 +382,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             rt.block_on(async move {
                                 let ok = relay_upgrade_task(
                                     p2p_addrs, n, s, kcp_handle, punch_port,
-                                    phase3_out_tx, phase3_peer, phase3_tcp, cancel,
+                                    phase3_out_tx, phase3_peer, phase3_tcp, cancel, peer_nat_type,
                                 ).await;
                                 succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                                 d.notify_one();

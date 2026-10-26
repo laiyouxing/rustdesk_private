@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16, i32),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -264,7 +264,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0, 0),
                 false,
             ));
         }
@@ -278,7 +278,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0, 0),
                 false,
             ));
         }
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16, i32),
         bool,
     )> {
         let mut start = Instant::now();
@@ -626,6 +626,7 @@ impl Client {
                                     punched_peer_addr,
                                     Vec::new(),
                                     udp_nat_port,
+                                    peer_nat_type,
                                 ),
                                 false,
                             ));
@@ -708,7 +709,7 @@ impl Client {
                     log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
                     return Ok((
                         (stream, true, lan_pk, None, "LAN"),
-                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type),
                         false,
                     ));
                 }
@@ -719,7 +720,7 @@ impl Client {
         }
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type),
             false,
         ));
     }

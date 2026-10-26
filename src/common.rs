@@ -2727,6 +2727,15 @@ pub const PUNCH_BURST_INTERVAL_MS: u64 = 200;
 /// 使一端永远走不到精确地址）。保留"精确 + 小幅漂移"。
 pub const PUNCH_OFFSETS: &[i32] = &[0, 1, -1, 2, -2, 3, -3, 5, -5];
 
+/// NAT 类型错峰：宽容端（ASYMMETRIC，映射端口固定）提前发起打洞的毫秒数。
+/// 原理：宽容端先打 → 严格端（SYMMETRIC）的 NAT 记录其固定端口，回包可被
+/// Cone NAT 放行；反之严格端先打，其源端口是对当前目标临时分配的（≠STUN
+/// 端口），对端 Cone/PortRestricted 会因端口不匹配丢弃 → 失败。
+/// 提前量须小于 PUNCH_EXACT_MS，保证两端打洞窗口仍重叠。
+pub const PUNCH_INITIATOR_LEAD_MS: u64 = 2_000;
+/// NAT 类型错峰：严格端（SYMMETRIC）延迟配合的毫秒数，让对端（宽容端）先打。
+pub const PUNCH_FOLLOWER_DELAY_MS: u64 = 4_000;
+
 /// NTP 服务器（用于双方时钟对齐的兜底同步）
 static NTP_SERVERS: [&str; 4] = [
     "pool.ntp.org:123",
@@ -4083,6 +4092,8 @@ pub async fn relay_upgrade_task(
     phase3_peer_rx: Arc<std::sync::Mutex<Vec<PunchAddrInfo>>>,
     phase3_tcp_rx: Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
     cancel: hbb_common::tokio_util::sync::CancellationToken,
+    // 对端 NAT 类型（NatType as i32）：用于 NAT 错峰——宽容端（ASYMMETRIC）先打。
+    peer_nat_type: i32,
 ) -> bool {
     // 先等 relay 稳定再启动任何网络操作，避免与中继抢 tokio 运行时资源
     hbb_common::tokio::time::sleep(Duration::from_secs(3)).await;
@@ -4570,18 +4581,45 @@ pub async fn relay_upgrade_task(
         // 只等自己的 sync_at 没有意义——对端发来的 sync_at 也必须参与，
         // 两端才会在同一个绝对时刻同时发起（修复前对端 sync_at 只进日志）。
         let target_sync = sync_at_ms.max(peer_sync_at_ms);
+        // NAT 类型错峰：让更宽容的一端（ASYMMETRIC，映射端口固定）先发起打洞。
+        // 宽容端先打 → 严格端（SYMMETRIC）的 NAT 记录其固定端口，回包才能被 Cone
+        // NAT 放行；反之严格端先打，其源端口是对当前目标临时分配的（≠STUN 端口），
+        // 对端 Cone/PortRestricted 会因端口不匹配丢弃 → 打洞失败。
+        // host 端（relay_phase3_punch_to_peer）保持按 sync 同时打，本端单方面偏移
+        // 即可实现错峰；同类型/未知 offset=0，保持现有同步同时打不变。
+        let my_nat_type = Config::get_nat_type();
+        let mut sync_offset_ms: i64 = 0;
+        if my_nat_type == NatType::ASYMMETRIC as i32
+            && peer_nat_type == NatType::SYMMETRIC as i32
+        {
+            sync_offset_ms = -(PUNCH_INITIATOR_LEAD_MS as i64);
+            log::info!(
+                "[NAT穿透] 本端 ASYMMETRIC(宽容) / 对端 SYMMETRIC(严格)：提前 {}ms 发起打洞",
+                PUNCH_INITIATOR_LEAD_MS
+            );
+        } else if my_nat_type == NatType::SYMMETRIC as i32
+            && peer_nat_type == NatType::ASYMMETRIC as i32
+        {
+            sync_offset_ms = PUNCH_FOLLOWER_DELAY_MS as i64;
+            log::info!(
+                "[NAT穿透] 本端 SYMMETRIC(严格) / 对端 ASYMMETRIC(宽容)：延迟 {}ms 配合打洞",
+                PUNCH_FOLLOWER_DELAY_MS
+            );
+        }
         if target_sync > 0 {
-            let wait = target_sync - now_ms();
+            let wait = target_sync + sync_offset_ms - now_ms();
             if wait > 0 && wait <= 30_000 {
                 log::info!(
-                    "Phase3: waiting {}ms until sync_at {} (own={}, peer={}) to start punching",
+                    "Phase3: waiting {}ms until sync_at {} (own={}, peer={}, offset={}) to start punching",
                     wait,
                     target_sync,
                     sync_at_ms,
-                    peer_sync_at_ms
+                    peer_sync_at_ms,
+                    sync_offset_ms
                 );
                 hbb_common::tokio::time::sleep(Duration::from_millis(wait as u64)).await;
             }
+            // wait <= 0（已过约定时刻，或提前量超过剩余等待）：立即开始，实现"先打"
         }
 
         // ===== 阶段 A：在精确地址上"持续打洞" =====
