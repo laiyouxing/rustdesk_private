@@ -1409,7 +1409,10 @@ jobs:
         run: git submodule update --init --recursive
 
       - name: Set Swap Space
-        if: ${{ matrix.job.arch == 'x86_64' }}
+        # armv7 走 QEMU 编译 rustdesk 时 LLVM 必 OOM（容器内 mkswap 会报
+        # "/swapfile is mounted" 而失败）；swap 是内核级资源，host 层创建后
+        # run-on-arch 容器内的 QEMU 进程即可使用。x86_64 原生编译同样需要。
+        if: matrix.job.arch == 'x86_64' || matrix.job.arch == 'armv7'
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
@@ -1455,7 +1458,9 @@ jobs:
       - name: Install vcpkg dependencies
         if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
         run: |
-          sudo apt install -y libva-dev && apt show libva-dev
+          # libx11-dev：vcpkg ffmpeg 编 vaapi 时需要 X11/Xlib.h（va_x11.h 包含它），
+          # 缺了会 fatal error: X11/Xlib.h: No such file or directory
+          sudo apt install -y libva-dev libx11-dev && apt show libva-dev
           if ! $VCPKG_ROOT/vcpkg \
             install \
             --triplet ${{ matrix.job.vcpkg-triplet }} \
