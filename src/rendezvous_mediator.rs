@@ -454,7 +454,8 @@ impl RendezvousMediator {
                                 socket_addr: peer_addr_bytes,
                                 id: Config::get_id(),
                                 relay_server: final_relay,
-                                nat_type: punch_nat_type,
+                                // protobuf 枚举字段类型为 EnumOrUnknown<NatType>
+                                nat_type: punch_nat_type.into(),
                                 version: crate::VERSION.to_owned(),
                                 upnp_port: crate::common::get_upnp_port() as _,
                                 relay_servers: final_candidates.into(),
