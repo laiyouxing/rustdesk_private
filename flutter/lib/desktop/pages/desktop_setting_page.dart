@@ -12,6 +12,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
+import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/printer_model.dart';
@@ -2413,7 +2414,7 @@ class _AboutState extends State<_About> {
     if (url.isNotEmpty) {
       _showUpdateResultDialog(
         title: '发现新版本',
-        content: '有新版本可用，是否现在前往下载？',
+        content: '发现新版本，是否现在更新？更新将自动完成下载与安装。',
         url: url,
       );
     } else {
@@ -2429,6 +2430,13 @@ class _AboutState extends State<_About> {
       {required String title,
       required String content,
       required String url}) {
+    // 安装版（Windows/macOS）支持自动更新：下载 → 确认 → 自动安装，
+    // 与主页更新卡片（handleUpdate）流程完全一致；
+    // 便携版/绿色版无法自动安装，回退为浏览器打开下载页。
+    final bool canAutoUpdate = url.isNotEmpty &&
+        !url.contains('rustdesk.com') &&
+        (isWindows || isMacOS) &&
+        bind.mainIsInstalled();
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -2437,15 +2445,19 @@ class _AboutState extends State<_About> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('确定'),
+            child: const Text('取消'),
           ),
           if (url.isNotEmpty)
             TextButton(
               onPressed: () {
                 Navigator.of(ctx).pop();
-                launchUrlString(url);
+                if (canAutoUpdate) {
+                  handleUpdate(url);
+                } else {
+                  launchUrlString(url);
+                }
               },
-              child: const Text('下载'),
+              child: Text(canAutoUpdate ? '更新' : '下载'),
             ),
         ],
       ),
