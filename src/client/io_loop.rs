@@ -623,17 +623,22 @@ impl<T: InvokeUiSession> Remote<T> {
                             // Phase3 穿透阶段流水：把最新阶段描述转发到 UI 磁贴，
                             // 让用户看到"开始→等地址→等同步→阶段A→B→C→结果"全流程。
                             // try_recv 非阻塞；channel 断开（打洞线程退出）时清空。
-                            if let Some(rx) = &self.phase3_stage_rx {
-                                loop {
-                                    match rx.try_recv() {
-                                        Ok(stage) => {
-                                            log::info!("Phase3 stage: {}", stage);
-                                            self.handler.set_punch_status("trying", &stage);
-                                        }
-                                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                            self.phase3_stage_rx = None;
-                                            break;
+                            // 关键：仅未直连时转发——换流成功后 channel 里可能还有
+                            // 残留的"阶段A"消息，若继续转发会把 try_apply_punch_upgrade
+                            // 置的 succeeded 覆盖回 trying（盾牌已绿、文字还在穿透中）。
+                            if !direct {
+                                if let Some(rx) = &self.phase3_stage_rx {
+                                    loop {
+                                        match rx.try_recv() {
+                                            Ok(stage) => {
+                                                log::info!("Phase3 stage: {}", stage);
+                                                self.handler.set_punch_status("trying", &stage);
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                                self.phase3_stage_rx = None;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
