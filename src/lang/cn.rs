@@ -765,5 +765,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("nat_type_unknown", "未知"),
         ("nat_type_asymmetric", "非对称型(锥型)"),
         ("nat_type_symmetric", "对称型"),
+        ("Direct Success Rate", "直连成功率"),
+        ("peer_cone_nat", "对端锥形"),
+        ("peer_symmetric_nat", "对端对称"),
     ].iter().cloned().collect();
 }

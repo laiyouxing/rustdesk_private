@@ -3796,14 +3796,33 @@ Widget _buildSymmetricNatWarning() {
     2: translate('nat_type_symmetric'),
   };
   final natStr = natLabels[nat] ?? 'NAT${nat}';
+  // 直连成功率估算（基于经典 NAT 穿透组合 + 本客户端 Phase3 机制：
+  // 对称端主动发包 + 锥形端 accept + delta 端口预测）：
+  //   锥形↔锥形 ≈95%（两端映射均固定，同时打洞必通）
+  //   锥形↔对称 ≈75%（锥形端收任意源 + 对称端主动发包建立映射）
+  //   对称↔对称 ≈15%（需双向端口预测都命中，很难）
+  // 本端视角取代表性概览值（对端类型未知），细分见 tooltip。
+  final probOverview = {
+    1: '90%',
+    2: '50%',
+  };
+  final probDetail = {
+    1: '${translate('Direct Success Rate')}: ${translate('peer_cone_nat')}≈95%, ${translate('peer_symmetric_nat')}≈75%',
+    2: '${translate('Direct Success Rate')}: ${translate('peer_cone_nat')}≈65%, ${translate('peer_symmetric_nat')}≈15%',
+  };
   final color = nat == 2 ? Colors.orange : Colors.green;
   final icon = nat == 2
       ? Icons.warning_amber_rounded
       : Icons.language;
-  final shortLabel = natStr;
+  // 简短标签：NAT 类型 + 直连概率备注（未知类型不给概率）
+  final shortLabel = probOverview[nat] != null
+      ? '$natStr · ${translate('Direct Success Rate')}≈${probOverview[nat]}'
+      : natStr;
+  final probLine = probDetail[nat];
+  final probSuffix = probLine != null ? '\n$probLine' : '';
   final fullTip = nat == 2
-      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natStr'
-      : '${translate('NAT')}: $natStr\n${translate('Public Address')}: $publicAddr';
+      ? '${translate('symmetric_nat_warning')}\n${translate('NAT')}: $natStr$probSuffix'
+      : '${translate('NAT')}: $natStr\n${translate('Public Address')}: $publicAddr$probSuffix';
 
   return Container(
     color: color.shade100,
