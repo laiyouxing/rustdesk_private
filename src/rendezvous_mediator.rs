@@ -18,7 +18,7 @@ use hbb_common::{
     },
     futures::future::join_all,
     log,
-    protobuf::Message as _,
+    protobuf::{Enum, Message as _},
     rendezvous_proto::*,
     sleep,
     socket_client::{self, connect_tcp, is_ipv4, new_udp_for},
