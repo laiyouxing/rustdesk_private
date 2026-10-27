@@ -940,6 +940,7 @@ jobs:
                libpam0g-dev \
                libpulse-dev \
                libva-dev \
+               libx11-dev \
                libxcb-randr0-dev \
                libxcb-shape0-dev \
                libxcb-xfixes0-dev \
@@ -1218,6 +1219,7 @@ jobs:
                libpam0g-dev \
                libpulse-dev \
                libva-dev \
+               libx11-dev \
                libxcb-randr0-dev \
                libxcb-shape0-dev \
                libxcb-xfixes0-dev \
@@ -1512,6 +1514,7 @@ jobs:
                libpam0g-dev \
                libpulse-dev \
                libva-dev \
+               libx11-dev \
                libxcb-randr0-dev \
                libxcb-shape0-dev \
                libxcb-xfixes0-dev \
@@ -1616,6 +1619,9 @@ jobs:
             pushd /workspace
             export CARGO_INCREMENTAL=0
             export DEB_ARCH=${{ matrix.job.deb_arch }}
+            # 把 BUILD_VERSION 传进容器：build.py 的 get_version() 优先读它，
+            # 不传则回退读 Cargo.toml（版本滞后），deb 包名会带旧版本号
+            export BUILD_VERSION=${{ env.BUILD_VERSION }}
             python3 ./build.py --flutter --skip-cargo
             for name in rustdesk*??.deb; do
               mv "$name" "${name%%.deb}-${{ matrix.job.arch }}.deb"
@@ -1629,6 +1635,8 @@ jobs:
                 sed -i "s/linux\/x64/linux\/arm64/g" ./res/rpm-flutter.spec
                 ;;
             esac
+            # spec 的 Version 原为硬编码旧版本号，替换为当前构建版本
+            sed -i "s/^Version:.*/Version: ${{ env.VERSION }}/" ./res/rpm-flutter.spec
             HBB=`pwd` rpmbuild ./res/rpm-flutter.spec -bb
             pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
             for name in rustdesk*??.rpm; do
@@ -1643,6 +1651,8 @@ jobs:
                 sed -i "s/linux\/x64/linux\/arm64/g" ./res/rpm-flutter-suse.spec
                 ;;
             esac
+            # spec 的 Version 原为硬编码旧版本号，替换为当前构建版本
+            sed -i "s/^Version:.*/Version: ${{ env.VERSION }}/" ./res/rpm-flutter-suse.spec
             HBB=`pwd` rpmbuild ./res/rpm-flutter-suse.spec -bb
             pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
             for name in rustdesk*??.rpm; do
@@ -1774,6 +1784,8 @@ jobs:
             ls -l "${PWD}"
           dockerRunArgs: |
             --volume "${PWD}:/workspace"
+            # QEMU armv7 编译 rustdesk 时 LLVM 易 OOM，需要 privileged 才能 swapon
+            --privileged
           shell: /bin/bash
           install: |
             apt-get update
@@ -1796,6 +1808,7 @@ jobs:
                libpam0g-dev \
                libpulse-dev \
                libva-dev \
+               libx11-dev \
                libxcb-randr0-dev \
                libxcb-shape0-dev \
                libxcb-xfixes0-dev \
@@ -1811,6 +1824,9 @@ jobs:
                xz-utils \
                zip \
                libssl-dev
+            # armv7 QEMU 下编译 rustdesk 时 LLVM 易 OOM（LLVM ERROR: out of memory），
+            # 创建 4G swap 缓解（runner 内存约 7G，QEMU + rustc 易超限）
+            dd if=/dev/zero of=/swapfile bs=1M count=4096 && mkswap /swapfile && swapon /swapfile || true
             # arm-linux needs CMake and vcokg built from source as there
             # are no prebuilts available from Kitware and Microsoft
             if [ "${{ matrix.job.vcpkg-triplet }}" = "arm-linux" ]; then
