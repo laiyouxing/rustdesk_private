@@ -4113,6 +4113,10 @@ pub async fn relay_upgrade_task(
     cancel: hbb_common::tokio_util::sync::CancellationToken,
     // 对端 NAT 类型（NatType as i32）：用于 NAT 错峰——宽容端（ASYMMETRIC）先打。
     peer_nat_type: i32,
+    // 穿透阶段流水线：各阶段 send 一行描述，io_loop 转发到 UI 磁贴，
+    // 让用户看到全流程（开始→STUN→等地址→等同步→阶段A→阶段B→阶段C→结果），
+    // 便于判断卡在哪一步。std mpsc 无阻塞，任务在独立线程运行。
+    stage_tx: std::sync::mpsc::Sender<String>,
 ) -> bool {
     // 先等 relay 稳定再启动任何网络操作，避免与中继抢 tokio 运行时资源
     hbb_common::tokio::time::sleep(Duration::from_secs(3)).await;
@@ -4156,6 +4160,31 @@ pub async fn relay_upgrade_task(
             "relay_upgrade_task: SYMMETRIC NAT, low-intensity punch mode (exact + predicted port only)"
         );
     }
+    // KCP 握手角色按 NAT 类型分配（修复 对称↔非对称 打不通的核心）：
+    // - 对称端必须做 KCP connect 的发起方：它的 NAT 为对端目标单独分配映射端口
+    //   （P_new），主动发包才能打通；它的 STUN 端口（P_stun）对入站无效。
+    // - 非对称（锥形）端做 accept 方：NAT 允许任意源进入固定端口，且能收到
+    //   对称端从 P_new 发来的包并正确回包。
+    // 本端非对称且对端对称时，本端 accept（等对端主动），否则保持默认 connect。
+    // host 端用对称规则（symmetric_mode → connect），两端互补。
+    let prefer_connect = !(Config::get_nat_type() == NatType::ASYMMETRIC as i32
+        && peer_nat_type == NatType::SYMMETRIC as i32);
+    if !prefer_connect {
+        log::info!(
+            "relay_upgrade_task: local ASYMMETRIC vs peer SYMMETRIC, switching to KCP accept (peer initiates)"
+        );
+    }
+    let nat_label = |n: i32| match n {
+        1 => "非对称(锥形)",
+        2 => "对称",
+        _ => "未知",
+    };
+    let _ = stage_tx.send(format!(
+        "开始穿透：本端NAT={} 对端NAT={}，角色={}",
+        nat_label(Config::get_nat_type()),
+        nat_label(peer_nat_type),
+        if prefer_connect { "主动发起" } else { "等待对端发起" },
+    ));
 
     // "以时间换资源"：中继已建立，不急。拉长总预算到 3 分钟，每个目标间隔 1s，
     // 空包只发 2-3 个，让 Phase3 几乎不影响中继操作。
@@ -4443,8 +4472,10 @@ pub async fn relay_upgrade_task(
             if let Some(alt_addr) = alt.to_socket_addrs().ok()
                 .and_then(|mut i| i.find(|a| a.is_ipv4()))
             {
-                let _ = socket.connect(alt_addr).await;
-                socket.send(&[]).await.ok();
+                // 用 send_to 而非 connect：connect 会让 socket 之后只接收
+                // connected 对端的包（内核过滤），打洞阶段对端从其它映射端口
+                // （对称 NAT 的 P_new）回来的 KCP 包会被全部丢弃。
+                socket.send_to(&[], alt_addr).await.ok();
                 match stun_query_single_server(&socket, alt).await {
                     Ok((alt_result, _)) => {
                         let delta = alt_result.port() as i32 - base_port;
@@ -4575,6 +4606,10 @@ pub async fn relay_upgrade_task(
                         info.delta,
                         info.sync_at_ms
                     );
+                    let _ = stage_tx.send(format!(
+                        "已获取对端公网地址 {}（端口预测步长 {}），等待同步起始时刻",
+                        info.addr, info.delta
+                    ));
                 }
             }
         }
@@ -4627,6 +4662,11 @@ pub async fn relay_upgrade_task(
                 peer_nat_type,
                 sync_offset_ms
             );
+            let _ = stage_tx.send(format!(
+                "等待同步起始时刻：NAT错峰 offset={}ms（{}端先打）",
+                sync_offset_ms,
+                if sync_offset_ms < 0 { "宽容" } else { "严格" }
+            ));
         }
         if target_sync > 0 {
             let wait = target_sync + sync_offset_ms - now_ms();
@@ -4667,6 +4707,12 @@ pub async fn relay_upgrade_task(
             PUNCH_EXACT_MS
         };
         let exact_deadline = std::time::Instant::now() + Duration::from_millis(exact_ms);
+        let _ = stage_tx.send(format!(
+            "阶段A：精确地址 {} 持续打洞（{}s，{}）",
+            exact,
+            exact_ms / 1000,
+            if symmetric_mode { "对称低强度模式" } else { "标准模式" }
+        ));
         while std::time::Instant::now() < exact_deadline {
             if cancel.is_cancelled() {
                 return false;
@@ -4681,14 +4727,16 @@ pub async fn relay_upgrade_task(
                 if started.elapsed() >= TOTAL_BUDGET {
                     break;
                 }
+                // 未 connect 模式（peer_addr=Some）：KCP 包 send_to 目标地址，
+                // 同时 recv_from 接收所有源的包（按 conv 分发）。connect 模式会让
+                // 内核只投递 connected 对端的包——对端是对称 NAT 时其回包来自
+                // 另一个映射端口（P_new≠P_stun），全部被丢弃，必然打不通。
                 let sock = socket_v4.clone();
-                if sock.connect(*target).await.is_err() {
-                    continue;
-                }
                 let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, *target, round_ms, true, None).await
+                    punch_target_sustained(&sock, *target, round_ms, prefer_connect, Some(*target))
+                        .await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
@@ -4734,6 +4782,7 @@ pub async fn relay_upgrade_task(
                 scan_offsets.insert(1, peer_delta);
             }
             let stage_b_deadline = std::time::Instant::now() + Duration::from_secs(40);
+            let _ = stage_tx.send("阶段B：端口偏移扫描（精确地址 + 小幅漂移）".to_owned());
             'offsets: for &offset in scan_offsets.iter() {
                 if offset == 0 {
                     continue; // 精确地址已在阶段 A 充分尝试
@@ -4763,14 +4812,13 @@ pub async fn relay_upgrade_task(
                     } else {
                         socket_v4.clone()
                     };
-                    if sock.connect(target).await.is_err() {
-                        continue;
-                    }
+                    // 未 connect 模式：send_to 发包 + 收所有源的包（见阶段 A 注释）
                     let remain_ms =
                         TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                     let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                     if let Some((kcp, stream)) =
-                        punch_target_sustained(&sock, target, round_ms, true, None).await
+                        punch_target_sustained(&sock, target, round_ms, prefer_connect, Some(target))
+                            .await
                     {
                         if let Ok(mut h) = kcp_handle.lock() {
                             *h = Some(kcp);
@@ -4816,6 +4864,12 @@ pub async fn relay_upgrade_task(
                     let excess = tcp_targets.len() - 8;
                     tcp_targets.drain(..excess);
                 }
+            }
+            if !tcp_targets.is_empty() {
+                let _ = stage_tx.send(format!(
+                    "阶段C：TCP 同步打开（{} 个 TCP 目标）",
+                    tcp_targets.len()
+                ));
             }
             let tcp_deadline = std::time::Instant::now() + Duration::from_secs(30);
             for &tcp_target in &tcp_targets {
@@ -4904,6 +4958,10 @@ pub async fn relay_upgrade_task(
         }
     }
     log::info!("[NAT穿透] 穿透未成功, 耗时={:?}", started.elapsed());
+    let _ = stage_tx.send(format!(
+        "穿透失败：各阶段均已尝试（耗时 {}s），持续使用中继",
+        started.elapsed().as_secs()
+    ));
     false
 }
 
@@ -4958,6 +5016,15 @@ pub async fn relay_phase3_punch_to_peer(
         log::info!(
             "Phase3(Host): SYMMETRIC NAT, low-intensity punch mode (exact + predicted port only)"
         );
+    }
+    // KCP 握手角色：本机是对称 NAT 时做 connect 发起方。
+    // 对称 NAT 的 STUN 端口（P_stun）对入站无效——对端发来的包会被丢弃，
+    // 只有本端主动发包（NAT 为对端目标分配映射 P_new）才能打通单向，
+    // 锥形对端收到后回包到 P_new 即可建立双向。与控制端规则互补：
+    // 控制端在"本端非对称且对端对称"时切 accept，等本端主动。
+    let prefer_connect = symmetric_mode;
+    if prefer_connect {
+        log::info!("Phase3(Host): SYMMETRIC NAT, switching to KCP connect (initiate punch)");
     }
 
     // 等待 STUN 任务结束再操作共享 socket：socket.connect(target) 会过滤掉
@@ -5087,13 +5154,15 @@ pub async fn relay_phase3_punch_to_peer(
                 bail!("Phase3(Host) punch timed out");
             }
             for target in primary_targets.iter() {
-                if socket.connect(*target).await.is_err() {
-                    break;
-                }
+                // 未 connect 模式（peer_addr=Some）：不能 connect——connected
+                // socket 的 recv 只投递 connected 对端的包，对端（对称 NAT 时
+                // 从 P_new、锥形时也可能非 STUN 端口）的 KCP 包会被内核全部
+                // 丢弃；共享 socket 也不允许 connect（多对端场景）。
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&socket, *target, round_ms, false, None).await
+                    punch_target_sustained(&socket, *target, round_ms, prefer_connect, Some(*target))
+                        .await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);
@@ -5155,13 +5224,11 @@ pub async fn relay_phase3_punch_to_peer(
                 } else {
                     socket.clone()
                 };
-                if sock.connect(target).await.is_err() {
-                    continue;
-                }
+                // 未 connect 模式：send_to 发包 + 收所有源的包（见阶段 A 注释）
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, target, round_ms, false, None).await
+                    punch_target_sustained(&sock, target, round_ms, prefer_connect, Some(target)).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);

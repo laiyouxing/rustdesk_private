@@ -97,6 +97,9 @@ pub struct Remote<T: InvokeUiSession> {
     punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
     // Phase3 取消令牌：重连/断连时取消旧打洞线程，避免线程累积泄漏
     phase3_cancel: Option<hbb_common::tokio_util::sync::CancellationToken>,
+    // Phase3 穿透阶段流水线接收端：relay_upgrade_task 各阶段发描述，
+    // status_timer 轮询转发到 UI 磁贴（全流程穿透过程可见）
+    phase3_stage_rx: Option<std::sync::mpsc::Receiver<String>>,
     // Phase 3: keep the punched KCP stream alive for the whole session.
     // relay_upgrade_task stores the KcpStream here; without this the stream
     // would be dropped (and its kcp_io pump stopped) when the task exits.
@@ -179,6 +182,7 @@ impl<T: InvokeUiSession> Remote<T> {
             punch_verify_rx_base: 0,
             last_input_time: Instant::now(),
             inactivity_warning_remaining: None,
+            phase3_stage_rx: None,
         }
     }
 
@@ -247,6 +251,9 @@ impl<T: InvokeUiSession> Remote<T> {
         self.punch_stream = Some(punch_stream.clone());
         // 重连时丢弃上一会话的 KcpStream（其 kcp_io 泵随 drop 停止）
         self.phase3_kcp = None;
+        // 丢弃上一轮的穿透阶段接收端：旧打洞线程的 send 会失败（被忽略），
+        // 新一轮在启动 Phase3 时会创建新 channel
+        self.phase3_stage_rx = None;
         // 重置上一会话遗留的换流确认状态
         self.punch_verify_deadline = None;
         // 这些是"每轮会话"级状态，必须按轮复位：Remote 跨轮存活，
@@ -374,6 +381,10 @@ impl<T: InvokeUiSession> Remote<T> {
                         // 会话结束信号，io_loop 退出时再发送（见本函数末尾）。
                         let (rt_stop_tx, rt_stop_rx) = hbb_common::tokio::sync::oneshot::channel::<()>();
                         self.phase3_rt_stop = Some(rt_stop_tx);
+                        // 穿透阶段流水线：relay_upgrade_task 各阶段发一行描述，
+                        // status_timer 轮询转发到 UI 磁贴（全流程可见，便于定位卡点）
+                        let (stage_tx, stage_rx) = std::sync::mpsc::channel::<String>();
+                        self.phase3_stage_rx = Some(stage_rx);
                         std::thread::spawn(move || {
                             let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
@@ -383,6 +394,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 let ok = relay_upgrade_task(
                                     p2p_addrs, n, s, kcp_handle, punch_port,
                                     phase3_out_tx, phase3_peer, phase3_tcp, cancel, peer_nat_type,
+                                    stage_tx,
                                 ).await;
                                 succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                                 d.notify_one();
@@ -606,6 +618,24 @@ impl<T: InvokeUiSession> Remote<T> {
                                     crate::common::record_phase3_failure();
                                     self.handler.set_punch_status("reconnecting", "");
                                     break;
+                                }
+                            }
+                            // Phase3 穿透阶段流水：把最新阶段描述转发到 UI 磁贴，
+                            // 让用户看到"开始→等地址→等同步→阶段A→B→C→结果"全流程。
+                            // try_recv 非阻塞；channel 断开（打洞线程退出）时清空。
+                            if let Some(rx) = &self.phase3_stage_rx {
+                                loop {
+                                    match rx.try_recv() {
+                                        Ok(stage) => {
+                                            log::info!("Phase3 stage: {}", stage);
+                                            self.handler.set_punch_status("trying", &stage);
+                                        }
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                            self.phase3_stage_rx = None;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             let elapsed = fps_instant.elapsed().as_millis();

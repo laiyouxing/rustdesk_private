@@ -285,6 +285,8 @@ class FfiModel with ChangeNotifier {
     try {
       var connectionType = ConnectionTypeState.find(peerId);
       connectionType.setPunchStatus(status);
+      // 穿透阶段流水：Rust 端各阶段描述（info），磁贴展示全流程
+      connectionType.setPunchInfo(info);
     } catch (e) {
       //
     }

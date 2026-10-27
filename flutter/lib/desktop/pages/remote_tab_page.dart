@@ -170,7 +170,12 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
             var punchInfo = '';
             final punch = connectionType.punch_status.value;
             if (punch == 'trying') {
-              punchInfo = '\n${translate('NAT')}: ${translate('punch_trying')}';
+              // 穿透阶段流水：优先显示 Rust 端各阶段描述（全流程可见），
+              // 无阶段描述时回退默认文案
+              final stage = connectionType.punch_info.value;
+              punchInfo = stage.isNotEmpty
+                  ? '\n${translate('NAT')}: ${translate('punch_trying')}\n$stage'
+                  : '\n${translate('NAT')}: ${translate('punch_trying')}';
             } else if (punch == 'succeeded') {
               punchInfo = '\n${translate('NAT')}: ✓ ${translate('punch_succeeded')}';
             } else if (punch == 'failed') {
