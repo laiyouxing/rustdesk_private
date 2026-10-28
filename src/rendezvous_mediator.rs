@@ -1028,6 +1028,10 @@ async fn punch_inbound_once(
     // 按对端建议优先级排序，并过滤不可用地址
     let peer_addrs = crate::hbbs_http::punch_exchange::sort_addrs(addrs);
     let mut targets: Vec<std::net::SocketAddr> = Vec::new();
+    // 对端公网 IPv6（取第一个可用）：走 v6 直连快速通道。
+    // 不能混进 v4 目标列表——共享 v4 socket 无法 send_to v6 目标，
+    // 混进来只会白占轮转槽位（每个 5s），压低 v4 成功率。
+    let mut peer_v6: Option<std::net::SocketAddr> = None;
     for a in &peer_addrs {
         if !a.is_udp() {
             continue;
@@ -1036,6 +1040,12 @@ async fn punch_inbound_once(
             continue;
         };
         if crate::common::is_unusable_punch_addr(&sa) {
+            continue;
+        }
+        if sa.is_ipv6() {
+            if peer_v6.is_none() {
+                peer_v6 = Some(sa);
+            }
             continue;
         }
         if !targets.contains(&sa) {
@@ -1053,13 +1063,14 @@ async fn punch_inbound_once(
             }
         }
     }
-    if targets.is_empty() {
+    if targets.is_empty() && peer_v6.is_none() {
         return;
     }
     log::info!(
-        "pre-relay punch(host): punching {} for {} target(s)",
+        "pre-relay punch(host): punching {} for {} target(s), peer IPv6: {:?}",
         peer_id,
-        targets.len()
+        targets.len(),
+        peer_v6
     );
 
     // 打洞 socket：用进程级共享 socket（启动时已创建 + STUN 缓存），
@@ -1122,6 +1133,23 @@ async fn punch_inbound_once(
         }
     }
 
+    // ===== IPv6 直连快速通道：与 v4 轮转**并发**，不串行占用预算 =====
+    // 串行会让 v6 的 4s 从同一个 total_deadline 切走，v4 的每目标 5s 就少打
+    // 一个（40s 预算下 9 个目标变 8 个），等于变相压低 v4 成功率。
+    // 并发则完全不碰 v4 的墙钟：v6 只是抢跑，成功就用它，没成功静默退出。
+    // 主机侧 prefer_connect=false（accept 控制端发起的流），与控制端互补。
+    // 熔断已跳闸时不 spawn：省掉一次注定失败的后台任务（只跳过 v6）。
+    let mut v6_task = peer_v6
+        .filter(|_| !crate::common::should_skip_v6())
+        .map(|v6| {
+            let budget = total_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(800));
+            tokio::spawn(async move {
+                crate::common::punch_ipv6_direct(v6, false, budget).await
+            })
+        });
+
     // 多地址轮转打洞（主机侧 prefer_connect=false，accept 控制端发起的流）。
     // 每个目标最多 5s，预算 45s 内按优先级轮换。
     for target in targets {
@@ -1131,6 +1159,41 @@ async fn punch_inbound_once(
         let per_target = Duration::from_millis(5_000);
         let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
         while std::time::Instant::now() < target_deadline {
+            // v4 每轮之间顺带看一眼 v6 是否抢先成功：成功就没必要继续打 v4
+            // （只省时间，不改变 v4 的任何参数）。take() 后未完成则放回。
+            if let Some(task) = v6_task.take() {
+                if task.is_finished() {
+                    if let Ok(Ok((kcp, stream, addr))) = task.await {
+                        log::info!(
+                            "pre-relay punch(host): IPv6 direct link to {} established, handing over to connection",
+                            addr
+                        );
+                        if let Some(mine) = my_primary {
+                            crate::common::save_punch_last_success(&mine);
+                        }
+                        let server = server.clone();
+                        // KcpStream 必须活到会话结束（Drop 会停掉 kcp_io）
+                        tokio::spawn(async move {
+                            allow_err!(
+                                crate::server::create_tcp_connection(
+                                    server,
+                                    stream,
+                                    addr,
+                                    true,
+                                    None,
+                                    false,
+                                )
+                                .await
+                            );
+                            drop(kcp);
+                        });
+                        return;
+                    }
+                    log::debug!("pre-relay punch(host): IPv6 fast path ended without link");
+                } else {
+                    v6_task = Some(task);
+                }
+            }
             let sock = socket.clone();
             // 未 connect 模式：共享 socket 要同时服务多个控制端（一对多远程），
             // 不能 connect 锁定单一目标；用 send_to 探测可达性
@@ -1144,6 +1207,43 @@ async fn punch_inbound_once(
             if let Some((kcp, stream)) =
                 crate::common::punch_target_sustained(&sock, target, round_ms, false, Some(target)).await
             {
+                // 优先确认 v6 是否也已成功：控制端同样优先采纳 v6。若此处直接
+                // 返回 v4 而控制端此刻采纳了 v6，两端各用一条链路（都能握手
+                // 但互不相通），本可直连的会话会退化为中继。
+                if let Some(task) = v6_task.take() {
+                    if task.is_finished() {
+                        if let Ok(Ok((v6_kcp, v6_stream, v6_addr))) = task.await {
+                            log::info!(
+                                "pre-relay punch(host): IPv6 direct link to {} established (v4 {} also succeeded, preferring v6)",
+                                v6_addr,
+                                target
+                            );
+                            if let Some(mine) = my_primary {
+                                crate::common::save_punch_last_success(&mine);
+                            }
+                            let server = server.clone();
+                            tokio::spawn(async move {
+                                allow_err!(
+                                    crate::server::create_tcp_connection(
+                                        server,
+                                        v6_stream,
+                                        v6_addr,
+                                        true,
+                                        None,
+                                        false,
+                                    )
+                                    .await
+                                );
+                                drop(v6_kcp);
+                            });
+                            return;
+                        }
+                    } else {
+                        // v6 还没结果：abort（JoinHandle 的 drop 不会中止任务，
+                        // 否则它会游离到超时并持续占用共享 v6 socket 的读循环）
+                        task.abort();
+                    }
+                }
                 log::info!(
                     "pre-relay punch(host): KCP punch to {} succeeded after {:?}, handing over to connection",
                     target,
@@ -1174,6 +1274,34 @@ async fn punch_inbound_once(
                 });
                 return;
             }
+        }
+    }
+    // v4 轮转结束仍未成功：给 v6 一个收尾机会（它可能刚好还在握手中）
+    if let Some(task) = v6_task {
+        if let Ok(Ok((kcp, stream, addr))) = task.await {
+            log::info!(
+                "pre-relay punch(host): IPv6 direct link to {} established (after v4 rounds)",
+                addr
+            );
+            if let Some(mine) = my_primary {
+                crate::common::save_punch_last_success(&mine);
+            }
+            let server = server.clone();
+            tokio::spawn(async move {
+                allow_err!(
+                    crate::server::create_tcp_connection(
+                        server,
+                        stream,
+                        addr,
+                        true,
+                        None,
+                        false,
+                    )
+                    .await
+                );
+                drop(kcp);
+            });
+            return;
         }
     }
     log::info!(

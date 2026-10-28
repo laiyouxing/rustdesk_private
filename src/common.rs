@@ -147,6 +147,76 @@ pub fn reset_phase3_state() {
     if let Ok(mut g) = PHASE3_LAST_FAIL_AT.lock() {
         *g = None;
     }
+    // 用户主动断开说明网络环境可能已变，v6 熔断一并复位，下次重连重新尝试
+    V6_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
+        *g = None;
+    }
+}
+
+// ===================== IPv6 直连快速通道熔断 =====================
+// 为什么必须与 Phase3 熔断**完全独立**：v6 只是并发抢跑的附加通道，v4 才是
+// 主路径。若共用计数器，v6 失败会把 Phase3/v4 一并禁掉——那是实打实的成功率
+// 损失。这里只用它决定"这次连接还要不要 spawn v6 任务"。
+//
+// 与 Phase3 的区别：v6 并发执行，失败不占用户额外时间（不像 Phase3 串行
+// 占预算），所以门槛可以比 Phase3（1 次）宽松一点，给偶发丢包一次机会；
+// 但 v6 长期不通的环境（对端无 v6 / 路由不可达 / 防火墙丢 ICMPv6）每次
+// 连接都会白起一个任务跑到预算耗尽，因此仍需熔断。
+static V6_RETRY_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static V6_LAST_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+/// v6 连续失败多少次后熔断。2 次：一次可能是握手期偶发丢包，两次基本可以
+/// 判定这个环境下 v6 路径不通。
+const V6_MAX_RETRIES: u32 = 2;
+/// 熔断窗口：超过该时长视为环境可能已变（换网络、对端开启 v6），放行重试。
+const V6_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// v6 打洞成功：清零计数，下次连接继续尝试 v6。
+pub fn record_v6_success() {
+    V6_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
+        *g = None;
+    }
+}
+
+/// v6 打洞失败（有 v6 地址但没打通）。窗口外的旧失败不累计。
+pub fn record_v6_failure() {
+    let now = std::time::Instant::now();
+    let expired = if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
+        let expired = matches!(*g, Some(last) if now.duration_since(last) >= V6_RETRY_WINDOW);
+        *g = Some(now);
+        expired
+    } else {
+        false
+    };
+    if expired {
+        V6_RETRY_COUNT.store(1, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        V6_RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 是否跳过本次 v6 尝试（熔断已跳闸且未过窗口）。
+///
+/// 注意：**只影响 v6**，v4 打洞永远照常进行。
+pub fn should_skip_v6() -> bool {
+    if V6_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= V6_MAX_RETRIES {
+        let expired = if let Ok(g) = V6_LAST_FAIL_AT.lock() {
+            matches!(*g, Some(last) if last.elapsed() >= V6_RETRY_WINDOW)
+        } else {
+            false
+        };
+        if expired {
+            V6_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
+                *g = None;
+            }
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
@@ -3369,6 +3439,20 @@ pub async fn stun_probe_with_delta(
 
 static SHARED_PUNCH_SOCKET: std::sync::Mutex<Option<Arc<tokio::net::UdpSocket>>> =
     std::sync::Mutex::new(None);
+/// 进程级共享 IPv6 打洞 socket（双栈直连用）。
+///
+/// 必须单实例且端口固定：上报给对端的 v6 地址端口就是本 socket 的本地端口，
+/// 对端据此打过来——若上报端口与实际收包端口不一致，v6 直连必然单向死亡
+/// （收到 0 个包）。对应的 v4 教训见 get_cached_ipv6_addr 的端口 0 问题。
+static SHARED_PUNCH_SOCKET_V6: std::sync::Mutex<Option<Arc<tokio::net::UdpSocket>>> =
+    std::sync::Mutex::new(None);
+/// v6 打洞串行锁：共享 v6 socket 只有一个 recv_from 投递点，多个 v6 打洞
+/// 并发会互相吞掉对方的 KCP 握手包（v4 侧靠 SHARED_SOCKET_USERS 让 STUN
+/// 探测避让，v6 侧没有等价机制，故用锁串行化）。
+lazy_static::lazy_static! {
+    static ref V6_PUNCH_LOCK: hbb_common::tokio::sync::Mutex<()> =
+        hbb_common::tokio::sync::Mutex::new(());
+}
 // (映射地址, 对称 delta, 探测时间)
 static SHARED_PUNCH_MAPPED: std::sync::Mutex<Option<(SocketAddr, i32, std::time::Instant)>> =
     std::sync::Mutex::new(None);
@@ -3430,6 +3514,24 @@ pub async fn ensure_shared_punch_socket() -> ResultType<Arc<tokio::net::UdpSocke
     let mut g = SHARED_PUNCH_SOCKET
         .lock()
         .map_err(|_| anyhow!("shared punch socket lock poisoned"))?;
+    Ok(g.get_or_insert(s).clone())
+}
+
+/// 获取（必要时创建）进程级共享 IPv6 打洞 socket。
+///
+/// 双栈直连的前提：上报给对端的端口 == 本 socket 实际收包端口。因此 v6
+/// 地址采集与打洞必须共用这一个 socket（同 v4 共享 socket 的设计）。
+pub async fn ensure_shared_punch_socket_v6() -> ResultType<Arc<tokio::net::UdpSocket>> {
+    if let Ok(g) = SHARED_PUNCH_SOCKET_V6.lock() {
+        if let Some(s) = g.as_ref() {
+            return Ok(s.clone());
+        }
+    }
+    // 先 bind 再取锁：不在持锁状态下 await（std::sync::Mutex 不可跨 await）
+    let s = Arc::new(UdpSocket::bind(SocketAddr::from(([0u16; 8], 0u16))).await?);
+    let mut g = SHARED_PUNCH_SOCKET_V6
+        .lock()
+        .map_err(|_| anyhow!("shared punch socket v6 lock poisoned"))?;
     Ok(g.get_or_insert(s).clone())
 }
 
@@ -3664,7 +3766,8 @@ pub async fn collect_punch_addrs(
 ) {
     use crate::hbbs_http::punch_exchange::{
         PunchAddr, PunchMeta, KIND_LAN, KIND_LAST_SUCCESS, KIND_STUN_ALT, KIND_STUN_PRIMARY,
-        KIND_TCP, PRIO_LAN, PRIO_LAST_SUCCESS, PRIO_STUN_ALT, PRIO_STUN_PRIMARY, PRIO_TCP,
+        KIND_TCP, KIND_V6, PRIO_LAN, PRIO_LAST_SUCCESS, PRIO_STUN_ALT, PRIO_STUN_PRIMARY,
+        PRIO_TCP, PRIO_V6,
     };
 
     let mut addrs: Vec<PunchAddr> = Vec::new();
@@ -3768,6 +3871,46 @@ pub async fn collect_punch_addrs(
             PRIO_TCP,
             0,
         ));
+    }
+
+    // 4.5 公网 IPv6（双栈直连）：双方都有全球单播 v6 时，v6 路径没有 NAT，
+    //     成功率与延迟都优于 v4 打洞，对端会优先尝试（见 punch_ipv6_direct）。
+    //
+    // 端口必须取**共享 v6 打洞 socket 的实际本地端口**：test_ipv6() 缓存的地址
+    // 端口是 0，而 is_unusable_punch_addr() 会把端口 0 判为不可打洞直接丢弃
+    // （Phase3 曾经因此让 IPv6 打洞单向死亡）。v6 无 NAT66，本地端口即对端
+    // 该打的目标端口。
+    //
+    // **绝不能在关键路径上等待探测**：test_ipv6 -> test_bind_ipv6 里的
+    // `STUNS_V6[0].to_socket_addrs()` 是同步阻塞的 getaddrinfo，直接跑在 async
+    // 任务里；纯 v4 环境下缓存永远为空，每次上报都会触发一次 DNS（Windows
+    // resolver 超时常见 5-10s），会把连接预算吃掉一大块。因此这里只 kick 一次
+    // 后台探测、绝不等它，本轮没有缓存就不上报 v6，下一轮（心跳附带上报 /
+    // 看门狗）缓存就绪后自然带上。
+    if crate::get_ipv6_punch_enabled() {
+        if get_cached_ipv6_addr().is_none() {
+            // 后台探测：不 await、不阻塞上报路径
+            hbb_common::tokio::spawn(async {
+                let _ = crate::test_ipv6().await;
+            });
+        } else if let Some(v6_addr) = get_cached_ipv6_addr() {
+            match ensure_shared_punch_socket_v6().await {
+                Ok(sock) => {
+                    if let Ok(local) = sock.local_addr() {
+                        if local.port() > 0 && !v6_addr.ip().is_unspecified() {
+                            addrs.push(PunchAddr::new(
+                                SocketAddr::new(v6_addr.ip(), local.port()).to_string(),
+                                "udp6",
+                                KIND_V6,
+                                PRIO_V6,
+                                0,
+                            ));
+                        }
+                    }
+                }
+                Err(e) => log::debug!("collect_punch_addrs: no IPv6 punch socket: {:?}", e),
+            }
+        }
     }
 
     // 5. 网络环境 meta：对端据此选策略
@@ -3931,10 +4074,12 @@ pub async fn punch_direct_via_api(
     }
 
     // 6. 组装打洞目标列表（按对端建议优先级）：
-    //    - UDP 类地址全部纳入
-    //    - 对端对称 NAT 时：用对端上报的 stun_alt（不同映射）+ delta 预测 +
-    //      小幅漂移偏移，覆盖其端口变化
+    //    - UDP 类地址全部纳入（**IPv6 除外**：v4 共享 socket 无法 send_to v6 目标，
+    //      若混进来会占掉前面 idx<2 的 8s 高优先槽位而必然失败，反而压低 v4 成功率；
+    //      v6 走下面独立的 IPv6 快速通道）
     let mut targets: Vec<SocketAddr> = Vec::new();
+    // 对端公网 IPv6（取第一个可用）——用于 v6 直连快速通道
+    let mut peer_v6: Option<SocketAddr> = None;
     for a in &peer_addrs {
         if !a.is_udp() {
             continue;
@@ -3943,6 +4088,12 @@ pub async fn punch_direct_via_api(
             continue;
         };
         if is_unusable_punch_addr(&sa) {
+            continue;
+        }
+        if sa.is_ipv6() {
+            if peer_v6.is_none() {
+                peer_v6 = Some(sa);
+            }
             continue;
         }
         if !targets.contains(&sa) {
@@ -3975,14 +4126,39 @@ pub async fn punch_direct_via_api(
             }
         }
     }
-    if targets.is_empty() {
+    if targets.is_empty() && peer_v6.is_none() {
         bail!("punch_direct_via_api: no usable peer UDP target");
     }
     log::info!(
-        "punch_direct_via_api: {} UDP target(s) to try: {:?}",
+        "punch_direct_via_api: {} UDP target(s) to try: {:?}, peer IPv6: {:?}",
         targets.len(),
-        targets
+        targets,
+        peer_v6
     );
+
+    // 6.5 IPv6 直连快速通道：与下面的 v4 轮转**并发**进行，绝不串行占用预算。
+    //
+    // 为什么必须并发而不是"先跑 v6 再跑 v4"：串行时 v6 的耗时是从同一个
+    // total_deadline 里切走的，v4 的每目标 8s/3s 槽位会少打 1~2 个
+    // （对称 NAT 的 delta / 正负漂移地址首当其冲），等于变相降低 v4 成功率。
+    // 并发则完全不碰 v4 的墙钟：v6 只是抢跑，先握手成功就用它，没成功就
+    // 静默退出，v4 轮转的时序、顺序、预算与改动前逐字一致。
+    //
+    // v6 无 NAT、无需 sync 对齐与端口预测，因此可以和 v4 同时起跑；
+    // 控制端这里 connect（主机端对应 accept）。
+    // 熔断已跳闸时不 spawn：省掉一次注定失败的后台任务（只跳过 v6，不影响 v4）。
+    let mut v6_task = peer_v6.filter(|_| !should_skip_v6()).map(|v6| {
+        let shared_use = shared_socket_acquire();
+        hbb_common::tokio::spawn(async move {
+            // 凭证随任务存活：v6 打洞期间不让看门狗探测抢包
+            let _hold = shared_use;
+            // 预算与 v4 总预算同源：v4 都放弃时 v6 也没有意义了
+            let budget = total_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(800));
+            punch_ipv6_direct(v6, true, budget).await
+        })
+    });
 
     // 7. 多地址轮转打洞：预算内轮换。时间向高优先级倾斜——列表前两个
     //    （last_success / stun_primary，命中率最高）各 8s，其后每个 3s
@@ -4000,6 +4176,30 @@ pub async fn punch_direct_via_api(
         };
         let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
         while std::time::Instant::now() < target_deadline {
+            // v4 每轮之间顺带看一眼 v6 是否已经抢先成功：成功就没有继续
+            // 打 v4 的必要（只省时间，不影响 v4 自身的任何参数）。
+            // take() 后未完成则放回，避免在循环里反复借用。
+            if let Some(task) = v6_task.take() {
+                if task.is_finished() {
+                    match task.await {
+                        Ok(Ok((kcp, stream, addr))) => {
+                            log::info!(
+                                "[NAT穿透] 中继前 IPv6 直连成功({}), 耗时={:?}",
+                                addr,
+                                started.elapsed()
+                            );
+                            if let Some(mine) = my_primary {
+                                save_punch_last_success(&mine);
+                            }
+                            return Ok((kcp, stream, addr));
+                        }
+                        // v6 失败/取消是常态，v4 继续
+                        _ => log::debug!("punch_direct_via_api: IPv6 fast path ended without link"),
+                    }
+                } else {
+                    v6_task = Some(task);
+                }
+            }
             let sock = socket_v4.clone();
             // 未 connect 模式：不 connect（共享 socket 要同时服务多个对端），
             // 用一次 send_to 探测目标可达性，失败即换下一个目标
@@ -4013,6 +4213,33 @@ pub async fn punch_direct_via_api(
             if let Some((kcp, stream)) =
                 punch_target_sustained(&sock, target, round_ms, true, Some(target)).await
             {
+                // 优先确认 v6 是否也已成功：v6 无 NAT、无端口映射老化问题，
+                // 且主机端同样会优先采纳 v6。若此处直接返回 v4，而主机端此刻
+                // 恰好采纳了 v6，两端就会各用一条链路（都能握手但互不相通），
+                // 本可直连的会话退化为中继。因此 v6 已就绪时让位给 v6。
+                if let Some(task) = v6_task.take() {
+                    if task.is_finished() {
+                        if let Ok(Ok((v6_kcp, v6_stream, v6_addr))) = task.await {
+                            log::info!(
+                                "[NAT穿透] 中继前 IPv6 直连成功({}), 耗时={:?}（v4 {} 同时成功，优先 v6）",
+                                v6_addr,
+                                started.elapsed(),
+                                target
+                            );
+                            if let Some(mine) = my_primary {
+                                save_punch_last_success(&mine);
+                            }
+                            return Ok((v6_kcp, v6_stream, v6_addr));
+                        }
+                    } else {
+                        // v6 还没结果：abort 掉，v4 已经拿到可用链路。
+                        // JoinHandle 的 drop 不会中止 tokio 任务，不 abort 的话
+                        // 它会继续向对端 v6 发包、继续持有 v6 socket 的 kcp_io
+                        // 读循环直到自己超时；快速重连会累积多个游离任务同时
+                        // recv_from 同一个共享 v6 socket，互相吞包。
+                        task.abort();
+                    }
+                }
                 log::info!(
                     "[NAT穿透] 中继前打洞成功({}), 耗时={:?}",
                     target,
@@ -4024,6 +4251,20 @@ pub async fn punch_direct_via_api(
                 }
                 return Ok((kcp, stream, target));
             }
+        }
+    }
+    // v4 轮转结束仍未成功：给 v6 一个收尾机会（它可能刚好还在握手中）。
+    // 只等剩余预算，不多占任何时间。
+    if let Some(task) = v6_task {
+        if let Ok(Ok((kcp, stream, addr))) = task.await {
+            log::info!(
+                "[NAT穿透] 中继前 IPv6 直连成功({}, v4 轮转结束后收尾)",
+                addr
+            );
+            if let Some(mine) = my_primary {
+                save_punch_last_success(&mine);
+            }
+            return Ok((kcp, stream, addr));
         }
     }
     bail!("punch_direct_via_api: punch failed after {:?}", started.elapsed())
@@ -4092,6 +4333,101 @@ pub async fn punch_target_sustained(
         Ok(v) => Some(v),
         Err(_) => None,
     }
+}
+
+/// IPv6 直连快速通道（中继前）：双方都是全球单播 IPv6 时，v6 路径无 NAT，
+/// 一次打洞即可直连，成功率和延迟都优于 v4 打洞。
+///
+/// **不占用、不影响** v4 打洞的预算与时序：
+///   - 独立 socket（共享 v6 socket）、独立 KCP endpoint；
+///   - 调用方用 `tokio::spawn` 让它与 v4 轮转**并发**跑，只把 `total_deadline`
+///     的剩余时间当作自己的死线，**不从 v4 的预算里切走任何时间**；
+///   - 失败即返回 Err，调用方静默忽略，v4 轮转照原样继续。
+///
+/// 返回 (KcpStream, Stream, 对端地址)。
+///
+/// `prefer_connect`：控制端 connect、主机端 accept，与 v4 打洞同一约定。
+/// 双方都只有 v6 地址时不存在 NAT 映射差异，"同时发起"即可，无需 delta/错峰。
+pub async fn punch_ipv6_direct(
+    peer_v6: SocketAddr,
+    prefer_connect: bool,
+    budget: Duration,
+) -> ResultType<(crate::kcp_stream::KcpStream, Stream, SocketAddr)> {
+    if !peer_v6.is_ipv6() {
+        bail!("punch_ipv6_direct: not an IPv6 target");
+    }
+    if is_unusable_punch_addr(&peer_v6) {
+        bail!("punch_ipv6_direct: unusable IPv6 target {}", peer_v6);
+    }
+    if !crate::get_ipv6_punch_enabled() {
+        bail!("punch_ipv6_direct: IPv6 punch disabled");
+    }
+    // 熔断：本环境下 v6 连续不通就别再起任务（只跳过 v6，v4 照常）
+    if should_skip_v6() {
+        bail!("punch_ipv6_direct: IPv6 punch suspended by circuit breaker");
+    }
+    let sock = ensure_shared_punch_socket_v6().await?;
+
+    // 单轮时长取小值：v6 无 NAT，握手窗口只需覆盖一个 RTT 级往返；
+    // 预算内可重试多轮，避免偶发丢包就判失败。
+    // （同时也是"排队后预算是否还够打一轮"的门槛，见下）
+    const V6_ROUND_MS: u64 = 3_000;
+
+    // 死线在拿锁**之前**就算好：排队等锁耗掉的时间也算进本次预算，
+    // 避免后到的控制端靠排队把 v6 打洞时间无限延长（v4 早就结束了）。
+    let started = std::time::Instant::now();
+    let deadline = started + budget;
+
+    // v6 打洞互斥：共享 v6 socket 只有一个 recv_from 投递点，多个 v6 打洞
+    // 并发会互相抢包（v4 侧靠 SHARED_SOCKET_USERS 挡住 STUN 探测，v6 侧
+    // 没有等价机制）。这里用一把异步锁串行化：一对多远程时后到的控制端
+    // 排队等前一个 v6 打洞结束，而不是两边一起把对方的 SYN 吞掉。
+    let _v6_guard = V6_PUNCH_LOCK.lock().await;
+
+    // 排队期间预算已被吃掉：直接放弃，且**不计入熔断**——这是调度排队
+    // 造成的，不是"这个环境下 v6 不通"，记进去会错误地把 v6 长期禁掉。
+    //
+    // 门槛取 V6_ROUND_MS（3s）而不是 500ms：剩余不足一轮时长时打出去也
+    // 必然等不到握手完成，若只判 500ms，排队后剩 1~3s 的情况仍会跑一轮
+    // 必败打洞并被记成一次失败——一对多远程下连续两次这样的排队就能把
+    // 本来可用的 v6 熔断 5 分钟。
+    let remain_ms = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_millis() as u64;
+    if remain_ms < V6_ROUND_MS {
+        bail!("punch_ipv6_direct: no budget left after waiting for the v6 punch lock");
+    }
+
+    // 每轮都要求剩余时长够打满一轮：不足一轮时打出去也等不到握手完成，
+    // 白耗预算还容易被误判成"v6 不通"。
+    while std::time::Instant::now() < deadline {
+        let remain_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        if remain_ms < V6_ROUND_MS {
+            break;
+        }
+        let round_ms = V6_ROUND_MS.min(remain_ms);
+        // 未 connect 模式（peer_addr=Some）：共享 v6 socket 可同时服务多个对端
+        if let Some((kcp, stream)) =
+            punch_target_sustained(&sock, peer_v6, round_ms, prefer_connect, Some(peer_v6)).await
+        {
+            log::info!(
+                "[NAT穿透] IPv6 直连成功({}), 耗时={:?}",
+                peer_v6,
+                started.elapsed()
+            );
+            record_v6_success();
+            return Ok((kcp, stream, peer_v6));
+        }
+    }
+    // 有 v6 地址但没打通：计入熔断。注意这里只影响后续 v6 尝试。
+    record_v6_failure();
+    bail!(
+        "punch_ipv6_direct: no IPv6 direct link to {} within {:?}",
+        peer_v6,
+        started.elapsed()
+    )
 }
 
 /// Returns true if punch succeeded, false otherwise.
@@ -5965,5 +6301,92 @@ mod tests {
         let combined_mask = MOUSE_TYPE_DOWN | ((MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT) << 3);
         assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
         assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
+    }
+
+    /// v6 熔断器的所有用例串行化用锁。
+    ///
+    /// 熔断状态是**进程级全局量**（生产代码里就必须如此：熔断要跨连接生效），
+    /// 而 Rust 测试默认并行执行同一二进制内的用例。若不串行化，用例之间会
+    /// 互相清零/改写对方的计数与时间戳，导致随机失败（flaky）。
+    static V6_BREAKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// v6 熔断必须与 Phase3 熔断**完全独立**：v6 只是并发抢跑的附加通道，
+    /// 它失败绝不能把 v4/Phase3 一起禁掉（那才是真正的成功率损失）。
+    ///
+    /// 独立性、成功清零、衰减三类断言合并在一个测试里：它们共用同一组全局
+    /// 状态，串行执行才可靠（见 V6_BREAKER_TEST_LOCK）。
+    #[test]
+    fn test_v6_breaker_semantics() {
+        let _guard = V6_BREAKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // ---- 1) 初始状态 ----
+        reset_phase3_state();
+        assert!(!should_skip_phase3(), "phase3 初始不应熔断");
+        assert!(!should_skip_v6(), "v6 初始不应熔断");
+
+        // ---- 2) v6 连续失败只熔断 v6，绝不牵连 Phase3 ----
+        for _ in 0..V6_MAX_RETRIES {
+            record_v6_failure();
+        }
+        assert!(should_skip_v6(), "v6 连续失败达阈值后应熔断");
+        assert!(
+            !should_skip_phase3(),
+            "v6 熔断绝不能连带禁掉 Phase3/v4 —— 那是实打实的成功率损失"
+        );
+
+        // ---- 3) v6 成功一次即清零 ----
+        record_v6_success();
+        assert!(!should_skip_v6(), "v6 成功后应恢复尝试");
+
+        // ---- 4) 反向：Phase3 失败也不应影响 v6 判定 ----
+        // PHASE3_MAX_RETRIES = 1，因此一次失败即跳闸，断言有实际区分度。
+        record_phase3_failure();
+        assert!(should_skip_phase3(), "phase3 一次失败即熔断（MAX_RETRIES=1）");
+        assert!(!should_skip_v6(), "Phase3 失败不应影响 v6 判定");
+
+        // ---- 5) record_v6_failure 的窗口衰减 ----
+        reset_phase3_state();
+        record_v6_success();
+        record_v6_failure(); // count = 1
+        // 把"上次失败时刻"推到窗口之外，模拟很久以前失败过
+        if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
+            *g = Some(
+                std::time::Instant::now() - V6_RETRY_WINDOW - std::time::Duration::from_secs(1),
+            );
+        }
+        // 窗口已过：本次失败应重新从 1 起算，而不是累加到阈值
+        record_v6_failure();
+        assert!(
+            !should_skip_v6(),
+            "窗口外的旧失败不应累计到熔断阈值（应重新从 1 起算）"
+        );
+
+        // ---- 6) should_skip_v6 的衰减放行分支 ----
+        // 先真正跳闸，再把时间戳推到窗口外：should_skip_v6 应清零并放行。
+        record_v6_failure();
+        assert!(should_skip_v6(), "重新累计到阈值后应再次跳闸");
+        if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
+            *g = Some(
+                std::time::Instant::now() - V6_RETRY_WINDOW - std::time::Duration::from_secs(1),
+            );
+        }
+        assert!(
+            !should_skip_v6(),
+            "熔断窗口过期后应放行（衰减），且应顺带清零计数"
+        );
+        // 清零后必须重新累计满 V6_MAX_RETRIES 次才再次跳闸
+        // （证明是真清零，而不只是这一次返回 false）
+        record_v6_failure();
+        assert!(!should_skip_v6(), "衰减清零后，单次失败不应立即再次跳闸");
+        for _ in 1..V6_MAX_RETRIES {
+            record_v6_failure();
+        }
+        assert!(should_skip_v6(), "衰减清零后重新累计满阈值应再次跳闸");
+
+        // 收尾：复位，避免影响同二进制内其他用例
+        reset_phase3_state();
+        record_v6_success();
     }
 }
