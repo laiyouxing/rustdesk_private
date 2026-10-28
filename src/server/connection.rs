@@ -348,9 +348,8 @@ pub struct Connection {
     // Phase 3: TCP listener for simultaneous open, bound at setup time and
     // kept alive with the connection so the punch task can accept on it.
     phase3_tcp_listener: Option<Arc<tokio::net::TcpListener>>,
-    // Phase 3: IPv6 UDP socket for dual-stack punching (None if unavailable
-    // or IPv6 punch disabled). IPv6 targets are punched through this socket.
-    punch_socket_v6: Option<Arc<tokio::net::UdpSocket>>,
+    // 注：Phase3 不做 IPv6 打洞（无 punch_socket_v6 字段）。
+    // v6 直连统一走中继前打洞（punch_inbound_once，用进程级共享 v6 socket）。
     // Phase 3: whether the session type is worth punching (set by on_message
     // after the LoginRequest type is known: only desktop control / view
     // camera sessions are punchable; file transfer / terminal / port forward
@@ -556,7 +555,6 @@ impl Connection {
             phase3_upgraded: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             phase3_stun_done: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             phase3_tcp_listener: None,
-            punch_socket_v6: None,
             phase3_useful: None,
             phase3_login_seen: None,
             phase3_task: None,
@@ -681,16 +679,12 @@ impl Connection {
                 Err(_) => None,
             };
             conn.punch_socket = punch_socket.clone();
-            // IPv6 打洞 socket（双栈）：仅启用 IPv6 punch 时创建
-            let punch_socket_v6 = if crate::get_ipv6_punch_enabled() {
-                tokio::net::UdpSocket::bind(std::net::SocketAddr::from(([0u16; 8], 0u16)))
-                    .await
-                    .ok()
-                    .map(Arc::new)
-            } else {
-                None
-            };
-            conn.punch_socket_v6 = punch_socket_v6.clone();
+            // 注：Phase3 不创建 IPv6 打洞 socket。v6 直连统一走中继前打洞
+            // （punch_inbound_once），那里用的是进程级共享 v6 socket，上报端口
+            // 与收包端口一致。Phase3 的 v6 从来打不通（控制端会丢弃对端 v6
+            // 地址，等于只有单向发包），且主机端阶段 B 会对 v6 目标做必然失败
+            // 的偏移扫描（v6 无 NAT，只有 offset 0 有效，而阶段 B 跳过 offset 0），
+            // 白烧 v4 打洞预算。
             // TCP listener 在 spawn 前创建并随 Connection 存活（spawn 结束不 drop），
             // spawn 内只广播端口，打洞任务之后在这个 listener 上 accept
             let phase3_tcp_listener = tokio::net::TcpListener::bind("0.0.0.0:0")
@@ -794,43 +788,9 @@ impl Connection {
                         }
                     }
                 }
-                // 2. Also send IPv6 address if available (for dual-stack peers)
-                if crate::get_ipv6_punch_enabled() {
-                    crate::test_ipv6().await;
-                    if let Some(ipv6_addr) = crate::common::get_cached_ipv6_addr() {
-                        // 必须带上 v6 打洞 socket 的实际本地端口：test_ipv6 缓存的
-                        // 地址端口为 0，对端会按"端口 0 不可打洞"丢弃，IPv6 打洞
-                        // 因此单向死亡。带上端口后两端各以 v6 socket 互打。
-                        let v6_local_port = punch_socket_v6
-                            .as_ref()
-                            .and_then(|s| s.local_addr().ok())
-                            .map(|a| a.port())
-                            .unwrap_or(0);
-                        if v6_local_port > 0 {
-                            let v6_punch_addr =
-                                std::net::SocketAddr::new(ipv6_addr.ip(), v6_local_port);
-                            let _ = tx_to_cm.send(ipc::Data::PunchStatus {
-                                status: "cone_nat".to_owned(),
-                                info: v6_punch_addr.to_string(),
-                            });
-                            let _ = phase3_tx
-                                .send(crate::common::PunchAddrInfo {
-                                    addr: v6_punch_addr,
-                                    ready: false,
-                                    delta: 0,
-                                    sync_at_ms: 0,
-                                    addr_type: crate::common::PUNCH_ADDR_TYPE_IPV6,
-                                })
-                                .await;
-                            log::info!(
-                                "Phase3(Host): sent IPv6 address to peer: {}",
-                                v6_punch_addr
-                            );
-                        } else {
-                            log::info!("Phase3(Host): no IPv6 punch socket, skip IPv6 address");
-                        }
-                    }
-                }
+                // 注：这里不再广播 IPv6 地址。Phase3 的 v6 打洞已整体移除
+                // （控制端会丢弃对端 v6 地址，且阶段 B 的偏移扫描对 v6 必然失败），
+                // v6 直连统一走中继前打洞（punch_inbound_once）。
                 // STUN（及地址广播）全部完成，打洞任务可以安全操作共享 socket
                 stun_done.store(true, std::sync::atomic::Ordering::SeqCst);
             });
@@ -2694,7 +2654,6 @@ impl Connection {
                             let punch_stream = self.punch_stream.clone();
                             let punch_notify = self.punch_notify.clone();
                             let punch_socket = self.punch_socket.clone();
-                            let punch_socket_v6 = self.punch_socket_v6.clone();
                             let targets = self.phase3_targets.clone().unwrap();
                             let upgraded = self.phase3_upgraded.clone().unwrap();
                             let tcp_listener = self.phase3_tcp_listener.clone();
@@ -2709,7 +2668,6 @@ impl Connection {
                                     targets,
                                     kcp_handle,
                                     punch_socket,
-                                    punch_socket_v6,
                                     tcp_listener,
                                     upgraded,
                                     stun_done,

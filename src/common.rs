@@ -3446,13 +3446,15 @@ static SHARED_PUNCH_SOCKET: std::sync::Mutex<Option<Arc<tokio::net::UdpSocket>>>
 /// （收到 0 个包）。对应的 v4 教训见 get_cached_ipv6_addr 的端口 0 问题。
 static SHARED_PUNCH_SOCKET_V6: std::sync::Mutex<Option<Arc<tokio::net::UdpSocket>>> =
     std::sync::Mutex::new(None);
-/// v6 打洞串行锁：共享 v6 socket 只有一个 recv_from 投递点，多个 v6 打洞
-/// 并发会互相吞掉对方的 KCP 握手包（v4 侧靠 SHARED_SOCKET_USERS 让 STUN
-/// 探测避让，v6 侧没有等价机制，故用锁串行化）。
+// v6 打洞串行锁：共享 v6 socket 只有一个 recv_from 投递点，多个 v6 打洞
+// 并发会互相吞掉对方的 KCP 握手包（v4 侧靠 SHARED_SOCKET_USERS 让 STUN
+// 探测避让，v6 侧没有等价机制，故用锁串行化）。
+// 注：用普通注释而非 ///，因为 rustdoc 不为宏调用生成文档。
 lazy_static::lazy_static! {
     static ref V6_PUNCH_LOCK: hbb_common::tokio::sync::Mutex<()> =
         hbb_common::tokio::sync::Mutex::new(());
 }
+
 // (映射地址, 对称 delta, 探测时间)
 static SHARED_PUNCH_MAPPED: std::sync::Mutex<Option<(SocketAddr, i32, std::time::Instant)>> =
     std::sync::Mutex::new(None);
@@ -4563,14 +4565,17 @@ pub async fn relay_upgrade_task(
         }
     };
     let socket = socket_v4.clone();
-    // Also create IPv6 socket for dual-stack punching (best-effort)
-    let socket_v6 = UdpSocket::bind(SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0u16)))
-        .await
-        .ok()
-        .map(Arc::new);
-    if socket_v6.is_some() {
-        log::info!("RelayUpgrade: created IPv6 socket for dual-stack punching");
-    }
+
+    // 注：Phase3 不做 IPv6 打洞。v6 直连统一走中继前打洞
+    // （punch_direct_via_api / punch_inbound_once），那里两端共用同一个
+    // 共享 v6 socket、上报端口与实际收包端口一致、时序也对齐。
+    // Phase3 此前的那套 v6（控制端 socket_v6 + 广播 PUNCH_ADDR_TYPE_IPV6、
+    // 主机端阶段 B 用 punch_socket_v6 打）从来打不通，反而白烧 v4 预算：
+    //   - 控制端 io_loop 会丢弃所有对端 v6 地址，v6 只有单向在发包；
+    //   - 广播端口取的是 Phase3 临时 socket 的端口，与打洞用的 socket 不同；
+    //   - 阶段 B 跳过 offset 0，而 v6 无 NAT、只有 offset 0 是有效端口，
+    //     于是每个 v6 目标要白打 8 偏移 x 8s = 64s。
+    // 因此这里不再创建 v6 socket、也不再广播 v6 地址。
 
     // Fresh hbbs TestNatRequest using OUR OWN socket. This replaces the
     // old approach of relying on the pre-connection test socket (which goes
@@ -4748,32 +4753,11 @@ pub async fn relay_upgrade_task(
     // We delay this until AFTER delta measurement so we can include
     // the predicted port for symmetric NAT (BUGFIX: on symmetric NAT,
     // the STUN-discovered port differs from the port the peer must punch to).
-    // IPv6 and TCP listener are sent immediately (they don't need delta).
-    if crate::get_ipv6_punch_enabled() {
-        if let Some(ipv6_addr) = get_cached_ipv6_addr() {
-            // 必须带上打洞 socket 的实际本地端口：test_ipv6 缓存的地址端口为 0，
-            // 对端会按"端口 0 不可打洞"丢弃，IPv6 打洞因此单向死亡。
-            // 带上端口后两端各以 v6 socket 互打，IPv6 路径才真正可用。
-            let v6_local_port = socket_v6
-                .as_ref()
-                .and_then(|s| s.local_addr().ok())
-                .map(|a| a.port())
-                .unwrap_or(0);
-            if v6_local_port > 0 {
-                let v6_punch_addr = std::net::SocketAddr::new(ipv6_addr.ip(), v6_local_port);
-                let _ = phase3_out_tx.try_send(PunchAddrInfo {
-                    addr: v6_punch_addr,
-                    ready: false,
-                    delta: 0,
-                    sync_at_ms: 0,
-                    addr_type: PUNCH_ADDR_TYPE_IPV6,
-                });
-                log::info!("Phase3: sent IPv6 address to relay loop: {}", v6_punch_addr);
-            } else {
-                log::info!("Phase3: no IPv6 punch socket, skip IPv6 address");
-            }
-        }
-    }
+    // TCP listener is sent immediately (it doesn't need delta).
+    //
+    // 注意：这里**不**广播 IPv6 地址。Phase3 的 v6 打洞已整体移除（见上方
+    // 创建 socket 处的说明）——它从来打不通，只会让主机端白烧 v4 预算。
+    // v6 直连统一走中继前打洞。
     // If hbbs-discovered address differs from STUN (symmetric NAT), send it
     // first as the primary target so the peer starts punching immediately.
     // Send TCP listener address for TCP simultaneous open fallback.
@@ -5140,14 +5124,14 @@ pub async fn relay_upgrade_task(
                     }
                     let mut target = *base;
                     target.set_port(p as u16);
-                    let sock = if target.is_ipv6() {
-                        match socket_v6.as_ref() {
-                            Some(s) => s.clone(),
-                            None => continue,
-                        }
-                    } else {
-                        socket_v4.clone()
-                    };
+                    // Phase3 只做 v4 打洞：v6 目标不在阶段 B 扫描。v6 无 NAT，
+                    // 只有 offset 0 有效，而这里恰好跳过 offset 0 —— 对 v6 做
+                    // 偏移扫描是 100% 必败的纯浪费，会挤占 v4 的扫描预算。
+                    // v6 直连统一走中继前打洞（punch_ipv6_direct）。
+                    if target.is_ipv6() {
+                        continue;
+                    }
+                    let sock = socket_v4.clone();
                     // 未 connect 模式：send_to 发包 + 收所有源的包（见阶段 A 注释）
                     let remain_ms =
                         TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
@@ -5315,13 +5299,12 @@ pub async fn relay_upgrade_task(
 /// STUN query. When provided, STUN discovery and hole punching share the
 /// same socket, so the NAT mapping is consistent. When `None`, a new socket
 /// is created internally (fallback for edge cases).
-/// `punch_socket_v6` is the IPv6 counterpart for dual-stack punching; when
-/// `None`, IPv6 targets are skipped.
+///
+/// Phase3 只做 IPv4 打洞（IPv6 直连统一走中继前打洞，见 punch_ipv6_direct）。
 pub async fn relay_phase3_punch_to_peer(
     targets: Arc<hbb_common::tokio::sync::Mutex<Vec<PunchAddrInfo>>>,
     kcp_handle: Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>,
     punch_socket: Option<Arc<tokio::net::UdpSocket>>,
-    punch_socket_v6: Option<Arc<tokio::net::UdpSocket>>,
     tcp_listener: Option<Arc<tokio::net::TcpListener>>,
     upgraded: Arc<std::sync::atomic::AtomicBool>,
     stun_done: Arc<std::sync::atomic::AtomicBool>,
@@ -5539,6 +5522,13 @@ pub async fn relay_phase3_punch_to_peer(
                 if base.is_tcp() {
                     continue;
                 }
+                // IPv6 目标不在 Phase3 打洞：v6 无 NAT，只有 offset 0 是有效端口，
+                // 而阶段 B 恰好跳过 offset 0（精确地址已在阶段 A 打过），因此这里
+                // 对 v6 目标做偏移扫描是 100% 必败的纯浪费（8 偏移 x 8s = 64s），
+                // 会直接摊薄 v4 的偏移扫描预算。v6 直连统一走中继前打洞。
+                if base.addr.is_ipv6() {
+                    continue;
+                }
                 if upgraded.load(std::sync::atomic::Ordering::SeqCst) {
                     bail!("Phase3(Host) stop punch: already upgraded");
                 }
@@ -5551,16 +5541,8 @@ pub async fn relay_phase3_punch_to_peer(
                 let mut target = base.addr;
                 target.set_port(new_port as u16);
 
-                // IPv6 目标走 v6 socket（双栈打洞）；无 v6 socket 时跳过
-                let sock = if target.is_ipv6() {
-                    match punch_socket_v6.as_ref() {
-                        Some(s) => s.clone(),
-                        None => continue,
-                    }
-                } else {
-                    socket.clone()
-                };
                 // 未 connect 模式：send_to 发包 + 收所有源的包（见阶段 A 注释）
+                let sock = socket.clone();
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
