@@ -2004,11 +2004,24 @@ impl LoginConfigHandler {
         self.session_id = sid;
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
-        self.force_relay =
-            config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
-                || force_relay
-                || use_ws()
-                || Config::is_proxy();
+        // 是否强制走中继（不建立 P2P 直连）。
+        //
+        // 来源有两处，**必须都查**：
+        //  1. 本机/每对端配置（PeerConfig）；
+        //  2. 全局配置（Config::get_options）—— api-server 下发的"策略"
+        //     就是写进这里的。PeerConfig 是每台对端独立存储、**不合并**
+        //     全局配置，所以只查 PeerConfig 时策略永远不生效。
+        //
+        // 键名兼容两种写法：客户端标准是 force-always-relay，
+        // 早期策略模板里误写成 force_relay，两个都认，避免管理员配了没反应。
+        let forbid_direct = |k: &str| config::option2bool("force-always-relay", &self.get_option(k));
+        self.force_relay = force_relay
+            || use_ws()
+            || Config::is_proxy()
+            || forbid_direct("force-always-relay")
+            || forbid_direct("force_relay")
+            || config::option2bool("force-always-relay", &Config::get_option("force-always-relay"))
+            || config::option2bool("force-always-relay", &Config::get_option("force_relay"));
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {

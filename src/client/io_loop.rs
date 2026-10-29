@@ -326,7 +326,12 @@ impl<T: InvokeUiSession> Remote<T> {
                 {
                     // Skip Phase3 if it failed on a previous attempt (reconnection path).
                     // Only app restart or a successful Phase3 will reset this.
-                    if crate::common::should_skip_phase3() {
+                    // 服务端强制走中继时一律跳过 Phase3：否则 force-always-relay 只挡住
+                    // 中继前打洞，Phase3 换流仍会把会话升级成直连，等于开关失效。
+                    if self.handler.is_force_relay() {
+                        log::info!("Phase3: skipped (force relay by server policy)");
+                        self.handler.set_punch_status("failed", "force-relay");
+                    } else if crate::common::should_skip_phase3() {
                         log::info!("Phase3: skipped (previously failed in this session)");
                         // 跳过时也要给终态，否则 UI 的穿透状态会停留在上次的
                         // "正在穿透"（trying）不消失
