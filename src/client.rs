@@ -644,6 +644,13 @@ impl Client {
                     log::info!("pre-relay punch failed, fallback to relay: {:?}", e);
                     // 明确告知"中继前直连没成功"，随后 Phase3 会接手并置 trying
                     interface.report_punch_status("failed", "pre-relay");
+                    // 告知服务端"本次回退中继"：否则服务端看到"有打洞意图 +
+                    // 有活跃会话 + 没有直连上报"，会误判成未登记的直连并强制断开。
+                    // fire-and-forget，不阻塞中继建连。
+                    let p = peer.clone();
+                    tokio::spawn(async move {
+                        crate::common::report_relay_fallback(&Config::get_id(), &p).await;
+                    });
                 }
             }
         }

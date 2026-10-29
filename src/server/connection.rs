@@ -2663,6 +2663,8 @@ impl Connection {
                             > = Arc::new(std::sync::Mutex::new(None));
                             // KcpStream 随 Connection 存活，避免打洞任务结束后被 drop 停掉 kcp_io
                             self.phase3_kcp = Some(kcp_handle.clone());
+                            // 控制端 id：Phase3 换流成功后要做直连合规上报
+                            let phase3_peer_id = self.lr.my_id.clone();
                             self.phase3_task = Some(tokio::spawn(async move {
                                 match relay_phase3_punch_to_peer(
                                     targets,
@@ -2671,6 +2673,7 @@ impl Connection {
                                     tcp_listener,
                                     upgraded,
                                     stun_done,
+                                    phase3_peer_id,
                                 )
                                 .await
                                 {

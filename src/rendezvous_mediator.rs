@@ -1012,6 +1012,28 @@ fn inbox_request_key(e: &crate::hbbs_http::punch_exchange::InboxEntry) -> String
     format!("{}|{}|{}", e.updated_at, addrs.join(","), sync_at)
 }
 
+/// 把已通过合规上报的直连流交给连接层。
+///
+/// 注意：直连合规上报不在本函数做——它已由 `common::punch_target_sustained`
+/// 在所有直连路径的唯一出口处完成；上报失败的直连根本走不到这里。
+///
+/// KcpStream 必须活到会话结束：它的 Drop 会关掉 stop_sender，kcp_io 泵随之
+/// 退出，直连会话立刻无法收发包，所以和 create_tcp_connection 一起 move 进
+/// 同一个任务。
+fn handoff_direct_stream(
+    server: ServerPtr,
+    kcp: crate::kcp_stream::KcpStream,
+    stream: hbb_common::Stream,
+    addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        allow_err!(
+            crate::server::create_tcp_connection(server, stream, addr, true, None, false).await
+        );
+        drop(kcp);
+    });
+}
+
 /// 被控端：对一台控制端的公网地址主动打洞（中继前打洞的一次性任务）。
 /// 成功则把直连流交给 `create_tcp_connection`（ConnInner 接管，等 Login）。
 async fn punch_inbound_once(
@@ -1145,8 +1167,9 @@ async fn punch_inbound_once(
             let budget = total_deadline
                 .saturating_duration_since(std::time::Instant::now())
                 .max(Duration::from_millis(800));
+            let peer_id = peer_id.clone();
             tokio::spawn(async move {
-                crate::common::punch_ipv6_direct(v6, false, budget).await
+                crate::common::punch_ipv6_direct(v6, false, budget, &peer_id).await
             })
         });
 
@@ -1171,22 +1194,8 @@ async fn punch_inbound_once(
                         if let Some(mine) = my_primary {
                             crate::common::save_punch_last_success(&mine);
                         }
-                        let server = server.clone();
-                        // KcpStream 必须活到会话结束（Drop 会停掉 kcp_io）
-                        tokio::spawn(async move {
-                            allow_err!(
-                                crate::server::create_tcp_connection(
-                                    server,
-                                    stream,
-                                    addr,
-                                    true,
-                                    None,
-                                    false,
-                                )
-                                .await
-                            );
-                            drop(kcp);
-                        });
+                        // 先上报，成功才交接；失败则丢弃该直连，控制端会回退中继
+                        handoff_direct_stream(server.clone(), kcp, stream, addr);
                         return;
                     }
                     log::debug!("pre-relay punch(host): IPv6 fast path ended without link");
@@ -1205,7 +1214,7 @@ async fn punch_inbound_once(
                 .as_millis() as u64;
             let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
             if let Some((kcp, stream)) =
-                crate::common::punch_target_sustained(&sock, target, round_ms, false, Some(target)).await
+                crate::common::punch_target_sustained(&sock, target, round_ms, false, Some(target), &peer_id).await
             {
                 // 优先确认 v6 是否也已成功：控制端同样优先采纳 v6。若此处直接
                 // 返回 v4 而控制端此刻采纳了 v6，两端各用一条链路（都能握手
@@ -1221,21 +1230,8 @@ async fn punch_inbound_once(
                             if let Some(mine) = my_primary {
                                 crate::common::save_punch_last_success(&mine);
                             }
-                            let server = server.clone();
-                            tokio::spawn(async move {
-                                allow_err!(
-                                    crate::server::create_tcp_connection(
-                                        server,
-                                        v6_stream,
-                                        v6_addr,
-                                        true,
-                                        None,
-                                        false,
-                                    )
-                                    .await
-                                );
-                                drop(v6_kcp);
-                            });
+                            // 先上报再交接；v6 上报失败则继续走下面的 v4 交接
+                            handoff_direct_stream(server.clone(), v6_kcp, v6_stream, v6_addr);
                             return;
                         }
                     } else {
@@ -1252,26 +1248,8 @@ async fn punch_inbound_once(
                 if let Some(mine) = my_primary {
                     crate::common::save_punch_last_success(&mine);
                 }
-                let server = server.clone();
-                // KcpStream 必须活到会话结束：它的 Drop 会关掉 stop_sender，
-                // kcp_io 泵随之退出，直连会话立刻无法收发包（原来这里绑成
-                // `_kcp`，函数返回即 drop，打洞成功也用不了）。
-                // create_tcp_connection 内部 await Connection::start，直到
-                // 会话结束才返回，所以把 kcp 一起 move 进同一个任务即可。
-                tokio::spawn(async move {
-                    allow_err!(
-                        crate::server::create_tcp_connection(
-                            server,
-                            stream,
-                            target,
-                            true,
-                            None,
-                            false,
-                        )
-                        .await
-                    );
-                    drop(kcp);
-                });
+                // 先上报，成功才交接（失败则丢弃直连，控制端会回退中继）
+                handoff_direct_stream(server.clone(), kcp, stream, target);
                 return;
             }
         }
@@ -1286,21 +1264,7 @@ async fn punch_inbound_once(
             if let Some(mine) = my_primary {
                 crate::common::save_punch_last_success(&mine);
             }
-            let server = server.clone();
-            tokio::spawn(async move {
-                allow_err!(
-                    crate::server::create_tcp_connection(
-                        server,
-                        stream,
-                        addr,
-                        true,
-                        None,
-                        false,
-                    )
-                    .await
-                );
-                drop(kcp);
-            });
+            handoff_direct_stream(server.clone(), kcp, stream, addr);
             return;
         }
     }

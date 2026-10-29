@@ -336,6 +336,8 @@ impl<T: InvokeUiSession> Remote<T> {
                         let d = punch_done.clone();
                         let s = punch_stream.clone();
                         let succ = punch_success.clone();
+                        // 对端 id：Phase3 换流成功后要做直连合规上报
+                        let phase3_peer_id = self.handler.get_id();
                         // 过滤无效地址（0.0.0.0 / 端口 0 不可打洞）
                         let mut p2p_addrs: Vec<std::net::SocketAddr> = peer_addrs
                             .iter()
@@ -394,7 +396,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 let ok = relay_upgrade_task(
                                     p2p_addrs, n, s, kcp_handle, punch_port,
                                     phase3_out_tx, phase3_peer, phase3_tcp, cancel, peer_nat_type,
-                                    stage_tx,
+                                    stage_tx, phase3_peer_id,
                                 ).await;
                                 succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                                 d.notify_one();

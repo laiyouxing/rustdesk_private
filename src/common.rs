@@ -3943,6 +3943,10 @@ pub fn save_punch_last_success(addr: &std::net::SocketAddr) {
 ///
 /// 这样连接建立时就直接是直连会话：不存在"先中继再换流"，也就没有双连接
 /// 与换流竞态（切换后无法操作的根因）。
+///
+/// 打洞成功后的**合规上报**统一在 `punch_target_sustained` 里做（所有直连
+/// 路径的唯一出口）。上报失败会被当作打洞失败，本函数随之返回 Err，
+/// 调用方回退中继——不会留下服务端不知情的直连会话。
 pub async fn punch_direct_via_api(
     peer_id: &str,
     total_budget: std::time::Duration,
@@ -4151,6 +4155,7 @@ pub async fn punch_direct_via_api(
     // 熔断已跳闸时不 spawn：省掉一次注定失败的后台任务（只跳过 v6，不影响 v4）。
     let mut v6_task = peer_v6.filter(|_| !should_skip_v6()).map(|v6| {
         let shared_use = shared_socket_acquire();
+        let peer_id = peer_id.to_owned();
         hbb_common::tokio::spawn(async move {
             // 凭证随任务存活：v6 打洞期间不让看门狗探测抢包
             let _hold = shared_use;
@@ -4158,7 +4163,7 @@ pub async fn punch_direct_via_api(
             let budget = total_deadline
                 .saturating_duration_since(std::time::Instant::now())
                 .max(Duration::from_millis(800));
-            punch_ipv6_direct(v6, true, budget).await
+            punch_ipv6_direct(v6, true, budget, &peer_id).await
         })
     });
 
@@ -4213,7 +4218,7 @@ pub async fn punch_direct_via_api(
                 .as_millis() as u64;
             let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
             if let Some((kcp, stream)) =
-                punch_target_sustained(&sock, target, round_ms, true, Some(target)).await
+                punch_target_sustained(&sock, target, round_ms, true, Some(target), peer_id).await
             {
                 // 优先确认 v6 是否也已成功：v6 无 NAT、无端口映射老化问题，
                 // 且主机端同样会优先采纳 v6。若此处直接返回 v4，而主机端此刻
@@ -4288,6 +4293,128 @@ pub async fn punch_report_own_addrs() -> bool {
     report_own_addrs_inner().await
 }
 
+// ===================== 直连合规上报 =====================
+// 需求：直连成功必须把两端的网络标识上报 api-server；上报失败则不允许使用
+// 直连（回退中继）。服务端若在宽限期内没收到两端上报，会下发 disconnect
+// 强制断开该会话。
+
+/// 直连上报超时。它在连接建立的关键路径上，不能太长（用户要等），
+/// 也不能太短（跨地域 HTTPS 往返可能 1-2s）。
+const DIRECT_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 采集内网地址（用于直连上报）。
+pub fn collect_report_lan_addrs() -> Vec<String> {
+    let mut v: Vec<String> = get_all_ipv4_addrs()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// 采集本机 MAC 并做单向哈希：`sha256(服务器密钥 || MAC)`，输出 hex。
+///
+/// **只上报哈希，原始 MAC 不出本机**：MAC 属于个人信息，服务端只需能比对
+/// 设备是否重复，不需要原始值。加服务器密钥做盐，避免不同部署间可交叉比对。
+///
+/// 移动端系统不提供真实 MAC（Android 10+ 恒定返回 02:00:00:00:00:00，
+/// iOS 直接禁止），故返回空，由服务端按"未采集"处理。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn collect_mac_hashes() -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let key = {
+        let k = Config::get_option("key");
+        if k.is_empty() {
+            hbb_common::config::RS_PUB_KEY.to_owned()
+        } else {
+            k
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let Ok(iter) = mac_address::MacAddressIterator::new() else {
+        return out;
+    };
+    for ma in iter {
+        let bytes = ma.bytes();
+        // 跳过全零（虚拟网卡/未启用适配器常见）
+        if bytes.iter().all(|b| *b == 0) {
+            continue;
+        }
+        let mut h = Sha256::new();
+        h.update(key.as_bytes());
+        h.update(b":");
+        h.update(bytes);
+        let hex = h
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        if !out.contains(&hex) {
+            out.push(hex);
+        }
+    }
+    out
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn collect_mac_hashes() -> Vec<String> {
+    // 移动端系统不提供真实 MAC（隐私限制），留空由服务端按"未采集"处理
+    Vec::new()
+}
+
+/// 直连建立后上报；失败返回 Err，调用方**必须**放弃直连回退中继。
+///
+/// 不在这里做重试：在连接关键路径上重试只会拉长用户等待，服务端宽限期
+/// 由另一端的上报兜底；失败即降级是最稳的选择。
+pub async fn report_direct_or_reject(
+    peer_id: &str,
+    target: &str,
+    conn_type: &str,
+    public_addr: &str,
+) -> ResultType<()> {
+    let lan = collect_report_lan_addrs();
+    let macs = collect_mac_hashes();
+    let fut = crate::hbbs_http::punch_exchange::report_direct_ok(
+        peer_id, target, conn_type, public_addr, lan, macs,
+    );
+    match tokio::time::timeout(DIRECT_REPORT_TIMEOUT, fut).await {
+        Ok(Ok(())) => {
+            log::info!(
+                "direct-ok reported: id={} target={} type={} addr={}",
+                peer_id,
+                target,
+                conn_type,
+                public_addr
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => Err(anyhow!("direct-ok report error: {}", e)),
+        Err(_) => Err(anyhow!("direct-ok report timeout")),
+    }
+}
+
+/// 直连失败、回退中继时告知服务端。
+///
+/// **必须上报**：否则服务端只看到"有打洞意图 + 有活跃会话 + 没有直连上报"，
+/// 会把它误判成"未登记的直连"而强制断开——那会把正常的中继回退误杀。
+///
+/// fire-and-forget：失败无副作用，不影响中继建连。
+pub async fn report_relay_fallback(peer_id: &str, target: &str) {
+    if let Err(e) = crate::hbbs_http::punch_exchange::report_direct_ok(
+        peer_id,
+        target,
+        "relay",
+        "",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    {
+        log::debug!("report relay fallback failed (ignored): {}", e);
+    }
+}
+
 /// 在单个 target 上"持续打洞"：整个时长内并行维持空包（防止 NAT 映射老化），
 /// 同时 KCP 在该时长内反复握手。返回 Some 表示打洞成功。
 ///
@@ -4297,12 +4424,18 @@ pub async fn punch_report_own_addrs() -> bool {
 /// `peer_addr` 为 Some 时使用未 connect 模式（KCP 包 send_to 到该地址，
 /// 空包亦然）——进程级共享 socket 由此可同时服务多个对端（一对多远程）；
 /// 为 None 时沿用 connect 模式（调用方已 connect，旧 Phase3 路径）。
+///
+/// `peer_id`：对端设备 id，用于直连成功后的合规上报。所有直连打洞路径
+/// （中继前打洞、v6 直连、Phase3 换流）都汇聚到这里，因此上报只在这一处做，
+/// 保证任何直连都不会漏报。上报失败时**当作打洞失败**返回 None——调用方
+/// 会继续尝试下一个目标或回退中继，绝不会留下未登记的直连会话。
 pub async fn punch_target_sustained(
     socket: &Arc<UdpSocket>,
     target: std::net::SocketAddr,
     duration_ms: u64,
     prefer_connect: bool,
     peer_addr: Option<std::net::SocketAddr>,
+    peer_id: &str,
 ) -> Option<(crate::kcp_stream::KcpStream, Stream)> {
     // 后台持续发空包维持 NAT 映射（打洞成败取决于双方是否都在持续发包）
     let sock = socket.clone();
@@ -4331,10 +4464,31 @@ pub async fn punch_target_sustained(
 
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = burst.await;
-    match res {
-        Ok(v) => Some(v),
-        Err(_) => None,
+    let (kcp, stream) = match res {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    // ===== 直连合规上报（所有直连路径的唯一出口）=====
+    // 上报失败即视为打洞失败：caller 会继续下一个目标或回退中继，
+    // 不会留下服务端不知情的直连会话。
+    let conn_type = if target.is_ipv6() {
+        "direct_v6"
+    } else {
+        "direct_v4"
+    };
+    if let Err(e) = report_direct_or_reject(&Config::get_id(), peer_id, conn_type, &target.to_string())
+        .await
+    {
+        log::warn!(
+            "直连上报失败({} -> {})：{}；放弃这条直连，继续下一个目标/回退中继",
+            peer_id,
+            target,
+            e
+        );
+        drop(kcp);
+        return None;
     }
+    Some((kcp, stream))
 }
 
 /// IPv6 直连快速通道（中继前）：双方都是全球单播 IPv6 时，v6 路径无 NAT，
@@ -4354,6 +4508,7 @@ pub async fn punch_ipv6_direct(
     peer_v6: SocketAddr,
     prefer_connect: bool,
     budget: Duration,
+    peer_id: &str,
 ) -> ResultType<(crate::kcp_stream::KcpStream, Stream, SocketAddr)> {
     if !peer_v6.is_ipv6() {
         bail!("punch_ipv6_direct: not an IPv6 target");
@@ -4412,7 +4567,7 @@ pub async fn punch_ipv6_direct(
         let round_ms = V6_ROUND_MS.min(remain_ms);
         // 未 connect 模式（peer_addr=Some）：共享 v6 socket 可同时服务多个对端
         if let Some((kcp, stream)) =
-            punch_target_sustained(&sock, peer_v6, round_ms, prefer_connect, Some(peer_v6)).await
+            punch_target_sustained(&sock, peer_v6, round_ms, prefer_connect, Some(peer_v6), peer_id).await
         {
             log::info!(
                 "[NAT穿透] IPv6 直连成功({}), 耗时={:?}",
@@ -4455,6 +4610,8 @@ pub async fn relay_upgrade_task(
     // 让用户看到全流程（开始→STUN→等地址→等同步→阶段A→阶段B→阶段C→结果），
     // 便于判断卡在哪一步。std mpsc 无阻塞，任务在独立线程运行。
     stage_tx: std::sync::mpsc::Sender<String>,
+    // 对端设备 id：直连成功后合规上报用（见 punch_target_sustained）
+    peer_id: String,
 ) -> bool {
     // 先等 relay 稳定再启动任何网络操作，避免与中继抢 tokio 运行时资源
     hbb_common::tokio::time::sleep(Duration::from_secs(3)).await;
@@ -5055,7 +5212,7 @@ pub async fn relay_upgrade_task(
                 let remain_ms = TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, *target, round_ms, prefer_connect, Some(*target))
+                    punch_target_sustained(&sock, *target, round_ms, prefer_connect, Some(*target), &peer_id)
                         .await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
@@ -5137,7 +5294,7 @@ pub async fn relay_upgrade_task(
                         TOTAL_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
                     let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                     if let Some((kcp, stream)) =
-                        punch_target_sustained(&sock, target, round_ms, prefer_connect, Some(target))
+                        punch_target_sustained(&sock, target, round_ms, prefer_connect, Some(target), &peer_id)
                             .await
                     {
                         if let Ok(mut h) = kcp_handle.lock() {
@@ -5308,6 +5465,8 @@ pub async fn relay_phase3_punch_to_peer(
     tcp_listener: Option<Arc<tokio::net::TcpListener>>,
     upgraded: Arc<std::sync::atomic::AtomicBool>,
     stun_done: Arc<std::sync::atomic::AtomicBool>,
+    // 对端设备 id：直连成功后合规上报用（见 punch_target_sustained）
+    peer_id: String,
 ) -> ResultType<Stream> {
     // Use the persistent punch socket if available, otherwise create a new one.
     let socket = if let Some(s) = punch_socket {
@@ -5480,7 +5639,7 @@ pub async fn relay_phase3_punch_to_peer(
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&socket, *target, round_ms, prefer_connect, Some(*target))
+                    punch_target_sustained(&socket, *target, round_ms, prefer_connect, Some(*target), &peer_id)
                         .await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
@@ -5546,7 +5705,7 @@ pub async fn relay_phase3_punch_to_peer(
                 let remain_ms = MAX_TIME.saturating_sub(started.elapsed()).as_millis() as u64;
                 let round_ms = PUNCH_ROUND_MS.min(remain_ms.max(500));
                 if let Some((kcp, stream)) =
-                    punch_target_sustained(&sock, target, round_ms, prefer_connect, Some(target)).await
+                    punch_target_sustained(&sock, target, round_ms, prefer_connect, Some(target), &peer_id).await
                 {
                     if let Ok(mut h) = kcp_handle.lock() {
                         *h = Some(kcp);

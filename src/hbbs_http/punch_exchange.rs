@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 const PUNCH_ADDR_PATH: &str = "/api/punch/addr";
 const PUNCH_INBOX_PATH: &str = "/api/punch/addr/inbox";
+/// 直连建立后的合规上报（客户端必须上报，否则服务端会下发强制断开）
+const DIRECT_OK_PATH: &str = "/api/punch/direct-ok";
 
 // 地址来源与建议优先级（越大越先试）
 pub const KIND_LAST_SUCCESS: &str = "last_success";
@@ -237,6 +239,56 @@ pub async fn report(
         .map_err(|e| anyhow!("punch addr report failed: {}", e))?;
     if !resp.status().is_success() {
         return Err(anyhow!("punch addr report status {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct DirectOkBody<'a> {
+    peer_id: &'a str,
+    target: &'a str,
+    conn_type: &'a str,
+    public_addr: &'a str,
+    lan_addrs: Vec<String>,
+    mac_hashes: Vec<String>,
+}
+
+/// 直连建立成功后的合规上报。
+///
+/// 上报：本机公网地址、内网地址、MAC 哈希（**不含原始 MAC**）。
+/// 服务端据此确认"这条直连会话已登记"；若宽限期内未收到两端上报，
+/// 服务端会通过心跳下发 disconnect 强制断开。
+///
+/// 返回 Err 表示上报失败，调用方**必须**放弃直连并回退中继
+/// （见 `common::report_direct_or_reject`）。
+pub async fn report_direct_ok(
+    peer_id: &str,
+    target: &str,
+    conn_type: &str,
+    public_addr: &str,
+    lan_addrs: Vec<String>,
+    mac_hashes: Vec<String>,
+) -> ResultType<()> {    let (api_server, token, key) = ctx().ok_or_else(|| anyhow!("api server not configured"))?;
+    let url = format!("{}{}", api_server, DIRECT_OK_PATH);
+    let body = DirectOkBody {
+        peer_id,
+        target,
+        conn_type,
+        public_addr,
+        lan_addrs,
+        mac_hashes,
+    };
+    let client = client_for(&url).await?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-Rustdesk-Key", key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("direct-ok report failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("direct-ok report status {}", resp.status()));
     }
     Ok(())
 }
