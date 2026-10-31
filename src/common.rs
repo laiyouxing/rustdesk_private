@@ -1279,6 +1279,57 @@ pub fn check_software_update() {
     });
 }
 
+/// 构建 GitHub Release 的下载兜底地址。
+///
+/// 背景：更新提示由 api-server 下发（国内直连可用），但产物未必都已镜像到
+/// 自有服务器；GitHub 上一定有（CI 打 tag 即发布）。因此当主下载地址
+/// 为空或下载失败时回落到 GitHub，两边互补。
+///
+/// 版本号以 GitHub 的 tag 为准，所以可以直接由 version 拼出资源名。
+/// 资源名规则与 flutter-build.yml 的产物命名保持一致：
+///     rustdesk-{version}-{arch}{suffix}.{ext}
+/// 认不出的平台/架构回落到 Release 页面（一定存在，不会 404）。
+fn github_release_url(version: &str) -> String {
+    const REPO: &str = "laiyouxing/rustdesk_private";
+    let asset = if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "x86_64") {
+            Some(format!("rustdesk-{}-x86_64.exe", version))
+        } else if cfg!(target_arch = "x86") {
+            // 32 位只有 sciter 变体（见 flutter-build.yml 的 -sciter 步骤）
+            Some(format!("rustdesk-{}-x86-sciter.exe", version))
+        } else {
+            None
+        }
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            Some(format!("rustdesk-{}-aarch64.dmg", version))
+        } else {
+            // x64 dmg 的产物名不稳定，直接给 Release 页面
+            None
+        }
+    } else if cfg!(target_os = "android") {
+        if cfg!(target_arch = "aarch64") {
+            Some(format!("rustdesk-{}-aarch64.apk", version))
+        } else if cfg!(target_arch = "arm") {
+            Some(format!("rustdesk-{}-armv7.apk", version))
+        } else if cfg!(target_arch = "x86_64") {
+            Some(format!("rustdesk-{}-x86_64.apk", version))
+        } else {
+            Some(format!("rustdesk-{}-universal.apk", version))
+        }
+    } else if cfg!(target_arch = "x86_64") {
+        Some(format!("rustdesk-{}-x86_64.deb", version))
+    } else if cfg!(target_arch = "aarch64") {
+        Some(format!("rustdesk-{}-aarch64.deb", version))
+    } else {
+        None
+    };
+    match asset {
+        Some(a) => format!("https://github.com/{}/releases/download/{}/{}", REPO, version, a),
+        None => format!("https://github.com/{}/releases/tag/{}", REPO, version),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let api_server = get_api_server(
@@ -1323,11 +1374,29 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let bytes = resp.bytes().await?;
     let json: serde_json::Value = serde_json::from_slice(&bytes)?;
     let latest_version = json["data"]["version"].as_str().unwrap_or("").to_string();
-    let download_url = json["data"]["url"].as_str().unwrap_or("").to_string();
+    let primary_url = json["data"]["url"].as_str().unwrap_or("").to_string();
+    // 服务端可选下发 fallback_url（例如自建镜像失效时指向 GitHub）。
+    let server_fallback = json["data"]["fallback_url"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let force_update = json["data"]["force_update"].as_bool().unwrap_or(false);
-    if latest_version.is_empty() || download_url.is_empty() {
+    if latest_version.is_empty() {
         return Ok(());
     }
+    // GitHub 兜底：版本号以 GitHub tag 为准，可直接由版本拼出产物地址。
+    // 主地址缺失时用它，主地址下载失败时也用它——不再因为 url 为空就直接
+    // 放弃提示（那样"有新版但没镜像到自有服务器"的用户永远收不到更新）。
+    let fallback_url = if !server_fallback.is_empty() {
+        server_fallback
+    } else {
+        github_release_url(&latest_version)
+    };
+    let download_url = if primary_url.is_empty() {
+        fallback_url.clone()
+    } else {
+        primary_url.clone()
+    };
     if get_version_number(&latest_version) > get_version_number(crate::VERSION) {
         if force_update {
             // Force update: auto-download and install without user prompt
@@ -1336,8 +1405,18 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
             if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
                 // 下载前清理历史更新下载残留（保留本次文件名对应的缓存文件）
                 crate::updater::cleanup_old_update_files(Some(&file_path));
-                // Download using the same HTTP client
-                if let Ok(resp) = client.get(&download_url).send().await {
+                // Download using the same HTTP client；主地址失败则自动回落到
+                // GitHub（或服务端下发的 fallback_url），两边互补。
+                let mut dl = client.get(&download_url).send().await;
+                if dl.is_err() && fallback_url != download_url {
+                    log::info!(
+                        "Force update: primary url failed ({:?}), falling back to {}",
+                        dl.as_ref().err().map(|e| e.to_string()),
+                        fallback_url
+                    );
+                    dl = client.get(&fallback_url).send().await;
+                }
+                if let Ok(resp) = dl {
                     if let Ok(bytes) = resp.bytes().await {
                         if std::fs::write(&file_path, &bytes).is_ok() {
                             log::info!("Force update: downloaded to {:?}", file_path);
