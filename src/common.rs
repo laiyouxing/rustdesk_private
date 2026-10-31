@@ -5208,7 +5208,16 @@ pub async fn relay_upgrade_task(
     // 始终没收到对端地址的计时：超过 45s 就早失败，别空转满 180s
     // （否则 UI 的穿透状态会一直显示"正在穿透"）
     let mut no_peer_addr_since: Option<std::time::Instant> = None;
-    for _round in 0..6 {
+    // 只统计"真正发起打洞"的轮次，等待对端地址的轮次不计入上限。
+    //
+    // 旧写法 `for _round in 0..6` 把等待轮次也计入 6 轮：每轮 sleep 500ms，
+    // 6 轮只有 3s。而对端此时通常还没走完它自己的 3s 稳定等待 + STUN + 经中继
+    // 交换地址，于是本端必然空转到头、直接宣告"各阶段均已尝试"——下面的
+    // 45s 保护因为轮数早已用完而**永远不可能触发**。
+    // 实测日志佐证：`[NAT穿透] 穿透未成功, 耗时=3.2982413s`，正是 6×500ms。
+    const PUNCH_ROUNDS: u32 = 6;
+    let mut _round: u32 = 0;
+    loop {
         if cancel.is_cancelled() {
             log::info!("[NAT穿透] Phase3 已取消（重连/断连）, 退出打洞");
             return false;
@@ -5274,6 +5283,14 @@ pub async fn relay_upgrade_task(
             }
         };
 
+        // 已拿到对端精确地址：从这一轮起才计入真正的打洞轮次。
+        // 否则等待轮次会把 PUNCH_ROUNDS 提前用光（见循环头注释）。
+        if _round >= PUNCH_ROUNDS {
+            break;
+        }
+        let round_idx = _round;
+        _round += 1;
+
         // 同步：等到"双方约定起始时刻的较大值"再开始打洞。
         // 只等自己的 sync_at 没有意义——对端发来的 sync_at 也必须参与，
         // 两端才会在同一个绝对时刻同时发起（修复前对端 sync_at 只进日志）。
@@ -5298,7 +5315,7 @@ pub async fn relay_upgrade_task(
             sync_offset_ms = PUNCH_FOLLOWER_DELAY_MS as i64;
         }
         // 错峰只影响第 1 轮的起始时刻（后续轮 target_sync 已过期），日志仅首轮打印
-        if _round == 0 && sync_offset_ms != 0 {
+        if round_idx == 0 && sync_offset_ms != 0 {
             log::info!(
                 "[NAT穿透] NAT 错峰生效：本端 nat={} / 对端 nat={}，起始 offset={}ms（宽容端先打）",
                 my_nat_type,
