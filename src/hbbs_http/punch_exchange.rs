@@ -117,7 +117,17 @@ struct ReportBody {
     target: String,
     meta: ReportMeta,
     addrs: Vec<ReportAddr>,
+    /// 本客户端支持的能力标识。
+    ///
+    /// 服务端据此判断"能不能对这台设备做直连合规执法"：只有声明了
+    /// `direct-ok` 的客户端才具备直连后上报的能力；旧客户端没有，服务端
+    /// 必须对它们放行，否则会把正常的中继会话误判成"未登记的直连"而强制
+    /// 断开——旧版本会集体表现为"连上就掉、无限重连"。
+    caps: Vec<String>,
 }
+
+/// 能力标识：支持直连成功后上报（direct-ok）
+const CAP_DIRECT_OK: &str = "direct-ok";
 
 #[derive(Deserialize)]
 struct PeerAddrRaw {
@@ -227,6 +237,7 @@ pub async fn report(
                 sync_at_ms: a.sync_at_ms,
             })
             .collect(),
+        caps: vec![CAP_DIRECT_OK.to_owned()],
     };
     let client = client_for(&url).await?;
     let resp = client
