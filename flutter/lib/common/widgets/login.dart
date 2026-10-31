@@ -476,6 +476,10 @@ Future<bool?> loginDialog() async {
               await bind.mainSetLocalOption(
                   key: 'user_info', value: jsonEncode(resp.user ?? {}));
             }
+            // 新装设备：登录后向 api-server 领取远程 ID。
+            // 已有 ID 的机器内部会直接复用、不向服务器索要（幂等）。
+            // 失败不阻断登录流程（内部自行 catch），只是暂时拿不到 ID。
+            await gFFI.userModel.claimDeviceIdIfNeeded();
             if (close != null) {
               close(true);
             }

@@ -33,6 +33,21 @@ pub fn core_main() -> Option<Vec<String>> {
         return None;
     }
     crate::load_custom_client();
+    // "必须先登录领取远程 ID"模式：只有配了自有 api-server 的定制部署才打开。
+    // 打开后，本地 id 为空时不再随机生成（见 hbb_common::config::Config::get_id），
+    // 需由客户端登录后调用 api-server /api/device/claim-id 领取并写回。
+    // 已有 ID 的机器不受影响（id 非空时该开关不参与判断）。
+    // 必须在 load_custom_client() 之后判断，因为 api-server 地址由它载入。
+    let api_server = crate::common::get_api_server(
+        hbb_common::config::Config::get_option("api-server"),
+        hbb_common::config::Config::get_option("custom-rendezvous-server"),
+    );
+    hbb_common::config::Config::set_id_claim_required(!api_server.is_empty());
+    log::info!(
+        "id claim mode: required={} (api_server={})",
+        hbb_common::config::Config::is_id_claim_required(),
+        if api_server.is_empty() { "<none>" } else { &api_server }
+    );
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
