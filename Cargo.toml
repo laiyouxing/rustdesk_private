@@ -1,6 +1,9 @@
 [package]
 name = "rustdesk"
-version = "1.5.4"
+# 注意：CI 出包时真实版本由 BUILD_VERSION（git tag）覆盖，这里只是本地构建的兜底值。
+# 曾经长期停在 1.5.4，导致"BUILD_VERSION 没传到位"的构建产出 1.5.4 的包，
+# 安装时被 Windows Installer 判成"比已安装版本低"。这里与当前发布版对齐。
+version = "1.7.11"
 authors = ["rustdesk <info@rustdesk.com>"]
 edition = "2021"
 build= "build.rs"
