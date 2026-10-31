@@ -258,6 +258,10 @@ async fn start_hbbs_sync_async() {
                 let modified_at = LocalConfig::get_option("strategy_timestamp").parse::<i64>().unwrap_or(0);
                 v["modified_at"] = json!(modified_at);
                 if let Ok(s) = crate::post_request(url.clone(), v.to_string(), "").await {
+                    // api-server 连接成功（含掉线重连后恢复）：顺带刷新打洞地址
+                    // 上报——事件触发式，内部有 30s 节流，不会每次心跳都打 API。
+                    // 控制端连接时带 target 的上报不走节流，不受影响。
+                    tokio::spawn(crate::common::punch_report_own_addrs());
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
                         if rsp.remove("sysinfo").is_some() {
                             info_uploaded.uploaded = false;

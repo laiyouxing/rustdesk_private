@@ -136,6 +136,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Insert Ctrl + Alt + Del", "插入 Ctrl + Alt + Del"),
         ("Insert Lock", "锁定远程电脑"),
         ("Refresh", "刷新画面"),
+        ("Connection failed, please login!", "连接失败，请登录"),
+        ("Token error, please log out and log back in!", "令牌验证失败，请重新登录"),
         ("ID does not exist", "ID 不存在"),
         ("Failed to connect to rendezvous server", "连接注册服务器失败"),
         ("Please try later", "请稍后再试"),
@@ -321,6 +323,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Restarting remote device", "正在重启远程设备"),
         ("remote_restarting_tip", "远程设备正在重启, 请关闭当前提示框, 并在一段时间后使用永久密码重新连接"),
         ("Copied", "已复制"),
+        ("Copy ID", "复制 ID"),
         ("Exit Fullscreen", "退出全屏"),
         ("Fullscreen", "全屏"),
         ("Mobile Actions", "移动端操作"),
@@ -405,6 +408,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Right click to select tabs", "右键选择选项卡"),
         ("Skipped", "已跳过"),
         ("Add to address book", "添加到地址簿"),
+        ("Add my ID to address book", "加入地址薄"),
+        ("Please enter hostname first", "请先填写本机名称"),
+        ("ID is not ready yet, please try again later", "本机 ID 未生成，请稍后再试"),
         ("Group", "小组"),
         ("Search", "搜索"),
         ("Closed manually by web console", "被 web 控制台手动关闭"),
@@ -656,6 +662,13 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Update client clipboard", "更新客户端的剪贴板"),
         ("Untagged", "无标签"),
         ("new-version-of-{}-tip", "{} 版本更新"),
+        // 已安装版本落后于"当前正在运行的这个程序"时，提示覆盖安装。
+        // 旧文案「你安装的版本比当前运行的低。」容易被读成"当前运行的版本更低"，
+        // 现把两个主语和动作都说清楚（不依赖版本号，避免同步 build 里取异步值）。
+        (
+            "installed_older_than_running_tip",
+            "你安装的版本旧于当前正在运行的版本。点击下方按钮，用当前运行的版本覆盖安装。",
+        ),
         ("Accessible devices", "可访问的设备"),
         ("upgrade_remote_rustdesk_client_to_{}_tip", "请在远程端将 RustDesk 客户端升级至版本 {} 或更新版本！"),
         ("d3d_render_tip", "当启用 D3D 渲染时，某些机器可能无法显示远程画面。"),
@@ -759,5 +772,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("nat_type_unknown", "未知"),
         ("nat_type_asymmetric", "非对称型(锥型)"),
         ("nat_type_symmetric", "对称型"),
+        ("Direct Success Rate", "直连成功率"),
+        ("peer_cone_nat", "对端锥形"),
+        ("peer_symmetric_nat", "对端对称"),
     ].iter().cloned().collect();
 }

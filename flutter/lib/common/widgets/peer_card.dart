@@ -19,6 +19,8 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../common.dart';
+import 'ignore_cert_http_io.dart'
+    if (dart.library.html) 'ignore_cert_http_stub.dart' as ignore_cert_http;
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
     Function(BuildContext);
@@ -1590,13 +1592,17 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       isRDP: isRDP);
 }
 
-/// 检查订阅是否过期，返回 true 表示已过期或无法验证（拒绝连接）
+/// 检查订阅是否过期，返回 true 表示已明确过期（拒绝连接）。
+/// 仅当服务端明确返回订阅状态且为过期/未订阅时才拦截；
+/// 未登录（401/403）、接口异常、网络超时等无法验证的情况一律放行，
+/// 避免已付费但客户端未登录账号的用户被误判为"订阅已过期"。
 Future<bool> checkSubscriptionExpired(BuildContext context) async {
   try {
     final api = '${await bind.mainGetApiServer()}/api/subscribe/mine';
     final headers = getHttpHeaders();
-    final resp = await http.get(Uri.parse(api), headers: headers)
-        .timeout(const Duration(seconds: 5));
+    // 使用忽略自签名证书的请求（api-server 为自签名证书，dart:io 默认校验会失败）
+    final resp = await ignore_cert_http.getHttpIgnoreCert(Uri.parse(api), headers,
+        timeout: const Duration(seconds: 5));
     if (resp.statusCode == 200) {
       final body = jsonDecode(resp.body);
       if (body is Map && body['data'] is Map) {
@@ -1605,11 +1611,15 @@ Future<bool> checkSubscriptionExpired(BuildContext context) async {
         // active 与 permanent 均视为有效订阅
         return status != 'active' && status != 'permanent';
       }
+      // 已登录但 data 缺失（业务错误）：不当作订阅过期，放行
+      return false;
     }
+    // 未登录（401/403）或接口异常：放行，避免误伤未登录的付费用户
+    return false;
   } catch (_) {
-    // 连不上 API → 拒绝连接
+    // 网络异常/超时：放行
+    return false;
   }
-  return true;
 }
 
 /// 显示续费弹窗

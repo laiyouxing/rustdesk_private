@@ -79,6 +79,15 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     pub sent_close_reason: bool,
+    /// 会话是否"彻底结束"（用户主动关闭 / 对端发来 CloseReason）。
+    /// 只有这种情况才终止自动重连环；其余退出（看门狗超时、直连流出错、
+    /// 网络波动）都应当继续自动重连。
+    ///
+    /// 注意不能继续用 `sent_close_reason` 判断：它只表示"已向对端发送过
+    /// 关闭原因"，而 KCP 会话退出时我们仍会给对端发一次关闭原因（KCP 没有
+    /// FIN，对端只能这样知道我们走了）——用它的结果就是看门狗/网络波动后
+    /// 自动重连被静默终止，用户只能手动重连。
+    pub no_reconnect: bool,
     // Relay upgrade
     punch_stream: Option<Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
     punch_notify: Option<Arc<Notify>>,
@@ -88,10 +97,27 @@ pub struct Remote<T: InvokeUiSession> {
     punch_tcp_addrs: Option<Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>>,
     // Phase3 取消令牌：重连/断连时取消旧打洞线程，避免线程累积泄漏
     phase3_cancel: Option<hbb_common::tokio_util::sync::CancellationToken>,
+    // Phase3 穿透阶段流水线接收端：relay_upgrade_task 各阶段发描述，
+    // status_timer 轮询转发到 UI 磁贴（全流程穿透过程可见）
+    phase3_stage_rx: Option<std::sync::mpsc::Receiver<String>>,
     // Phase 3: keep the punched KCP stream alive for the whole session.
     // relay_upgrade_task stores the KcpStream here; without this the stream
     // would be dropped (and its kcp_io pump stopped) when the task exits.
     phase3_kcp: Option<Arc<std::sync::Mutex<Option<crate::kcp_stream::KcpStream>>>>,
+    // Phase3 临时运行时的"保活"信号：打洞成功后该线程的 tokio 运行时必须
+    // 继续存活（kcp_io 与 KCP 更新循环都 spawn 在它上面），直到本会话结束，
+    // 否则 rt 一 drop，这些任务被立即取消，表现为"换流后直连秒断、无法操作"。
+    // 打洞失败时不保活（线程立即退出，不泄漏）。
+    phase3_rt_stop: Option<hbb_common::tokio::sync::oneshot::Sender<()>>,
+    // Phase3 换流确认：换到直连流后置位，用于"新流是否真的双向可用"看门狗。
+    // 直连 KCP 配对错误时两端会各用各的流（KCP 层面不通），表现为换流后
+    // 无法操作远程主机。收到对端在直连上的任何数据即清除；超时未确认则
+    // 主动断开让自动重连重建中继，而不是僵死在一条不通的流上。
+    punch_verify_deadline: Option<Instant>,
+    /// 武装换流确认看门狗时，进程级 KCP 收包计数的快照。
+    /// 看门狗超时后用差值判断：rx 没增长 → 对端根本没发（或包到不了）；
+    /// rx 有增长但没应用数据 → 收到了但上层没用上（解密/配对问题）。
+    punch_verify_rx_base: usize,
     // Inactivity timeout: track last user input for auto-disconnect
     last_input_time: Instant,
     inactivity_warning_remaining: Option<u32>,
@@ -144,15 +170,28 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            no_reconnect: false,
             punch_stream: None,
             punch_notify: None,
             punch_peer_addrs: None,
             punch_tcp_addrs: None,
             phase3_cancel: None,
             phase3_kcp: None,
+            phase3_rt_stop: None,
+            punch_verify_deadline: None,
+            punch_verify_rx_base: 0,
             last_input_time: Instant::now(),
             inactivity_warning_remaining: None,
+            phase3_stage_rx: None,
         }
+    }
+
+    /// 标记本次连接为重连：Session::handle_login_error 据此区分"网络波动误报密码错误"，
+    /// 保留已保存的密码自动重试，避免反复弹"重新输入密码"；
+    /// 无密码/手动接收场景重连时跳过"输入密码"弹框，直接发空密码由对端接受。
+    pub fn mark_reconnecting(&self) {
+        self.handler.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        self.handler.lc.write().unwrap().reconnecting = true;
     }
 
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
@@ -200,17 +239,39 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
-        // Initialize upgrade channels BEFORE connection start so that background
-        // LAN test (spawned inside _start_inner) can push direct streams here for
-        // seamless in-session replacement (same mechanism as Phase3 upgrade).
+        // Phase3 打洞通道：后台打洞任务（relay_upgrade_task / LAN 测试）把直连流
+        // 推进 punch_stream 并通知 punch_notify，由下面的 select 循环换流。
+        // 注意：io_loop 直接使用这两个本地 Arc，不再向 handler 镜像一份
+        // （旧的 set_upgrade_channels/get_upgrade_channels 机制无任何读取方，
+        // 属于僵尸功能，已移除）。
         let punch_notify = Arc::new(Notify::new());
         let punch_stream: Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>> =
             Arc::new(hbb_common::tokio::sync::Mutex::new(None));
         self.punch_notify = Some(punch_notify.clone());
         self.punch_stream = Some(punch_stream.clone());
-        self.handler.set_upgrade_channels(punch_stream.clone(), punch_notify.clone());
         // 重连时丢弃上一会话的 KcpStream（其 kcp_io 泵随 drop 停止）
         self.phase3_kcp = None;
+        // 丢弃上一轮的穿透阶段接收端：旧打洞线程的 send 会失败（被忽略），
+        // 新一轮在启动 Phase3 时会创建新 channel
+        self.phase3_stage_rx = None;
+        // 重置上一会话遗留的换流确认状态
+        self.punch_verify_deadline = None;
+        // 这些是"每轮会话"级状态，必须按轮复位：Remote 跨轮存活，
+        // 不复位会导致第 2 轮起行为异常：
+        //   - sent_close_reason：是"已向对端发过关闭原因"的去重标志，
+        //     不复位则第 2 轮起 send_close_reason 直接 return，对端收不到
+        //     关闭原因、只能等 KCP 约 60s 超时才察觉我们走了；
+        //   - no_reconnect：上一轮用户/对端结束会话会置 true，不复位则
+        //     新一轮首次退出就会错误地终止自动重连。
+        self.sent_close_reason = false;
+        self.no_reconnect = false;
+        // is_connected 也是每轮会话级状态，必须复位：登录成功后它跨轮存活，
+        // 会让下一轮在"还没登录"时就呈已连接状态（影响空闲判定等逻辑）。
+        self.is_connected = false;
+        // 空闲计时也要按轮复位：否则上一轮遗留的倒计时/旧时间戳会让
+        // 新一轮刚连上就立刻判定空闲。
+        self.inactivity_warning_remaining = None;
+        self.last_input_time = Instant::now();
 
         match Client::start(
             &self.handler.get_id(),
@@ -221,7 +282,7 @@ impl<T: InvokeUiSession> Remote<T> {
         )
         .await
         {
-            Ok(((mut peer, direct, pk, mut kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port))) => {
+            Ok(((mut peer, direct, pk, mut kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port, peer_nat_type))) => {
                 self.handler
                     .connection_round_state
                     .lock()
@@ -230,6 +291,15 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler
                     .set_connection_type(peer.is_secured(), direct, stream_type, &relay_server); // flutter -> connection_ready
                 self.handler.update_direct(Some(direct));
+                // 注意：预打洞直连路径**不**在这里武装连通性看门狗。
+                // 那条路径的 Client::start 内部已经在直连流上做完 secure_connection
+                // （应用层双向密钥交换），失败会自己回退中继流程——等价于一次
+                // 真实的应用层连通性验证，不存在"僵死无提示"。
+                // 而在这里武装会带来两个问题：① 它早于登录成功（is_connected），
+                // 主机等用户"接受/2FA"超过 5s 就会被误判为直连通；② 误判后
+                // direct==true 的轮次不会进入 Phase3，没有任何路径记账，熔断器
+                // 永不跳闸，会变成"5s 掐断→重连→再掐断"的死循环。
+                // 断流（网络波动）由主循环的 30s 无数据超时兜底。
                 // Phase3-specific channels (punch_stream/punch_notify already initialized before Client::start)
                 let punch_done = Arc::new(Notify::new());
                 let punch_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -256,13 +326,23 @@ impl<T: InvokeUiSession> Remote<T> {
                 {
                     // Skip Phase3 if it failed on a previous attempt (reconnection path).
                     // Only app restart or a successful Phase3 will reset this.
-                    if crate::common::should_skip_phase3() {
+                    // 服务端强制走中继时一律跳过 Phase3：否则 force-always-relay 只挡住
+                    // 中继前打洞，Phase3 换流仍会把会话升级成直连，等于开关失效。
+                    if self.handler.is_force_relay() {
+                        log::info!("Phase3: skipped (force relay by server policy)");
+                        self.handler.set_punch_status("failed", "force-relay");
+                    } else if crate::common::should_skip_phase3() {
                         log::info!("Phase3: skipped (previously failed in this session)");
+                        // 跳过时也要给终态，否则 UI 的穿透状态会停留在上次的
+                        // "正在穿透"（trying）不消失
+                        self.handler.set_punch_status("failed", "skipped");
                     } else {
                         let n = punch_notify.clone();
                         let d = punch_done.clone();
                         let s = punch_stream.clone();
                         let succ = punch_success.clone();
+                        // 对端 id：Phase3 换流成功后要做直连合规上报
+                        let phase3_peer_id = self.handler.get_id();
                         // 过滤无效地址（0.0.0.0 / 端口 0 不可打洞）
                         let mut p2p_addrs: Vec<std::net::SocketAddr> = peer_addrs
                             .iter()
@@ -299,6 +379,19 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                         let cancel = hbb_common::tokio_util::sync::CancellationToken::new();
                         self.phase3_cancel = Some(cancel.clone());
+                        // 打洞成功时：临时运行时必须继续存活。
+                        // kcp_io 泵和 KcpEndpoint::run() 内部的更新循环都是
+                        // tokio::spawn 到这个运行时上的；relay_upgrade_task 一旦
+                        // return，block_on 结束、rt 被 drop，这些任务会**立即被
+                        // 取消**——换流后新流随即 "stream closed"，表现为打洞
+                        // 成功却瞬间无法操作远程主机。因此成功后在这里阻塞等待
+                        // 会话结束信号，io_loop 退出时再发送（见本函数末尾）。
+                        let (rt_stop_tx, rt_stop_rx) = hbb_common::tokio::sync::oneshot::channel::<()>();
+                        self.phase3_rt_stop = Some(rt_stop_tx);
+                        // 穿透阶段流水线：relay_upgrade_task 各阶段发一行描述，
+                        // status_timer 轮询转发到 UI 磁贴（全流程可见，便于定位卡点）
+                        let (stage_tx, stage_rx) = std::sync::mpsc::channel::<String>();
+                        self.phase3_stage_rx = Some(stage_rx);
                         std::thread::spawn(move || {
                             let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
@@ -307,10 +400,16 @@ impl<T: InvokeUiSession> Remote<T> {
                             rt.block_on(async move {
                                 let ok = relay_upgrade_task(
                                     p2p_addrs, n, s, kcp_handle, punch_port,
-                                    phase3_out_tx, phase3_peer, phase3_tcp, cancel,
+                                    phase3_out_tx, phase3_peer, phase3_tcp, cancel, peer_nat_type,
+                                    stage_tx, phase3_peer_id,
                                 ).await;
                                 succ.store(ok, std::sync::atomic::Ordering::SeqCst);
                                 d.notify_one();
+                                if ok {
+                                    // 打洞成功：保住运行时，直到会话结束/重连。
+                                    // 发送端被 drop（io_loop 退出）同样会唤醒。
+                                    let _ = rt_stop_rx.await;
+                                }
                             });
                         });
                     } // end else
@@ -363,6 +462,17 @@ impl<T: InvokeUiSession> Remote<T> {
                             if let Some(res) = res {
                                 match res {
                                     Err(err) => {
+                                        // 换流竞态防护：打洞流已就绪时优先完成换流——
+                                        // 对端可能刚换流并 drop 了中继，导致这里读到错误，
+                                        // 但直连流已经打好，不能重连（否则"升级成功却断线"）。
+                                        if self
+                                            .try_apply_punch_upgrade(
+                                                &mut peer, &mut kcp, &punch_stream, &relay_server,
+                                            )
+                                            .await
+                                        {
+                                            continue;
+                                        }
                                         if received {
                                             log::info!("Connection lost, reconnecting...");
                                         } else {
@@ -373,9 +483,25 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                     Ok(ref bytes) => {
                                         last_recv_time = Instant::now();
+                                        // 直连换流确认：对端能在刚建立的直连流上发来数据，
+                                        // 即证明这条流双向可用（配对正确、NAT 洞已开）。
+                                        // 到这里才记 phase3 success——换流那一刻只代表
+                                        // KCP 握手完成，对称 NAT 下常有"假成功"。
+                                        if self.punch_verify_deadline.take().is_some() {
+                                            log::info!("Phase3: direct stream verified (peer data received)");
+                                            crate::common::record_phase3_success();
+                                        }
                                         if !received {
                                             received = true;
                                             self.handler.update_received(true);
+                                            // 本会话首次收到对端数据：若本就是直连会话
+                                            // （预打洞成功，没有换流动作、也就没有
+                                            // punch_verify_deadline），这里同样证明直连
+                                            // 可用，应重置熔断器——否则之前累计的失败
+                                            // 次数会一直挂着，把可用的直连也熔断掉。
+                                            if direct {
+                                                crate::common::record_phase3_success();
+                                            }
                                         }
                                         self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
                                         if !self.handle_msg_from_peer(bytes, &mut peer).await {
@@ -384,6 +510,16 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                 }
                             } else {
+                                // 换流竞态防护：中继被对端换流打断（EOF）时，
+                                // 若直连流已就绪则换流而不是重连。
+                                if self
+                                    .try_apply_punch_upgrade(
+                                        &mut peer, &mut kcp, &punch_stream, &relay_server,
+                                    )
+                                    .await
+                                {
+                                    continue;
+                                }
                                 if self.handler.is_restarting_remote_device() {
                                     log::info!("Restart remote device");
                                     self.handler.msgbox("restarting", "Restarting remote device", "remote_restarting_tip", "");
@@ -409,38 +545,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.handle_local_clipboard_msg(&mut peer, _msg).await;
                         }
                         _ = punch_notify.notified() => {
-                            let mut guard = punch_stream.lock().await;
-                            if let Some(new_peer) = guard.take() {
-                                log::info!("Relay upgraded to direct connection!");
-                                // 先让 relay 刷新挂起的消息，减少切流丢包
-                                allow_err!(peer.send(&Message::new()).await);
-                                let saved_key = peer.take_key();
-                                peer = new_peer;
-                                if let Some(enc) = saved_key {
-                                    // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途
-                                    // 报文若保留旧序号会使新流收发序号永久错位、解密失败；
-                                    // 两侧都在换流时刻归零，新流上序号自洽
-                                    peer.set_key(enc.0);
-                                    log::info!("Phase3: encryption key transferred to new stream (seq reset)");
-                                } else {
-                                    log::warn!("Phase3: no encryption key from old stream!");
-                                }
-                                // 给新流 50ms 稳定时间
-                                hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
-                                crate::common::record_phase3_success();
-                                self.handler.update_direct(Some(true));
-                                self.handler.set_connection_type(
-                                    peer.is_secured(), true, "UDP", &relay_server
-                                );
-                                self.handler.set_punch_status("succeeded", "UDP");
-                                // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start
-                                // 返回的 kcp 恒为 None，不更新的话断连时不会发 close_reason，
-                                // 对端要等 60s KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
-                                kcp = self
-                                    .phase3_kcp
-                                    .as_ref()
-                                    .and_then(|h| h.lock().ok().and_then(|mut g| g.take()));
-                            }
+                            // 换流逻辑与中继读失败分支共用（换流竞态防护）：
+                            // 无就绪流时静默返回（通知已消费但流已被取走属正常）
+                            self.try_apply_punch_upgrade(
+                                &mut peer, &mut kcp, &punch_stream, &relay_server,
+                            )
+                            .await;
                         }
                         _ = punch_done.notified() => {
                             // 单一换流路径在 punch_notify 分支；这里只处理打洞任务结束
@@ -458,10 +568,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut misc = Misc::new();
                             let mut ppa = PunchPeerAddr::new();
                             ppa.addr = phase3_my_info.addr.to_string().into();
-                            ppa.set_ready(phase3_my_info.ready);
-                            ppa.set_delta(phase3_my_info.delta);
-                            ppa.set_sync_at_ms(phase3_my_info.sync_at_ms);
-                            ppa.set_addr_type(phase3_my_info.addr_type);
+                            ppa.ready = phase3_my_info.ready;
+                            ppa.delta = phase3_my_info.delta;
+                            ppa.sync_at_ms = phase3_my_info.sync_at_ms;
+                            ppa.addr_type = phase3_my_info.addr_type;
                             misc.set_punch_peer_addr(ppa);
                             let mut msg = Message::new();
                             msg.set_misc(misc);
@@ -487,6 +597,59 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = status_timer.tick() => {
+                            // 直连换流确认看门狗：换流后 5s 内没收到对端在直连上的
+                            // 任何数据，说明这条直连流实际不通（KCP 配对错误或
+                            // 单向 NAT）。此时主动断开，让自动重连重建中继会话，
+                            // 避免僵死在不通的流上——否则用户完全无法操作远程主机。
+                            if let Some(deadline) = self.punch_verify_deadline {
+                                if Instant::now() >= deadline {
+                                    // rx 增量是关键证据：
+                                    //   0   → 对端换流后一个包都没发过来（或到不了）
+                                    //   >0  → 包收到了，但没形成应用层数据（解密/配对/上层）
+                                    let rx_now = crate::kcp_stream::kcp_rx_total();
+                                    let rx_delta = rx_now.saturating_sub(self.punch_verify_rx_base);
+                                    log::warn!(
+                                        "Phase3: direct stream not verified within 5s (no peer data), kcp_rx delta={} (base={} now={}), reconnecting to fall back to relay",
+                                        rx_delta,
+                                        self.punch_verify_rx_base,
+                                        rx_now
+                                    );
+                                    self.punch_verify_deadline = None;
+                                    // 必须记失败：换流时不再记 success，这里不记的话
+                                    // 熔断器永远不跳闸，每次重连都重新打洞→假成功
+                                    // →5s stall→重连，无限循环，用户每次连接都白等。
+                                    // 此处必然发生在登录成功之后（看门狗只在 Phase3
+                                    // 换流时武装，而 Phase3 需要先登录），所以这次
+                                    // 判定是可信的：已登录却 5s 收不到任何对端数据，
+                                    // 等于直连流不通。
+                                    crate::common::record_phase3_failure();
+                                    self.handler.set_punch_status("reconnecting", "");
+                                    break;
+                                }
+                            }
+                            // Phase3 穿透阶段流水：把最新阶段描述转发到 UI 磁贴，
+                            // 让用户看到"开始→等地址→等同步→阶段A→B→C→结果"全流程。
+                            // try_recv 非阻塞；channel 断开（打洞线程退出）时清空。
+                            // 关键：仅未直连时转发——换流成功后 channel 里可能还有
+                            // 残留的"阶段A"消息，若继续转发会把 try_apply_punch_upgrade
+                            // 置的 succeeded 覆盖回 trying（盾牌已绿、文字还在穿透中）。
+                            if !direct {
+                                if let Some(rx) = &self.phase3_stage_rx {
+                                    loop {
+                                        match rx.try_recv() {
+                                            Ok(stage) => {
+                                                log::info!("Phase3 stage: {}", stage);
+                                                self.handler.set_punch_status("trying", &stage);
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                                self.phase3_stage_rx = None;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let elapsed = fps_instant.elapsed().as_millis();
                             if elapsed < 1000 {
                                 continue;
@@ -533,6 +696,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                         log::info!("Inactivity timeout: closing connection");
                                         self.handler.msgbox("error", "Connection Error",
                                             "Disconnected due to inactivity", "");
+                                        // 空闲自动断开是"会话结束"语义：不能自动重连，
+                                        // 否则重连后又空闲 30min、再断、再连，空转 30 轮。
+                                        self.no_reconnect = true;
                                         break;
                                     }
                                     let remain = remaining - 1;
@@ -574,6 +740,12 @@ impl<T: InvokeUiSession> Remote<T> {
                     // KCP does not send messages immediately, so wait to ensure the last message is sent.
                     // 1ms works in my test, but 30ms is more reliable.
                     tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                // 最后才释放 Phase3 临时运行时（打洞成功时它一直保活到现在）。
+                // 必须放在 send_close_reason 之后——后者要靠该运行时上的
+                // kcp_io 把报文发出去。发信号让线程退出，运行时不泄漏。
+                if let Some(t) = self.phase3_rt_stop.take() {
+                    let _ = t.send(());
                 }
             }
             Err(err) => {
@@ -774,7 +946,10 @@ impl<T: InvokeUiSession> Remote<T> {
         if self.sent_close_reason {
             return;
         }
-        crate::common::reset_phase3_state();
+        // 注意：这里**不**重置 Phase3 熔断器。reset_phase3_state 只在用户
+        // 主动断开时调用（见 Data::Close 分支）——自动重连（看门狗超时/网络
+        // 波动/对端关闭）也会走到这里，一旦在这里重置，熔断器永远不跳闸：
+        // 假成功→看门狗 5s→重连→重置→再打洞，无限循环，用户每次连接都白等。
         let mut misc = Misc::new();
         misc.set_close_reason(reason.to_owned());
         let mut msg = Message::new();
@@ -783,9 +958,95 @@ impl<T: InvokeUiSession> Remote<T> {
         self.sent_close_reason = true;
     }
 
+    /// 换流竞态防护：若打洞流已就绪，把会话切换到直连流并返回 true。
+    ///
+    /// 对端可能先换流并 drop 了中继，导致本端在旧中继流上读到错误/EOF；
+    /// 此时直连流已经打好，不能重连（否则"升级成功却断线"）。
+    /// punch_notify 分支与中继读失败分支都走这里。无就绪流时返回 false。
+    async fn try_apply_punch_upgrade(
+        &mut self,
+        peer: &mut Stream,
+        kcp: &mut Option<crate::kcp_stream::KcpStream>,
+        punch_stream: &Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
+        relay_server: &str,
+    ) -> bool {
+        let new_peer = match punch_stream.lock().await.take() {
+            Some(s) => s,
+            None => return false,
+        };
+        log::info!("Relay upgraded to direct connection!");
+        // 先让 relay 刷新挂起的消息，减少切流丢包
+        allow_err!(peer.send(&Message::new()).await);
+        let saved_key = peer.take_key();
+        *peer = new_peer;
+        if let Some(enc) = saved_key {
+            // 用相同 key 重建 Encrypt（序号归零）：换流瞬间丢弃的在途报文若保留
+            // 旧序号会使新流收发序号永久错位、解密失败；两侧都在换流时刻归零，
+            // 新流上序号自洽
+            peer.set_key(enc.0);
+            log::info!("Phase3: encryption key transferred to new stream (seq reset)");
+        } else {
+            log::warn!("Phase3: no encryption key from old stream!");
+        }
+        // 给新流 50ms 稳定时间
+        hbb_common::tokio::time::sleep(Duration::from_millis(50)).await;
+        // 注意：这里**不**记 phase3 success。换流只说明 KCP 握手完成，不代表
+        // 这条流真的通（对称 NAT 下常见"假成功"）。成功记账改在真正收到对端
+        // 数据时做（见主循环 peer.next() 的 Ok 分支），否则一次假成功就把
+        // 熔断器计数清零，看门狗超时又不记失败，导致无限重试打洞。
+        self.handler.update_direct(Some(true));
+        self.handler
+            .set_connection_type(peer.is_secured(), true, "UDP", relay_server);
+        self.handler.set_punch_status("succeeded", "UDP");
+        // 丢弃穿透阶段 channel：relay_upgrade_task 返回前会再发几条阶段描述
+        // （阶段A/阶段B），若留着，主循环的 status_timer 会把它们当成新事件
+        // 转发，把刚置的 succeeded 覆盖回 trying——表现为"盾牌已绿、文字还在
+        // 穿透中"。
+        //
+        // 为什么不改成在主循环里判断：主循环的 `direct` 是 Client::start 解构
+        // 出来的只读副本，换流后不会更新，`if !direct` 永远为真、守不住。只有
+        // 在这里（换流真正发生的地方）清空才可靠。
+        self.phase3_stage_rx = None;
+        // 换流确认（看门狗）：直连流可能因 KCP 配对错误或单向 NAT 实际不通，
+        // 而两端都认为"打洞成功"。这里主动发一个 from_client 的 TestDelay
+        // （主机收到必原样回传），5s 内在新流上收到对端任何数据即确认双向
+        // 可用；超时未确认则由主循环断开，让自动重连回退到中继，而不是
+        // 僵死在一条不通的流上（表现为换流后无法操作远程主机）。
+        let mut probe = Message::new();
+        // 注意：TestDelay 在 message_proto 顶层（message_proto::TestDelay），
+        // 不在 message 子模块下；本文件已 glob 导入 message_proto::*。
+        probe.set_test_delay(TestDelay {
+            from_client: true,
+            ..Default::default()
+        });
+        if let Err(e) = peer.send(&probe).await {
+            log::warn!("Phase3: failed to send direct-stream probe: {}", e);
+        }
+        self.punch_verify_deadline = Some(Instant::now() + Duration::from_secs(5));
+        // 记录此刻的收包计数，超时时用它判断收方向到底有没有包
+        self.punch_verify_rx_base = crate::kcp_stream::kcp_rx_total();
+        log::info!(
+            "Phase3: armed 5s verify watchdog (kcp_rx_total={})",
+            self.punch_verify_rx_base
+        );
+        // 升级为 KCP 直连后接管 KcpStream：relay 路径下 Client::start 返回的
+        // kcp 恒为 None，不更新的话断连时不会发 close_reason，对端要等 60s
+        // KCP 超时才发现（KcpStream 仍存活至 io_loop 结束）
+        *kcp = self
+            .phase3_kcp
+            .as_ref()
+            .and_then(|h| h.lock().ok().and_then(|mut g| g.take()));
+        true
+    }
+
     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
         match data {
             Data::Close => {
+                // 用户主动断开：重置 Phase3 熔断器，下次连接重新尝试打洞。
+                // 自动重连不走这里（见 send_close_reason 的说明）。
+                crate::common::reset_phase3_state();
+                // 会话彻底结束：终止自动重连环。
+                self.no_reconnect = true;
                 self.send_close_reason(peer, "").await;
                 return false;
             }
@@ -1633,12 +1894,17 @@ impl<T: InvokeUiSession> Remote<T> {
                         if self.handler.is_view_camera() {
                             if !self.check_view_camera_support(&peer_version, &peer_platform) {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                                // 对端版本过低/不支持摄像头：重连也只是再弹一次同样的
+                                // 对话框，属"会话结束"语义。
+                                self.no_reconnect = true;
                                 return false;
                             }
                         }
                         if self.handler.is_terminal() {
                             if !self.check_terminal_support(&peer_version) {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                                // 同上：终端不受支持，不自动重连以免无限弹窗。
+                                self.no_reconnect = true;
                                 return false;
                             }
                         }
@@ -2122,7 +2388,9 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::CloseReason(c)) => {
-                        self.sent_close_reason = true; // The controlled end will close, no need to send close reason
+                        // 对端主动关闭：会话结束，不再自动重连（也不需要回发关闭原因）
+                        self.sent_close_reason = true;
+                        self.no_reconnect = true;
                         self.handler.msgbox("error", "Connection Error", &c, "");
                         return false;
                     }
@@ -2271,15 +2539,15 @@ impl<T: InvokeUiSession> Remote<T> {
                             if peer_addr.ip().is_unspecified() || peer_addr.is_ipv6() {
                                 log::info!("Phase3: ignore unusable peer address: {}", peer_addr);
                             } else {
-                                let addr_type = ppa.get_addr_type();
+                                let addr_type = ppa.addr_type;
                                 log::info!("Phase3: received peer address: {} (ready={}, delta={}, sync_at={}, type={})",
-                                    peer_addr, ppa.get_ready(), ppa.get_delta(),
-                                    ppa.get_sync_at_ms(), addr_type);
+                                    peer_addr, ppa.ready, ppa.delta,
+                                    ppa.sync_at_ms, addr_type);
                                 let info = crate::common::PunchAddrInfo {
                                     addr: peer_addr,
-                                    ready: ppa.get_ready(),
-                                    delta: ppa.get_delta(),
-                                    sync_at_ms: ppa.get_sync_at_ms(),
+                                    ready: ppa.ready,
+                                    delta: ppa.delta,
+                                    sync_at_ms: ppa.sync_at_ms,
                                     addr_type,
                                 };
                                 if addr_type == crate::common::PUNCH_ADDR_TYPE_TCP {
@@ -2588,6 +2856,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     "Someone turns on privacy mode, exit",
                     "",
                 );
+                // 他人已开隐私模式：本会话必须结束，自动重连只会与对方互相抢占
+                self.no_reconnect = true;
                 return false;
             }
             back_notification::PrivacyModeState::PrvNotSupported => {

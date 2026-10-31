@@ -80,12 +80,16 @@ class ConnectionType {
   final Rx<String> _stream_type = kInvalidValueStr.obs;
   final Rx<String> _relay_server = "".obs;
   final Rx<String> _punch_status = "".obs;
+  // 穿透阶段流水：Rust 端 relay_upgrade_task 各阶段发来的描述
+  // （开始→等地址→等同步→阶段A/B/C→结果），status=trying 时磁贴显示
+  final Rx<String> _punch_info = "".obs;
 
   Rx<String> get secure => _secure;
   Rx<String> get direct => _direct;
   Rx<String> get stream_type => _stream_type;
   Rx<String> get relay_server => _relay_server;
   Rx<String> get punch_status => _punch_status;
+  Rx<String> get punch_info => _punch_info;
 
   static String get strSecure => 'secure';
   static String get strInsecure => 'insecure';
@@ -110,6 +114,10 @@ class ConnectionType {
 
   void setPunchStatus(String v) {
     _punch_status.value = v;
+  }
+
+  void setPunchInfo(String v) {
+    _punch_info.value = v;
   }
 
   bool isValid() {

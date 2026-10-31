@@ -77,10 +77,6 @@ pub struct Session<T: InvokeUiSession> {
     pub displays_empty_retries: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
-    // Upgrade notification channels, set by io_loop for background LAN/Phase3 upgrade.
-    // Shared via Arc/RwLock so the clone passed into Client::start sees the same channels.
-    pub upgrade_stream: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>>>,
-    pub upgrade_notify: Arc<RwLock<Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>>>,
 }
 
 #[derive(Clone)]
@@ -1761,6 +1757,10 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         return self.lc.clone();
     }
 
+    fn report_punch_status(&self, status: &str, info: &str) {
+        self.ui_handler.set_punch_status(status, info);
+    }
+
     fn send(&self, data: Data) {
         if let Some(sender) = self.sender.read().unwrap().as_ref() {
             sender.send(data).ok();
@@ -1776,6 +1776,18 @@ impl<T: InvokeUiSession> Interface for Session<T> {
     }
 
     fn handle_login_error(&self, err: &str) -> bool {
+        // 重连场景（reconnect_count>0）下的"密码错误/密码为空"多为网络波动导致
+        // 密码响应丢失被服务端误判：保留已保存的密码，结束本连接由自动重连
+        // 用保存的密码重新验证，避免网络波动时反复弹"重新输入密码"。
+        if (err == crate::client::LOGIN_MSG_PASSWORD_WRONG
+            || err == crate::client::LOGIN_MSG_PASSWORD_EMPTY)
+            && self.reconnect_count.load(Ordering::SeqCst) > 0
+        {
+            log::info!(
+                "Password error during reconnect, keep password and let auto-reconnect retry"
+            );
+            return false;
+        }
         handle_login_error(self.lc.clone(), err, self)
     }
 
@@ -1783,25 +1795,6 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         self.ui_handler.set_multiple_windows_session(sessions);
     }
 
-    fn set_upgrade_channels(
-        &self,
-        stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
-        notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
-    ) {
-        *self.upgrade_stream.write().unwrap() = Some(stream);
-        *self.upgrade_notify.write().unwrap() = Some(notify);
-    }
-    fn get_upgrade_channels(
-        &self,
-    ) -> (
-        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
-        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
-    ) {
-        (
-            self.upgrade_stream.read().unwrap().clone(),
-            self.upgrade_notify.read().unwrap().clone(),
-        )
-    }
 
     fn handle_peer_info(&self, mut pi: PeerInfo) {
         log::debug!("handle_peer_info :{:?}", pi);
@@ -2091,11 +2084,20 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     for retry in 0..max_retries {
         if retry > 0 {
             log::info!("Connection lost, auto-reconnect attempt #{}/{} (delay={:.1}s)", retry + 1, max_retries, delay);
+            // 标记为重连：Session::handle_login_error 据此区分"网络波动误报密码错误"，
+            // 保留已保存的密码自动重试，避免反复弹"重新输入密码"；
+            // 无密码/手动接收场景：重连时跳过"输入密码"弹框，直接发空密码由对端接受。
+            remote.mark_reconnecting();
             sleep(delay).await;
             delay = (delay * 1.5).min(15.0);
         }
         remote.io_loop(&key, &token, round).await;
-        if remote.sent_close_reason {
+        // 只有"会话彻底结束"才停止重连：用户主动关闭、或对端发来 CloseReason。
+        // 直连流出错/看门狗超时/网络波动都会走到这里，但那些情况应当继续
+        // 自动重连（退回中继重建会话）——原来判断 sent_close_reason 会把
+        // "已向对端发送关闭原因"误当成"会话结束"，导致 KCP 会话退出后
+        // 自动重连被静默终止，用户只能手动重连。
+        if remote.no_reconnect {
             break;
         }
         // 文件传输会话：重连前落盘当前进度并清空内存任务，

@@ -471,16 +471,38 @@ def init_global_vars(dist_dir, app_name, args):
     global g_build_date
     g_version = args.version.replace("-", ".")
     if g_version == "":
+        # 没有显式传 --version 时，退回"执行已构建的 exe 读版本"。
+        # 这条路径很脆弱：一旦 CI 的 BUILD_VERSION 没传到位，exe 会退回
+        # Cargo.toml 里的版本（长期是 1.5.4），MSI 的 ProductVersion 就会
+        # 变成 1.5.4.x —— 比已安装的 1.7.x 低，Windows Installer 直接报
+        # "已安装更新版本"，用户看到的就是"新包版本更低"。
+        # 因此 CI 必须显式传 -v（见 flutter-build.yml）。
         g_version = read_process_output("--version")
     version_pattern = re.compile(r"\d+\.\d+\.\d+.*")
     if not version_pattern.match(g_version):
         print(f"Error: version {g_version} not found in {dist_app}")
         return False
+    # MSI 的 ProductVersion 规范只接受三段 major.minor.build
+    # （major/minor <= 255，build <= 65535）。历史上这里会再拼一段
+    # revision，得到四段版本（如 1.7.11.29890515）：
+    #   - 不符合 Windows Installer 规范，版本比较行为不可靠；
+    #   - "程序和功能"里直接显示成 1.7.11.29890515，用户无法判断大小。
+    # 现在固定为三段，只保留 x.y.z。
+    parts = g_version.split(".")
+    if len(parts) > 3:
+        print(f"Warning: version {g_version} has more than 3 fields, truncating to {'.'.join(parts[:3])}")
+        g_version = ".".join(parts[:3])
     if g_version.count(".") == 2:
-        # https://github.com/dotnet/runtime/blob/5535e31a712343a63f5d7d796cd874e563e5ac14/src/libraries/System.Private.CoreLib/src/System/Version.cs
-        if args.revision_version < 0 or args.revision_version > 2147483647:
-            raise ValueError(f"Invalid revision version: {args.revision_version}")    
-        g_version = f"{g_version}.{args.revision_version}"
+        # 三段就够：不再追加 revision。
+        # 同版本重装由 Package.wxs 的 AllowSameVersionUpgrades="yes" 兜底。
+        for idx in (0, 1):
+            if not g_version.split(".")[idx].isdigit():
+                print(f"Error: invalid version segment in {g_version}")
+                return False
+    build = int(g_version.split(".")[2])
+    if build < 0 or build > 65535:
+        print(f"Error: build number {build} out of MSI range (0..65535)")
+        return False
 
     g_build_date = read_process_output("--build-date")
     build_date_pattern = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")

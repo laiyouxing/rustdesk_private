@@ -202,7 +202,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16, i32),
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
@@ -247,7 +247,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16, i32),
         bool,
     )> {
         if config::is_incoming_only() {
@@ -264,7 +264,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0, 0),
                 false,
             ));
         }
@@ -278,7 +278,7 @@ impl Client {
                     None,
                     "TCP",
                 ),
-                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0),
+                (0, "".to_owned(), "".to_owned(), std::net::SocketAddr::from(([0,0,0,0], 0)), Vec::new(), 0, 0),
                 false,
             ));
         }
@@ -385,7 +385,7 @@ impl Client {
             Option<KcpStream>,
             &'static str,
         ),
-        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16),
+        (i32, String, String, std::net::SocketAddr, Vec<std::net::SocketAddr>, u16, i32),
         bool,
     )> {
         let mut start = Instant::now();
@@ -570,6 +570,91 @@ impl Client {
             relay_server = best;
         }
 
+        // ===== 中继前打洞（优先直连）=====
+        // 通过 api-server 交换 STUN 地址后立即打洞：成功则本连接从一开始就是
+        // 直连会话（secure_connection + Login 都走直连），不再"先建中继、再
+        // 打洞、再换流"——双连接与换流竞态（切换后无法操作）由此消除。
+        // 打洞失败/超时则无缝回退到下面的中继流程，功能不受影响。
+        // 仅桌面控制/摄像头会话打洞；强制中继或未配置 api-server 时跳过。
+        let punchable_conn = conn_type == ConnType::DEFAULT_CONN
+            || conn_type == ConnType::VIEW_CAMERA;
+        // 同局域网（is_local）时不走 api-server 打洞：公网映射地址在局域网内
+        // 反而绕远，直接走下面的 LAN 并行测试更快。
+        // should_skip_phase3：直连连续失败（含"握手成功但 5s 无数据"的假成功）
+        // 已达熔断上限，不再白试——与 Phase3 共用同一个熔断器。
+        if punchable_conn
+            && !is_local
+            && !interface.is_force_relay()
+            && !crate::common::should_skip_phase3()
+            && crate::hbbs_http::punch_exchange::available()
+        {
+            log::info!("pre-relay punch: trying direct UDP punch via api-server before relay");
+            // 状态上报：让 UI 知道正在尝试中继前直连（此前新流程完全不发状态，
+            // 失败回退中继后用户只看到 Phase3 的"穿透中"，无法区分是哪一轮）
+            interface.report_punch_status("trying", "pre-relay");
+            match crate::common::punch_direct_via_api(
+                &peer,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok((kcp, mut direct_stream, punched_peer_addr)) => {
+                    log::info!(
+                        "pre-relay punch succeeded: {}, doing key exchange on direct stream",
+                        punched_peer_addr
+                    );
+                    // 直连上与 LAN 直连相同的完整握手
+                    match Self::secure_connection(
+                        &peer,
+                        signed_id_pk.clone(),
+                        &key,
+                        &mut direct_stream,
+                    )
+                    .await
+                    {
+                        Ok(pk) => {
+                            log::info!("pre-relay punch: direct connection established (UDP)");
+                            // set_connection_type(direct=true) 会让 flutter 把
+                            // punch_status 置为 succeeded，这里再显式确认一次
+                            interface.report_punch_status("succeeded", "UDP");
+                            return Ok((
+                                (direct_stream, true, pk, Some(kcp), "UDP"),
+                                (
+                                    feedback,
+                                    rendezvous_server,
+                                    relay_server,
+                                    punched_peer_addr,
+                                    Vec::new(),
+                                    udp_nat_port,
+                                    peer_nat_type as i32,
+                                ),
+                                false,
+                            ));
+                        }
+                        Err(e) => {
+                            log::info!(
+                                "pre-relay punch: key exchange on direct stream failed: {:?}, fallback to relay",
+                                e
+                            );
+                            interface.report_punch_status("failed", "pre-relay key exchange");
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::info!("pre-relay punch failed, fallback to relay: {:?}", e);
+                    // 明确告知"中继前直连没成功"，随后 Phase3 会接手并置 trying
+                    interface.report_punch_status("failed", "pre-relay");
+                    // 告知服务端"本次回退中继"：否则服务端看到"有打洞意图 +
+                    // 有活跃会话 + 没有直连上报"，会误判成未登记的直连并强制断开。
+                    // fire-and-forget，不阻塞中继建连。
+                    let p = peer.clone();
+                    tokio::spawn(async move {
+                        crate::common::report_relay_fallback(&Config::get_id(), &p).await;
+                    });
+                }
+            }
+        }
+
         // Relay 先稳定建立（request_relay + secure_connection），保证 B 端无异常。
         // 如果 relay 建连过程中被 cancel，会触发 relay server 通知 B 端断连，
         // 导致后续 LAN 直连成功的 Session 也被 B 端关闭（登录中断）。
@@ -631,7 +716,7 @@ impl Client {
                     log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
                     return Ok((
                         (stream, true, lan_pk, None, "LAN"),
-                        (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+                        (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),
                         false,
                     ));
                 }
@@ -642,7 +727,7 @@ impl Client {
         }
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (my_nat_type, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port),
+            (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),
             false,
         ));
     }
@@ -1811,6 +1896,8 @@ pub struct LoginConfigHandler {
     pub force_relay: bool,
     pub direct: Option<bool>,
     pub received: bool,
+    // 自动重连中：无密码/手动接收场景下跳过"输入密码"弹框，避免网络波动反复提示
+    pub reconnecting: bool,
     switch_uuid: Option<String>,
     #[cfg(feature = "flutter")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1917,11 +2004,24 @@ impl LoginConfigHandler {
         self.session_id = sid;
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
-        self.force_relay =
-            config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
-                || force_relay
-                || use_ws()
-                || Config::is_proxy();
+        // 是否强制走中继（不建立 P2P 直连）。
+        //
+        // 来源有两处，**必须都查**：
+        //  1. 本机/每对端配置（PeerConfig）；
+        //  2. 全局配置（Config::get_options）—— api-server 下发的"策略"
+        //     就是写进这里的。PeerConfig 是每台对端独立存储、**不合并**
+        //     全局配置，所以只查 PeerConfig 时策略永远不生效。
+        //
+        // 键名兼容两种写法：客户端标准是 force-always-relay，
+        // 早期策略模板里误写成 force_relay，两个都认，避免管理员配了没反应。
+        let forbid_direct = |k: &str| config::option2bool("force-always-relay", &self.get_option(k));
+        self.force_relay = force_relay
+            || use_ws()
+            || Config::is_proxy()
+            || forbid_direct("force-always-relay")
+            || forbid_direct("force_relay")
+            || config::option2bool("force-always-relay", &Config::get_option("force-always-relay"))
+            || config::option2bool("force-always-relay", &Config::get_option("force_relay"));
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
@@ -3602,8 +3702,14 @@ pub async fn handle_hash(
     }
 
     let password = if password.is_empty() {
-        // login without password, the remote side can click accept
-        interface.msgbox("input-password", "Password Required", "", "");
+        // 无密码（手动接收）模式：
+        // - 首次连接弹输入框（可跳过，由对端手动接受）
+        // - 自动重连中（reconnecting）不再弹框，直接发空密码，避免网络波动反复提示
+        let reconnecting = lc.read().unwrap().reconnecting;
+        lc.write().unwrap().reconnecting = false;
+        if !reconnecting {
+            interface.msgbox("input-password", "Password Required", "", "");
+        }
         Vec::new()
     } else {
         let mut hasher = Sha256::new();
@@ -3762,6 +3868,13 @@ pub trait Interface: Send + Clone + 'static + Sized {
     );
     async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream);
 
+    /// 上报穿透状态给 UI（中继前打洞 / Phase3 都会调用）。
+    /// 命名刻意与 `InvokeUiSession::set_punch_status` 区分：`Session<T>` 同时
+    /// 实现这两个 trait，同名方法会让 `session.set_punch_status(..)` 产生
+    /// E0034 歧义。真正转发到 UI 的实现在 `ui_session_interface.rs` 里
+    /// `impl<T: InvokeUiSession> Interface for Session<T>`。
+    fn report_punch_status(&self, _status: &str, _info: &str) {}
+
     fn get_lch(&self) -> Arc<RwLock<LoginConfigHandler>>;
 
     fn get_id(&self) -> String {
@@ -3782,24 +3895,6 @@ pub trait Interface: Send + Clone + 'static + Sized {
         self.get_lch().write().unwrap().received = received;
     }
 
-    /// Set upgrade notification channels for post-relay LAN/Phase3 direct upgrade.
-    /// Called by io_loop before connection start to provide a communication path
-    /// for background LAN test tasks to notify the main loop of a new direct stream.
-    fn set_upgrade_channels(
-        &self,
-        _stream: std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>,
-        _notify: std::sync::Arc<hbb_common::tokio::sync::Notify>,
-    ) {
-    }
-    /// Retrieve upgrade notification channels, if previously set via set_upgrade_channels.
-    fn get_upgrade_channels(
-        &self,
-    ) -> (
-        Option<std::sync::Arc<hbb_common::tokio::sync::Mutex<Option<Stream>>>>,
-        Option<std::sync::Arc<hbb_common::tokio::sync::Notify>>,
-    ) {
-        (None, None)
-    }
 
     fn on_establish_connection_error(&self, err: String) {
         let title = "Connection Error";

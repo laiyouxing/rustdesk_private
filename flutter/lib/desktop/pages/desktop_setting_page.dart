@@ -12,6 +12,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
+import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/printer_model.dart';
@@ -2364,6 +2365,105 @@ class _About extends StatefulWidget {
 }
 
 class _AboutState extends State<_About> {
+  /// 手动检查更新中（按钮转圈并禁用）
+  bool _checkingUpdate = false;
+  Timer? _updateCheckTimeout;
+  static const _updateEvent = kCheckSoftwareUpdateFinish;
+  static const _updateHandlerName = 'about_check_update';
+
+  @override
+  void initState() {
+    super.initState();
+    // 与 common.dart 里的全局 handler 并行注册：事件按 handlerName 区分，
+    // 互不覆盖（见 models/native_model.dart: registerEventHandler）。
+    platformFFI.registerEventHandler(_updateEvent, _updateHandlerName,
+        (evt) async {
+      _onUpdateCheckFinished(evt);
+    });
+  }
+
+  @override
+  void dispose() {
+    _updateCheckTimeout?.cancel();
+    platformFFI.unregisterEventHandler(_updateEvent, _updateHandlerName);
+    super.dispose();
+  }
+
+  void _checkForUpdates() {
+    setState(() => _checkingUpdate = true);
+    // 触发一次真实的版本检查（走 api-server 的 /api/version/latest）
+    bind.mainGetSoftwareUpdateUrl();
+    // 服务端/网络异常时不会回事件，超时兜底，避免按钮一直转圈
+    _updateCheckTimeout?.cancel();
+    _updateCheckTimeout = Timer(const Duration(seconds: 15), () {
+      if (!mounted || !_checkingUpdate) return;
+      setState(() => _checkingUpdate = false);
+      _showUpdateResultDialog(
+        title: '检查更新',
+        content: '检查超时，请检查网络或服务器配置后重试。',
+        url: '',
+      );
+    });
+  }
+
+  void _onUpdateCheckFinished(Map<String, dynamic> evt) {
+    if (!mounted || !_checkingUpdate) return;
+    _updateCheckTimeout?.cancel();
+    final url = evt['url'] is String ? evt['url'] as String : '';
+    setState(() => _checkingUpdate = false);
+    if (url.isNotEmpty) {
+      _showUpdateResultDialog(
+        title: '发现新版本',
+        content: '发现新版本，是否现在更新？更新将自动完成下载与安装。',
+        url: url,
+      );
+    } else {
+      _showUpdateResultDialog(
+        title: '检查更新',
+        content: '当前已是最新版本。',
+        url: '',
+      );
+    }
+  }
+
+  void _showUpdateResultDialog(
+      {required String title,
+      required String content,
+      required String url}) {
+    // 安装版（Windows/macOS）支持自动更新：下载 → 确认 → 自动安装，
+    // 与主页更新卡片（handleUpdate）流程完全一致；
+    // 便携版/绿色版无法自动安装，回退为浏览器打开下载页。
+    final bool canAutoUpdate = url.isNotEmpty &&
+        !url.contains('rustdesk.com') &&
+        (isWindows || isMacOS) &&
+        bind.mainIsInstalled();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(content),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('取消'),
+          ),
+          if (url.isNotEmpty)
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                if (canAutoUpdate) {
+                  handleUpdate(url);
+                } else {
+                  launchUrlString(url);
+                }
+              },
+              child: Text(canAutoUpdate ? '更新' : '下载'),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return futureBuilder(future: () async {
@@ -2423,6 +2523,21 @@ class _AboutState extends State<_About> {
                     translate('Website'),
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
+              // 手动检查更新
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _checkingUpdate ? null : _checkForUpdates,
+                  icon: _checkingUpdate
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.system_update_alt, size: 16),
+                  label: Text(_checkingUpdate ? '正在检查…' : '检查更新'),
+                ).marginSymmetric(vertical: 4.0),
+              ),
               Container(
                 decoration: const BoxDecoration(color: Color(0xFF2c8cff)),
                 padding:

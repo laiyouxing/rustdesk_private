@@ -18,7 +18,7 @@ use hbb_common::{
     },
     futures::future::join_all,
     log,
-    protobuf::Message as _,
+    protobuf::{Enum, Message as _},
     rendezvous_proto::*,
     sleep,
     socket_client::{self, connect_tcp, is_ipv4, new_udp_for},
@@ -402,7 +402,12 @@ impl RendezvousMediator {
                 let peer_addr_bytes = ph.socket_addr.clone();
                 let provided_relay_server = ph.relay_server.clone();
                 let relay_servers: Vec<String> = ph.relay_servers.to_vec();
-                let punch_nat_type = ph.nat_type;
+                // 回显**本机（host）自己的** NAT 类型：hbbs 会把它写进给控制端的
+                // PunchHoleResponse.nat_type，控制端据此做 NAT 错峰判定（宽容端先打）。
+                // 原先回显 ph.nat_type（控制端发来的值），控制端收到的其实是自己的
+                // 类型，错峰条件恒不成立（offset 恒 0），功能失效。
+                let punch_nat_type = NatType::from_i32(Config::get_nat_type())
+                    .unwrap_or(NatType::UNKNOWN_NAT);
                 tokio::spawn(async move {
                     // If hbbs provided relay candidates, test latency and sort them.
                     // The sorted list (top 3) is sent back so A can also test and
@@ -449,7 +454,8 @@ impl RendezvousMediator {
                                 socket_addr: peer_addr_bytes,
                                 id: Config::get_id(),
                                 relay_server: final_relay,
-                                nat_type: punch_nat_type,
+                                // protobuf 枚举字段类型为 EnumOrUnknown<NatType>
+                                nat_type: punch_nat_type.into(),
                                 version: crate::VERSION.to_owned(),
                                 upnp_port: crate::common::get_upnp_port() as _,
                                 relay_servers: final_candidates.into(),
@@ -649,7 +655,15 @@ impl RendezvousMediator {
         let relay_server = self.get_relay_server(fla.relay_server.clone());
         let relay = use_ws() || Config::is_proxy();
         let mut socket_addr_v6 = Default::default();
-        if peer_addr_v6.port() > 0 && !relay {
+        // 必须同时满足：对端有 v6 地址、不走中继、且**用户开启了 IPv6 打洞**。
+        //
+        // 漏掉第三项是个真实缺陷：start_ipv6() 内部会调用 test_ipv6()，
+        // 而 test_bind_ipv6() 里的 STUNS_V6[0].to_socket_addrs() 是**同步阻塞**
+        // 的 getaddrinfo。在纯 IPv4 网络（公网 STUN v6 域名无 AAAA 记录）上，
+        // 每次连接都要付一次 DNS 失败超时（Windows 常见 5~10s），并且它是
+        // await 在 handle_intranet 里的——会把整个内网穿透处理堵住。
+        // 用户在设置里关掉 "IPv6 直连" 后这里仍然执行，表现为"关了也没用"。
+        if peer_addr_v6.port() > 0 && !relay && crate::get_ipv6_punch_enabled() {
             socket_addr_v6 = start_ipv6(
                 peer_addr_v6,
                 addr,
@@ -835,6 +849,36 @@ fn get_direct_port() -> i32 {
 async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
+    // ===== 中继前打洞（被控端）=====
+    // 发现控制端请求后立即主动打洞（主机侧 prefer_connect=false，即 accept
+    // 控制端发起的流），成功则直接交给 ConnInner 接管——连接从一开始就是
+    // 直连会话。
+    //
+    // 上报策略（事件触发，不做定时轮询，省带宽）：
+    //   1) 启动后上报一次——保证"打开软件即就绪"；
+    //   2) 本地 IP 集合变化（切换 WiFi/有线/VPN）时上报——循环内纯本地检测，
+    //      零带宽，同时作废映射缓存强制重探测；
+    //   3) 每次 api-server 心跳成功后附带上报（sync.rs 挂点，节流见
+    //      PUNCH_REPORT_THROTTLE），掉线重连后网络恢复时心跳成功即自动覆盖；
+    //   4) 控制端连接时必带 target 上报（punch_direct_via_api，不节流）。
+    // inbox（"谁想连我"）每 3s 拉一次：这是被控端发现连接请求的唯一途径，
+    // 3s 内可发现；控制端等对端地址上限 10s，足以覆盖。
+    let mut reported_startup = false;
+    let mut last_inbox = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap_or_else(std::time::Instant::now);
+    // 映射看门狗：定时轻量探测映射、仅变化时上报（覆盖路由器 NAT 老化等
+    // 本地 IP 不变的静默变化）。整个进程一个实例，随 mediator 生命周期。
+    tokio::spawn(crate::common::punch_mapped_watchdog());
+    // 本地 IP 集合（变化检测基线；纯本地枚举，无网络开销）
+    let mut last_local_ips = local_ip_set();
+    // 已发起过打洞的请求 -> (请求指纹, 发起时间)。
+    // 去重必须按"请求"而不是"请求方"：inbox 的 TTL 只有 60s，控制端断开重连
+    // 时会生成新请求，若按 peer_id 屏蔽 120s，重连在 60~120s 内会被静默忽略，
+    // 控制端白等到超时才回退中继。指纹 = 请求刷新时间(updated_at) + 地址集合
+    // + 最大 sync_at，详见 inbox_request_key；同一请求被轮询到多次才去重。
+    let mut handled: std::collections::HashMap<String, (String, std::time::Instant)> =
+        std::collections::HashMap::new();
     loop {
         let disabled = !option2bool(
             OPTION_DIRECT_SERVER,
@@ -866,6 +910,58 @@ async fn direct_server(server: ServerPtr) {
                 }
             }
         }
+
+        // ---- 中继前打洞：事件触发上报 + inbox（不依赖 direct-server 监听是否可用）----
+        if crate::hbbs_http::punch_exchange::available() {
+            // 1) 启动后上报一次（打开即就绪）
+            if !reported_startup {
+                reported_startup = true;
+                tokio::spawn(crate::common::punch_report_own_addrs());
+            }
+            // 2) 本地 IP 集合变化（网络切换）→ 立即上报（绕过节流）
+            let cur_ips = local_ip_set();
+            if cur_ips != last_local_ips {
+                log::info!(
+                    "pre-relay punch(host): local IP set changed ({:?} -> {:?}), refreshing punch address",
+                    last_local_ips,
+                    cur_ips
+                );
+                last_local_ips = cur_ips;
+                crate::common::invalidate_punch_mapped_cache();
+                // 走 report_own_addrs_inner 绕开 20s 节流：缓存刚被作废，
+                // 若刚好在节流窗口内，punch_report_own_addrs 会直接 return，
+                // 新地址要再等最多 20s 才上报，期间对端拿旧映射打不进来。
+                tokio::spawn(crate::common::report_own_addrs_inner());
+            }
+            // 3) inbox：每 3s 检查一次连接请求
+            if last_inbox.elapsed() >= std::time::Duration::from_secs(3) {
+                last_inbox = std::time::Instant::now();
+                let entries =
+                    crate::hbbs_http::punch_exchange::get_inbox(&Config::get_id()).await;
+                for e in entries {
+                    // 请求指纹：地址集合 + 最大 sync_at。同一请求的重复轮询去重，
+                    // 新请求（重连/换网络）指纹不同，立即重新打洞。
+                    let req_key = inbox_request_key(&e);
+                    if let Some((last_key, t)) = handled.get(&e.peer_id) {
+                        if *last_key == req_key
+                            && t.elapsed() < std::time::Duration::from_secs(120)
+                        {
+                            continue;
+                        }
+                    }
+                    handled.insert(e.peer_id.clone(), (req_key, std::time::Instant::now()));
+                    log::info!(
+                        "pre-relay punch(host): connection request from {} via api-server, punching {} addr(s)",
+                        e.peer_id,
+                        e.addrs.len()
+                    );
+                    let server = server.clone();
+                    tokio::spawn(punch_inbound_once(server, e.peer_id, e.addrs));
+                }
+                handled.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(300));
+            }
+        }
+
         if let Some(l) = listener.as_mut() {
             if disabled || port != get_direct_port() {
                 log::info!("Exit direct access listen");
@@ -899,6 +995,290 @@ async fn direct_server(server: ServerPtr) {
             sleep(1.).await;
         }
     }
+}
+
+/// 本机 IPv4 地址集合（排序去重，用于网络切换检测）。纯本地枚举，无网络开销。
+fn local_ip_set() -> Vec<String> {
+    let mut v: Vec<String> = crate::common::get_all_ipv4_addrs()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// inbox 请求指纹：同一控制端重新连接会生成新请求，靠它区分"重复轮询同
+/// 一个请求"和"这是一次新的连接请求"。
+/// 组成：api-server 的请求刷新时间（updated_at，秒级，最可靠）+ 地址集合 +
+/// 最大 sync_at。updated_at 在旧版 api-server 上为 0，此时退化为后两项——
+/// 注意 sync_at 对齐到 8s 边界，同一边界内的两次连接指纹会相同（见下）。
+fn inbox_request_key(e: &crate::hbbs_http::punch_exchange::InboxEntry) -> String {
+    let mut addrs: Vec<&str> = e.addrs.iter().map(|a| a.addr.as_str()).collect();
+    addrs.sort();
+    let sync_at = e.addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
+    format!("{}|{}|{}", e.updated_at, addrs.join(","), sync_at)
+}
+
+/// 把已通过合规上报的直连流交给连接层。
+///
+/// 注意：直连合规上报不在本函数做——它已由 `common::punch_target_sustained`
+/// 在所有直连路径的唯一出口处完成；上报失败的直连根本走不到这里。
+///
+/// KcpStream 必须活到会话结束：它的 Drop 会关掉 stop_sender，kcp_io 泵随之
+/// 退出，直连会话立刻无法收发包，所以和 create_tcp_connection 一起 move 进
+/// 同一个任务。
+fn handoff_direct_stream(
+    server: ServerPtr,
+    kcp: crate::kcp_stream::KcpStream,
+    stream: hbb_common::Stream,
+    addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        allow_err!(
+            crate::server::create_tcp_connection(server, stream, addr, true, None, false).await
+        );
+        drop(kcp);
+    });
+}
+
+/// 被控端：对一台控制端的公网地址主动打洞（中继前打洞的一次性任务）。
+/// 成功则把直连流交给 `create_tcp_connection`（ConnInner 接管，等 Login）。
+async fn punch_inbound_once(
+    server: ServerPtr,
+    peer_id: String,
+    addrs: Vec<crate::hbbs_http::punch_exchange::PunchAddr>,
+) {
+    // 预算从函数入口算：下面的 STUN 探测（ensure_punch_mapped）可能花几秒，
+    // 也要计入，否则打洞窗口比预期短、或整体耗时超出预算。
+    let budget = Duration::from_secs(45);
+    let started = std::time::Instant::now();
+    let total_deadline = started + budget;
+
+    // 按对端建议优先级排序，并过滤不可用地址
+    let peer_addrs = crate::hbbs_http::punch_exchange::sort_addrs(addrs);
+    let mut targets: Vec<std::net::SocketAddr> = Vec::new();
+    // 对端公网 IPv6（取第一个可用）：走 v6 直连快速通道。
+    // 不能混进 v4 目标列表——共享 v4 socket 无法 send_to v6 目标，
+    // 混进来只会白占轮转槽位（每个 5s），压低 v4 成功率。
+    let mut peer_v6: Option<std::net::SocketAddr> = None;
+    for a in &peer_addrs {
+        if !a.is_udp() {
+            continue;
+        }
+        let Ok(sa) = a.addr.parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        if crate::common::is_unusable_punch_addr(&sa) {
+            continue;
+        }
+        if sa.is_ipv6() {
+            if peer_v6.is_none() {
+                peer_v6 = Some(sa);
+            }
+            continue;
+        }
+        if !targets.contains(&sa) {
+            targets.push(sa);
+        }
+        // 对端（疑似）对称 NAT：用 delta 预测其映射邻居端口
+        if a.delta != 0 {
+            let p = sa.port() as i32 + a.delta;
+            if (1..=65535).contains(&p) {
+                let mut t = sa;
+                t.set_port(p as u16);
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+        }
+    }
+    if targets.is_empty() && peer_v6.is_none() {
+        return;
+    }
+    log::info!(
+        "pre-relay punch(host): punching {} for {} target(s), peer IPv6: {:?}",
+        peer_id,
+        targets.len(),
+        peer_v6
+    );
+
+    // 打洞 socket：用进程级共享 socket（启动时已创建 + STUN 缓存），
+    // 保证 NAT 映射与上报的一致，也省去现场探测。
+    let socket = match crate::common::ensure_shared_punch_socket().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::info!("pre-relay punch(host): bind failed: {:?}", e);
+            return;
+        }
+    };
+    // 记录本机主映射（成功后存为 last_success）；缓存热则零探测。
+    // 注意顺序：先探测、后申领共享 socket 使用权——否则 ensure_punch_mapped
+    // 会因"socket 忙"而跳过探测（只拿到可能已过期的旧缓存）。
+    let my_primary = crate::common::ensure_punch_mapped()
+        .await
+        .map(|(a, _)| a);
+    // 共享 socket 使用凭证：持有到函数返回（含整个打洞过程），期间看门狗/
+    // 其它 STUN 探测会跳过，不会 recv_from 抢走我们的报文。
+    let _shared_use = crate::common::shared_socket_acquire();
+
+    // 同步：与控制端约定起始时刻取较大值（取对端上报的 sync_at）。
+    // 约束：sync 等待不得吃掉打洞窗口——最晚等到"预算死线前 10s"，
+    // 否则被控端可能等到控制端早已放弃（控制端总预算 30s）。
+    const HOST_PUNCH_MIN_WINDOW: Duration = Duration::from_secs(10);
+    let peer_sync_at = peer_addrs.iter().map(|a| a.sync_at_ms).max().unwrap_or(0);
+    let ntp_offset = crate::common::ntp_offset_ms().await;
+    let own_sync = crate::common::punch_sync_boundary(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64 + ntp_offset.unwrap_or(0))
+            .unwrap_or(0),
+    );
+    let target_sync = own_sync.max(peer_sync_at);
+    if target_sync > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let wait = target_sync - now_ms;
+        if wait > 0 && wait <= 30_000 {
+            let now = std::time::Instant::now();
+            let wanted = now + Duration::from_millis(wait as u64);
+            // 最晚等到"死线前保留最小打洞窗口"的时刻
+            // （Instant 没有 saturating_sub，用 checked_sub + 兜底）
+            let latest = total_deadline
+                .checked_sub(HOST_PUNCH_MIN_WINDOW)
+                .unwrap_or(total_deadline);
+            let until = wanted.min(latest);
+            let actual_ms = until.saturating_duration_since(now).as_millis() as u64;
+            if actual_ms > 0 {
+                log::info!(
+                    "pre-relay punch(host): waiting {}ms until sync_at {} (clipped to keep {}s punch window)",
+                    actual_ms,
+                    target_sync,
+                    HOST_PUNCH_MIN_WINDOW.as_secs()
+                );
+                hbb_common::tokio::time::sleep(Duration::from_millis(actual_ms)).await;
+            }
+        }
+    }
+
+    // ===== IPv6 直连快速通道：与 v4 轮转**并发**，不串行占用预算 =====
+    // 串行会让 v6 的 4s 从同一个 total_deadline 切走，v4 的每目标 5s 就少打
+    // 一个（40s 预算下 9 个目标变 8 个），等于变相压低 v4 成功率。
+    // 并发则完全不碰 v4 的墙钟：v6 只是抢跑，成功就用它，没成功静默退出。
+    // 主机侧 prefer_connect=false（accept 控制端发起的流），与控制端互补。
+    // 熔断已跳闸时不 spawn：省掉一次注定失败的后台任务（只跳过 v6）。
+    let mut v6_task = peer_v6
+        .and_then(|v6| crate::common::v6_budget_from(total_deadline).map(|b| (v6, b)))
+        .filter(|_| crate::common::v6_should_attempt())
+        .map(|(v6, budget)| {
+            let peer_id = peer_id.clone();
+            tokio::spawn(async move {
+                crate::common::punch_ipv6_direct(v6, false, budget, &peer_id).await
+            })
+        });
+
+    // 多地址轮转打洞（主机侧 prefer_connect=false，accept 控制端发起的流）。
+    // 每个目标最多 5s，预算 45s 内按优先级轮换。
+    for target in targets {
+        if std::time::Instant::now() >= total_deadline {
+            break;
+        }
+        let per_target = Duration::from_millis(5_000);
+        let target_deadline = (std::time::Instant::now() + per_target).min(total_deadline);
+        while std::time::Instant::now() < target_deadline {
+            // v4 每轮之间顺带看一眼 v6 是否抢先成功：成功就没必要继续打 v4
+            // （只省时间，不改变 v4 的任何参数）。take() 后未完成则放回。
+            if let Some(task) = v6_task.take() {
+                if task.is_finished() {
+                    if let Ok(Ok((kcp, stream, addr))) = task.await {
+                        log::info!(
+                            "pre-relay punch(host): IPv6 direct link to {} established, handing over to connection",
+                            addr
+                        );
+                        if let Some(mine) = my_primary {
+                            crate::common::save_punch_last_success(&mine);
+                        }
+                        // 先上报，成功才交接；失败则丢弃该直连，控制端会回退中继
+                        handoff_direct_stream(server.clone(), kcp, stream, addr);
+                        return;
+                    }
+                    log::debug!("pre-relay punch(host): IPv6 fast path ended without link");
+                } else {
+                    v6_task = Some(task);
+                }
+            }
+            let sock = socket.clone();
+            // 未 connect 模式：共享 socket 要同时服务多个控制端（一对多远程），
+            // 不能 connect 锁定单一目标；用 send_to 探测可达性
+            if sock.send_to(&[], target).await.is_err() {
+                break;
+            }
+            let remain_ms = total_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            let round_ms = crate::common::PUNCH_ROUND_MS.min(remain_ms.max(500));
+            if let Some((kcp, stream)) =
+                crate::common::punch_target_sustained(&sock, target, round_ms, false, Some(target), &peer_id).await
+            {
+                // 优先确认 v6 是否也已成功：控制端同样优先采纳 v6。若此处直接
+                // 返回 v4 而控制端此刻采纳了 v6，两端各用一条链路（都能握手
+                // 但互不相通），本可直连的会话会退化为中继。
+                if let Some(task) = v6_task.take() {
+                    if task.is_finished() {
+                        if let Ok(Ok((v6_kcp, v6_stream, v6_addr))) = task.await {
+                            log::info!(
+                                "pre-relay punch(host): IPv6 direct link to {} established (v4 {} also succeeded, preferring v6)",
+                                v6_addr,
+                                target
+                            );
+                            if let Some(mine) = my_primary {
+                                crate::common::save_punch_last_success(&mine);
+                            }
+                            // 先上报再交接；v6 上报失败则继续走下面的 v4 交接
+                            handoff_direct_stream(server.clone(), v6_kcp, v6_stream, v6_addr);
+                            return;
+                        }
+                    } else {
+                        // v6 还没结果：abort（JoinHandle 的 drop 不会中止任务，
+                        // 否则它会游离到超时并持续占用共享 v6 socket 的读循环）
+                        task.abort();
+                    }
+                }
+                log::info!(
+                    "pre-relay punch(host): KCP punch to {} succeeded after {:?}, handing over to connection",
+                    target,
+                    started.elapsed()
+                );
+                if let Some(mine) = my_primary {
+                    crate::common::save_punch_last_success(&mine);
+                }
+                // 先上报，成功才交接（失败则丢弃直连，控制端会回退中继）
+                handoff_direct_stream(server.clone(), kcp, stream, target);
+                return;
+            }
+        }
+    }
+    // v4 轮转结束仍未成功：给 v6 一个收尾机会（它可能刚好还在握手中）
+    if let Some(task) = v6_task {
+        if let Ok(Ok((kcp, stream, addr))) = task.await {
+            log::info!(
+                "pre-relay punch(host): IPv6 direct link to {} established (after v4 rounds)",
+                addr
+            );
+            if let Some(mine) = my_primary {
+                crate::common::save_punch_last_success(&mine);
+            }
+            handoff_direct_stream(server.clone(), kcp, stream, addr);
+            return;
+        }
+    }
+    log::info!(
+        "pre-relay punch(host): punch to {} failed after {:?} (will rely on normal relay/accept path)",
+        peer_id,
+        started.elapsed()
+    );
 }
 
 enum Sink<'a> {
@@ -959,6 +1339,10 @@ async fn udp_nat_listen(
             res,
         )
         .await?;
+        // KcpStream 必须活到会话结束：它的 Drop 会关掉 stop_sender，kcp_io
+        // 泵随之退出，这条 LAN 直连会立刻不通（表现为连上就卡住）。
+        // create_tcp_connection 内部 await 到会话结束，所以一起留着即可。
+        let kcp_keepalive = stream.0;
         crate::server::create_tcp_connection(
             server,
             stream.1,
@@ -968,6 +1352,7 @@ async fn udp_nat_listen(
             false,
         )
         .await?;
+        drop(kcp_keepalive);
         Ok(())
     };
     func.await.map_err(|e: anyhow::Error| {

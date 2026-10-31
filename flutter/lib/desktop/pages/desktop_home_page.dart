@@ -227,7 +227,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   ?.color
                                   ?.withOpacity(0.5)),
                         ).marginOnly(top: 5),
-                        buildPopupMenu(context)
+                        Row(
+                          children: [
+                            buildCopyIdButton(context),
+                            buildPopupMenu(context),
+                          ],
+                        )
                       ],
                     ),
                   ),
@@ -257,6 +262,38 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           ),
         ],
       ),
+    );
+  }
+
+  /// 本机 ID 标题行的"复制 ID"按钮，样式与 buildPopupMenu 一致。
+  Widget buildCopyIdButton(BuildContext context) {
+    final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    RxBool hover = false.obs;
+    return InkWell(
+      onTap: () {
+        final id = gFFI.serverModel.serverId.text;
+        if (id.isNotEmpty) {
+          Clipboard.setData(ClipboardData(text: id));
+          showToast(translate("Copied"));
+        }
+      },
+      child: Tooltip(
+        message: translate('Copy ID'),
+        child: Obx(
+          () => CircleAvatar(
+            radius: 15,
+            backgroundColor: hover.value
+                ? Theme.of(context).scaffoldBackgroundColor
+                : Theme.of(context).colorScheme.background,
+            child: Icon(
+              Icons.copy_outlined,
+              size: 20,
+              color: hover.value ? textColor : textColor?.withOpacity(0.5),
+            ),
+          ),
+        ),
+      ),
+      onHover: (value) => hover.value = value,
     );
   }
 
@@ -454,16 +491,23 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           }
           final apiServer = await bind.mainGetApiServer();
           final Uri url;
-          if (updateUrl.isNotEmpty && !updateUrl.startsWith('https://github.com/rustdesk')) {
+          // 仅当 updateUrl 为官方地址（rustdesk.com / github.com/rustdesk）时替换为自定义地址
+          final bool isOfficialUrl = updateUrl.contains('rustdesk.com') ||
+              updateUrl.startsWith('https://github.com/rustdesk') ||
+              updateUrl.startsWith('http://github.com/rustdesk');
+          if (updateUrl.isNotEmpty && !isOfficialUrl) {
             url = Uri.parse(updateUrl);
           } else if (apiServer.isNotEmpty) {
             url = Uri.parse(apiServer + '/downloads');
           } else {
-            url = Uri.parse('https://rustdesk.com/download');
+            url = Uri.parse('https://github.com/laiyouxing/rustdesk_private/releases');
           }
           await launchUrl(url);
         };
-        final downloadLink = (updateUrl.isNotEmpty && !updateUrl.startsWith('https://github.com/rustdesk'))
+        final bool isOfficialLink = updateUrl.contains('rustdesk.com') ||
+            updateUrl.startsWith('https://github.com/rustdesk') ||
+            updateUrl.startsWith('http://github.com/rustdesk');
+        final downloadLink = (updateUrl.isNotEmpty && !isOfficialLink)
             ? updateUrl
             : 'https://github.com/laiyouxing/rustdesk_private/releases/tag/${bind.mainGetNewVersion()}';
         cards.add(buildInstallCard(
@@ -519,8 +563,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           bind.mainGotoInstall();
         });
       } else if (bind.mainIsInstalledLowerVersion()) {
+        // 已安装版本落后于当前运行的这个程序，提示覆盖安装。
+        // 旧文案「Your installation is lower version.」语义有歧义（可被读成
+        // "当前运行的版本更低"），改为把两个主语和动作都写清楚。
         return buildInstallCard(
-            "Status", "Your installation is lower version.", "Click to upgrade",
+            "Status", "installed_older_than_running_tip", "Click to upgrade",
             () async {
           await rustDeskWinManager.closeAllSubWindows();
           bind.mainUpdateMe();
