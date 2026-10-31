@@ -1351,40 +1351,6 @@ pub fn main_get_my_id() -> String {
     get_id()
 }
 
-/// 是否处于"必须先登录领取 ID"模式。
-/// 为 true 时本地 id 为空不会自动生成，界面应提示用户先去登录。
-pub fn main_is_id_claim_required() -> SyncReturn<bool> {
-    SyncReturn(hbb_common::config::Config::is_id_claim_required())
-}
-
-/// 写入 api-server 下发的远程 ID。
-///
-/// 安全约束：
-///   - 只在本地当前 id 为空时写入（已有 ID 的机器永远保持原 ID，符合
-///     "老机器不重新分配"的约定）；
-///   - 拒绝空串与非合理长度，避免把错误响应写进配置导致设备变成不可连接。
-///
-/// 返回写入后的 id（`main_get_my_id` 可再次读到）；未写入时返回原 id。
-pub fn main_set_my_id(id: String) -> SyncReturn<String> {
-    let id = id.trim().to_owned();
-    let cur = hbb_common::config::Config::get_id();
-    if !cur.is_empty() {
-        log::info!(
-            "main_set_my_id: 本地已有 id({}), 忽略服务端下发的 {}",
-            cur,
-            id
-        );
-        return SyncReturn(cur);
-    }
-    if id.is_empty() || id.len() < 6 || id.len() > 64 {
-        log::warn!("main_set_my_id: 拒绝写入非法 id: {:?}", id);
-        return SyncReturn(cur);
-    }
-    hbb_common::config::Config::set_id(&id);
-    log::info!("main_set_my_id: 已写入服务端分配的 id: {}", id);
-    SyncReturn(id)
-}
-
 pub fn main_get_uuid() -> String {
     get_uuid()
 }

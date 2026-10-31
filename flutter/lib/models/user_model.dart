@@ -175,55 +175,6 @@ class UserModel {
   }
 
   /// throw [RequestException]
-  /// 新装设备登录后向 api-server 领取远程 ID。
-  ///
-  /// 规则：ID 绑定这台机器（按 uuid），已有 ID 的机器不会重新分配
-  /// （服务端幂等返回原值，本地 main_set_my_id 也只在本机 id 为空时写入）。
-  /// 领取成功后写回本地配置，之后一直复用，不再向服务器索要。
-  ///
-  /// 失败不抛异常：领不到 ID 只是"暂时不能被控"，不该阻断登录后的其他操作。
-  Future<void> claimDeviceIdIfNeeded() async {
-    try {
-      // 本地已有 ID：直接复用，不再向服务器要
-      final currentId = await bind.mainGetMyId();
-      if (currentId.isNotEmpty) return;
-      if (!bind.mainIsIdClaimRequired()) return;
-
-      final token = bind.mainGetLocalOption(key: 'access_token');
-      if (token.isEmpty) return;
-      final url = await bind.mainGetApiServer();
-      if (url.isEmpty) return;
-
-      final resp = await http.post(
-        Uri.parse('$url/api/device/claim-id'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $token'
-        },
-        // hostname 是可选的：服务端先按 uuid 绑定，主机名后续由 sysinfo 补齐
-        body: jsonEncode({
-          'uuid': await bind.mainGetUuid(),
-        }),
-      );
-      if (resp.statusCode != 200) {
-        debugPrint(
-            'claimDeviceId: HTTP ${resp.statusCode} ${decode_http_response(resp)}');
-        return;
-      }
-      final body = jsonDecode(decode_http_response(resp));
-      if (body['error'] != null) {
-        debugPrint('claimDeviceId: error ${body['error']}');
-        return;
-      }
-      final id = (body['data']?['id'] ?? '').toString();
-      if (id.isEmpty) return;
-      final written = bind.mainSetMyId(id: id);
-      debugPrint('claimDeviceId: server id=$id, written=$written');
-    } catch (e) {
-      debugPrint('claimDeviceId failed: $e');
-    }
-  }
-
   Future<LoginResponse> login(LoginRequest loginRequest) async {
     final url = await bind.mainGetApiServer();
     final resp = await http.post(Uri.parse('$url/api/login'),
