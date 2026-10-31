@@ -998,6 +998,15 @@ impl<T: InvokeUiSession> Remote<T> {
         self.handler
             .set_connection_type(peer.is_secured(), true, "UDP", relay_server);
         self.handler.set_punch_status("succeeded", "UDP");
+        // 丢弃穿透阶段 channel：relay_upgrade_task 返回前会再发几条阶段描述
+        // （阶段A/阶段B），若留着，主循环的 status_timer 会把它们当成新事件
+        // 转发，把刚置的 succeeded 覆盖回 trying——表现为"盾牌已绿、文字还在
+        // 穿透中"。
+        //
+        // 为什么不改成在主循环里判断：主循环的 `direct` 是 Client::start 解构
+        // 出来的只读副本，换流后不会更新，`if !direct` 永远为真、守不住。只有
+        // 在这里（换流真正发生的地方）清空才可靠。
+        self.phase3_stage_rx = None;
         // 换流确认（看门狗）：直连流可能因 KCP 配对错误或单向 NAT 实际不通，
         // 而两端都认为"打洞成功"。这里主动发一个 from_client 的 TestDelay
         // （主机收到必原样回传），5s 内在新流上收到对端任何数据即确认双向
