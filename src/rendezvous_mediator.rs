@@ -1170,11 +1170,9 @@ async fn punch_inbound_once(
     // 主机侧 prefer_connect=false（accept 控制端发起的流），与控制端互补。
     // 熔断已跳闸时不 spawn：省掉一次注定失败的后台任务（只跳过 v6）。
     let mut v6_task = peer_v6
-        .filter(|_| !crate::common::should_skip_v6())
-        .map(|v6| {
-            let budget = total_deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .max(Duration::from_millis(800));
+        .and_then(|v6| crate::common::v6_budget_from(total_deadline).map(|b| (v6, b)))
+        .filter(|_| crate::common::v6_should_attempt())
+        .map(|(v6, budget)| {
             let peer_id = peer_id.clone();
             tokio::spawn(async move {
                 crate::common::punch_ipv6_direct(v6, false, budget, &peer_id).await

@@ -172,6 +172,32 @@ const V6_MAX_RETRIES: u32 = 2;
 /// 熔断窗口：超过该时长视为环境可能已变（换网络、对端开启 v6），放行重试。
 const V6_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// v6 打洞单轮时长。v6 无 NAT，握手窗口只需覆盖一个 RTT 级往返；
+/// 预算内可重试多轮，避免偶发丢包就判失败。
+///
+/// 同时是**启动门槛**：剩余预算不足一轮时，spawn 出去的 v6 任务必然
+/// 在白跑一轮后被判失败并计入熔断，所以调用方 spawn 前必须用同一个
+/// 阈值过滤（见 `v6_budget_from`），两边不能各写一个数。
+pub const V6_ROUND_MS: u64 = 3_000;
+
+/// 由 v4 的总死线推算 v6 任务可用的预算。
+///
+/// 返回 `None` 表示**不该启动 v6 任务**——剩余时间连一轮都打不满，
+/// 启动只会白耗一次熔断额度。
+///
+/// 为什么不设 `.max(800ms)` 下限（历史写法）：那会让 v6 任务在 v4 死线
+/// 之后仍然存活最多 800ms，期间它持有 `V6_PUNCH_LOCK`，把并发的另一个
+/// 控制端（一对多远程）的 v6 打洞堵在锁上；而它自己又因剩余不足一轮
+/// 必然失败。既没收益，又扩大了锁的串行区。
+pub fn v6_budget_from(total_deadline: std::time::Instant) -> Option<std::time::Duration> {
+    let remain = total_deadline.saturating_duration_since(std::time::Instant::now());
+    if remain.as_millis() as u64 >= V6_ROUND_MS {
+        Some(remain)
+    } else {
+        None
+    }
+}
+
 /// v6 打洞成功：清零计数，下次连接继续尝试 v6。
 pub fn record_v6_success() {
     V6_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -197,23 +223,30 @@ pub fn record_v6_failure() {
     }
 }
 
-/// 是否跳过本次 v6 尝试（熔断已跳闸且未过窗口）。
+/// 本次是否应该尝试 v6 打洞（熔断状态判定 + 过期复位）。
+///
+/// 语义：**允许**这次尝试返回 true；熔断跳闸且未过窗口返回 false。
+///
+/// 为什么把"复位"和"判定"合成一个函数，且只在**一把锁**内完成：
+/// 历史实现是 `should_skip_v6()`，它被判为只读谓词却在里面顺手复位，
+/// 而且复位分两次加锁（先读时间戳、再清零）。中间若插入一次
+/// `record_v6_failure()`，就会把刚记下的失败时间戳清掉，造成
+/// "计数=1 但时间戳=空"，此后既不衰减也不跳闸——熔断器行为不可预测。
+/// 现在所有状态读写都在同一临界区内，不存在交错窗口。
 ///
 /// 注意：**只影响 v6**，v4 打洞永远照常进行。
-pub fn should_skip_v6() -> bool {
-    if V6_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= V6_MAX_RETRIES {
-        let expired = if let Ok(g) = V6_LAST_FAIL_AT.lock() {
-            matches!(*g, Some(last) if last.elapsed() >= V6_RETRY_WINDOW)
-        } else {
-            false
-        };
-        if expired {
-            V6_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-            if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
-                *g = None;
-            }
-            return false;
-        }
+pub fn v6_should_attempt() -> bool {
+    let Ok(mut g) = V6_LAST_FAIL_AT.lock() else {
+        // 锁中毒：保守放行。v6 只是附加通道，即使放行也不会影响 v4。
+        return true;
+    };
+    if V6_RETRY_COUNT.load(std::sync::atomic::Ordering::SeqCst) < V6_MAX_RETRIES {
+        return true;
+    }
+    if matches!(*g, Some(last) if last.elapsed() >= V6_RETRY_WINDOW) {
+        // 过期：复位（与判定同一临界区内完成，不会被并发插入）
+        *g = None;
+        V6_RETRY_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         return true;
     }
     false
@@ -3259,11 +3292,18 @@ pub async fn stun_query_single_server(
 ) -> ResultType<(SocketAddr, String)> {
     use hbb_common::rand::{self, Rng};
 
-    let stun_addr = stun
-        .to_socket_addrs()?
-        .filter(|x| x.is_ipv4())
-        .next()
-        .ok_or_else(|| anyhow!("Failed to resolve STUN server: {}", stun))?;
+    // 阻塞 DNS 移出 async 线程（同 stun_query_with_socket 的处理）
+    let host = stun.to_owned();
+    let stun_addr = hbb_common::tokio::task::spawn_blocking(move || {
+        let a: std::io::Result<SocketAddr> = host.to_socket_addrs().map_err(std::io::Error::other).and_then(
+            |mut it| {
+                it.find(|x| x.is_ipv4())
+                    .ok_or_else(|| std::io::Error::other(format!("Failed to resolve STUN server: {}", host)))
+            },
+        );
+        a
+    })
+    .await??;
 
     let mut req = vec![0u8; 20];
     req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
@@ -4187,19 +4227,18 @@ pub async fn punch_direct_via_api(
     // v6 无 NAT、无需 sync 对齐与端口预测，因此可以和 v4 同时起跑；
     // 控制端这里 connect（主机端对应 accept）。
     // 熔断已跳闸时不 spawn：省掉一次注定失败的后台任务（只跳过 v6，不影响 v4）。
-    let mut v6_task = peer_v6.filter(|_| !should_skip_v6()).map(|v6| {
-        let shared_use = shared_socket_acquire();
-        let peer_id = peer_id.to_owned();
-        hbb_common::tokio::spawn(async move {
-            // 凭证随任务存活：v6 打洞期间不让看门狗探测抢包
-            let _hold = shared_use;
-            // 预算与 v4 总预算同源：v4 都放弃时 v6 也没有意义了
-            let budget = total_deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .max(Duration::from_millis(800));
-            punch_ipv6_direct(v6, true, budget, &peer_id).await
-        })
-    });
+    let mut v6_task = peer_v6
+        .and_then(|v6| v6_budget_from(total_deadline).map(|b| (v6, b)))
+        .filter(|_| v6_should_attempt())
+        .map(|(v6, budget)| {
+            let shared_use = shared_socket_acquire();
+            let peer_id = peer_id.to_owned();
+            hbb_common::tokio::spawn(async move {
+                // 凭证随任务存活：v6 打洞期间不让看门狗探测抢包
+                let _hold = shared_use;
+                punch_ipv6_direct(v6, true, budget, &peer_id).await
+            })
+        });
 
     // 7. 多地址轮转打洞：预算内轮换。时间向高优先级倾斜——列表前两个
     //    （last_success / stun_primary，命中率最高）各 8s，其后每个 3s
@@ -4554,7 +4593,7 @@ pub async fn punch_ipv6_direct(
         bail!("punch_ipv6_direct: IPv6 punch disabled");
     }
     // 熔断：本环境下 v6 连续不通就别再起任务（只跳过 v6，v4 照常）
-    if should_skip_v6() {
+    if !v6_should_attempt() {
         bail!("punch_ipv6_direct: IPv6 punch suspended by circuit breaker");
     }
     let sock = ensure_shared_punch_socket_v6().await?;
@@ -4562,7 +4601,7 @@ pub async fn punch_ipv6_direct(
     // 单轮时长取小值：v6 无 NAT，握手窗口只需覆盖一个 RTT 级往返；
     // 预算内可重试多轮，避免偶发丢包就判失败。
     // （同时也是"排队后预算是否还够打一轮"的门槛，见下）
-    const V6_ROUND_MS: u64 = 3_000;
+    // 定义在模块级（见 V6_ROUND_MS），调用方 spawn 前要用同一个阈值门控。
 
     // 死线在拿锁**之前**就算好：排队等锁耗掉的时间也算进本次预算，
     // 避免后到的控制端靠排队把 v6 打洞时间无限延长（v4 早就结束了）。
@@ -4787,11 +4826,17 @@ pub async fn relay_upgrade_task(
     // real NAT mapping for THIS socket (not a stale one from minutes ago).
     let hbbs_host = Config::get_rendezvous_server();
     if !hbbs_host.is_empty() {
-        if let Some(hbbs_addr) = hbbs_host
-            .to_socket_addrs()
+        // 阻塞 DNS 移出 async 线程
+        let hbbs_res = {
+            let h = hbbs_host.clone();
+            hbb_common::tokio::task::spawn_blocking(move || {
+                h.to_socket_addrs().ok().and_then(|mut i| i.find(|a| a.is_ipv4()))
+            })
+            .await
             .ok()
-            .and_then(|mut i| i.find(|a| a.is_ipv4()))
-        {
+            .flatten()
+        };
+        if let Some(hbbs_addr) = hbbs_res {
             let mut msg = RendezvousMessage::new();
             msg.set_test_nat_request(TestNatRequest::default());
             if let Ok(data) = msg.write_to_bytes() {
@@ -4980,9 +5025,17 @@ pub async fn relay_upgrade_task(
             if selected_server.as_ref().map_or(false, |s| s == alt) {
                 continue;
             }
-            if let Some(alt_addr) = alt.to_socket_addrs().ok()
-                .and_then(|mut i| i.find(|a| a.is_ipv4()))
-            {
+            // 阻塞 DNS 移出 async 线程
+            let alt_addr = {
+                let a = alt.clone();
+                hbb_common::tokio::task::spawn_blocking(move || {
+                    a.to_socket_addrs().ok().and_then(|mut i| i.find(|x| x.is_ipv4()))
+                })
+                .await
+                .ok()
+                .flatten()
+            };
+            if let Some(alt_addr) = alt_addr {
                 // 用 send_to 而非 connect：connect 会让 socket 之后只接收
                 // connected 对端的包（内核过滤），打洞阶段对端从其它映射端口
                 // （对称 NAT 的 P_new）回来的 KCP 包会被全部丢弃。
@@ -6499,13 +6552,13 @@ mod tests {
         // ---- 1) 初始状态 ----
         reset_phase3_state();
         assert!(!should_skip_phase3(), "phase3 初始不应熔断");
-        assert!(!should_skip_v6(), "v6 初始不应熔断");
+        assert!(v6_should_attempt(), "v6 初始应允许尝试");
 
         // ---- 2) v6 连续失败只熔断 v6，绝不牵连 Phase3 ----
         for _ in 0..V6_MAX_RETRIES {
             record_v6_failure();
         }
-        assert!(should_skip_v6(), "v6 连续失败达阈值后应熔断");
+        assert!(!v6_should_attempt(), "v6 连续失败达阈值后应熔断");
         assert!(
             !should_skip_phase3(),
             "v6 熔断绝不能连带禁掉 Phase3/v4 —— 那是实打实的成功率损失"
@@ -6513,13 +6566,13 @@ mod tests {
 
         // ---- 3) v6 成功一次即清零 ----
         record_v6_success();
-        assert!(!should_skip_v6(), "v6 成功后应恢复尝试");
+        assert!(v6_should_attempt(), "v6 成功后应恢复尝试");
 
         // ---- 4) 反向：Phase3 失败也不应影响 v6 判定 ----
         // PHASE3_MAX_RETRIES = 1，因此一次失败即跳闸，断言有实际区分度。
         record_phase3_failure();
         assert!(should_skip_phase3(), "phase3 一次失败即熔断（MAX_RETRIES=1）");
-        assert!(!should_skip_v6(), "Phase3 失败不应影响 v6 判定");
+        assert!(v6_should_attempt(), "Phase3 失败不应影响 v6 判定");
 
         // ---- 5) record_v6_failure 的窗口衰减 ----
         reset_phase3_state();
@@ -6534,31 +6587,34 @@ mod tests {
         // 窗口已过：本次失败应重新从 1 起算，而不是累加到阈值
         record_v6_failure();
         assert!(
-            !should_skip_v6(),
+            v6_should_attempt(),
             "窗口外的旧失败不应累计到熔断阈值（应重新从 1 起算）"
         );
 
-        // ---- 6) should_skip_v6 的衰减放行分支 ----
-        // 先真正跳闸，再把时间戳推到窗口外：should_skip_v6 应清零并放行。
+        // ---- 6) v6_should_attempt 的衰减放行分支 ----
+        // 先真正跳闸，再把时间戳推到窗口外：应清零并放行。
         record_v6_failure();
-        assert!(should_skip_v6(), "重新累计到阈值后应再次跳闸");
+        assert!(!v6_should_attempt(), "重新累计到阈值后应再次跳闸");
         if let Ok(mut g) = V6_LAST_FAIL_AT.lock() {
             *g = Some(
                 std::time::Instant::now() - V6_RETRY_WINDOW - std::time::Duration::from_secs(1),
             );
         }
         assert!(
-            !should_skip_v6(),
+            v6_should_attempt(),
             "熔断窗口过期后应放行（衰减），且应顺带清零计数"
         );
         // 清零后必须重新累计满 V6_MAX_RETRIES 次才再次跳闸
-        // （证明是真清零，而不只是这一次返回 false）
+        // （证明是真清零，而不只是这一次返回 true）
         record_v6_failure();
-        assert!(!should_skip_v6(), "衰减清零后，单次失败不应立即再次跳闸");
+        assert!(
+            v6_should_attempt(),
+            "衰减清零后，单次失败不应立即再次跳闸"
+        );
         for _ in 1..V6_MAX_RETRIES {
             record_v6_failure();
         }
-        assert!(should_skip_v6(), "衰减清零后重新累计满阈值应再次跳闸");
+        assert!(!v6_should_attempt(), "衰减清零后重新累计满阈值应再次跳闸");
 
         // 收尾：复位，避免影响同二进制内其他用例
         reset_phase3_state();
