@@ -669,6 +669,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Update client clipboard", "更新客戶端的剪貼簿"),
         ("Untagged", "無標籤"),
         ("new-version-of-{}-tip", "有新版本的 {} 可用"),
+        (
+            "installed_older_than_running_tip",
+            "你安裝的版本舊於目前正在執行的版本。請點擊下方按鈕，以目前執行的版本覆蓋安裝。",
+        ),
         ("Accessible devices", "可存取的裝置"),
         ("upgrade_remote_rustdesk_client_to_{}_tip", "請將遠端 RustDesk 客戶端升級到 {} 或更新版本！"),
         ("d3d_render_tip", "當啟用 D3D 渲染時，某些機器可能會無法顯示遠端畫面。"),

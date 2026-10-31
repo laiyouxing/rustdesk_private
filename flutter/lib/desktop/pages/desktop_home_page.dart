@@ -563,8 +563,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           bind.mainGotoInstall();
         });
       } else if (bind.mainIsInstalledLowerVersion()) {
+        // 已安装版本落后于当前运行的这个程序，提示覆盖安装。
+        // 旧文案「Your installation is lower version.」语义有歧义（可被读成
+        // "当前运行的版本更低"），改为把两个主语和动作都写清楚。
         return buildInstallCard(
-            "Status", "Your installation is lower version.", "Click to upgrade",
+            "Status", "installed_older_than_running_tip", "Click to upgrade",
             () async {
           await rustDeskWinManager.closeAllSubWindows();
           bind.mainUpdateMe();

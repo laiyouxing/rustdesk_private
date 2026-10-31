@@ -662,6 +662,13 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Update client clipboard", "更新客户端的剪贴板"),
         ("Untagged", "无标签"),
         ("new-version-of-{}-tip", "{} 版本更新"),
+        // 已安装版本落后于"当前正在运行的这个程序"时，提示覆盖安装。
+        // 旧文案「你安装的版本比当前运行的低。」容易被读成"当前运行的版本更低"，
+        // 现把两个主语和动作都说清楚（不依赖版本号，避免同步 build 里取异步值）。
+        (
+            "installed_older_than_running_tip",
+            "你安装的版本旧于当前正在运行的版本。点击下方按钮，用当前运行的版本覆盖安装。",
+        ),
         ("Accessible devices", "可访问的设备"),
         ("upgrade_remote_rustdesk_client_to_{}_tip", "请在远程端将 RustDesk 客户端升级至版本 {} 或更新版本！"),
         ("d3d_render_tip", "当启用 D3D 渲染时，某些机器可能无法显示远程画面。"),

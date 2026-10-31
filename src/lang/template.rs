@@ -668,6 +668,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Update client clipboard", ""),
         ("Untagged", ""),
         ("new-version-of-{}-tip", ""),
+        ("installed_older_than_running_tip", ""),
         ("Accessible devices", ""),
         ("upgrade_remote_rustdesk_client_to_{}_tip", ""),
         ("d3d_render_tip", ""),
