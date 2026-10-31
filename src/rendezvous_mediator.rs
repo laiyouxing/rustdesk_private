@@ -655,7 +655,15 @@ impl RendezvousMediator {
         let relay_server = self.get_relay_server(fla.relay_server.clone());
         let relay = use_ws() || Config::is_proxy();
         let mut socket_addr_v6 = Default::default();
-        if peer_addr_v6.port() > 0 && !relay {
+        // 必须同时满足：对端有 v6 地址、不走中继、且**用户开启了 IPv6 打洞**。
+        //
+        // 漏掉第三项是个真实缺陷：start_ipv6() 内部会调用 test_ipv6()，
+        // 而 test_bind_ipv6() 里的 STUNS_V6[0].to_socket_addrs() 是**同步阻塞**
+        // 的 getaddrinfo。在纯 IPv4 网络（公网 STUN v6 域名无 AAAA 记录）上，
+        // 每次连接都要付一次 DNS 失败超时（Windows 常见 5~10s），并且它是
+        // await 在 handle_intranet 里的——会把整个内网穿透处理堵住。
+        // 用户在设置里关掉 "IPv6 直连" 后这里仍然执行，表现为"关了也没用"。
+        if peer_addr_v6.port() > 0 && !relay && crate::get_ipv6_punch_enabled() {
             socket_addr_v6 = start_ipv6(
                 peer_addr_v6,
                 addr,

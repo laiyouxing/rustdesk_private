@@ -2727,16 +2727,20 @@ async fn stun_ipv6_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
     let local_addr = SocketAddr::from(([0u16; 8], 0)); // [::]:0
 
     let socket = UdpSocket::bind(&local_addr).await?;
-    let Some(stun_addr) = stun_server
-        .to_socket_addrs()?
-        .filter(|x| x.is_ipv6())
-        .next()
-    else {
-        bail!(
-            "Failed to resolve STUN ipv6 server address: {}",
-            stun_server
-        );
-    };
+    // to_socket_addrs() 是同步阻塞的 getaddrinfo，不能在 async 任务里直接跑
+    // （纯 IPv4 网络上 v6 STUN 域名解析失败的超时可达数秒，会占住 runtime 线程）。
+    let host = stun_server.to_owned();
+    let stun_addr = hbb_common::tokio::task::spawn_blocking(move || {
+        let a: std::io::Result<SocketAddr> = host
+            .to_socket_addrs()
+            .map_err(std::io::Error::other)
+            .and_then(|mut it| {
+                it.find(|x| x.is_ipv6())
+                    .ok_or_else(|| std::io::Error::other(format!("no ipv6 address for {}", host)))
+            });
+        a
+    })
+    .await??;
     let client = StunClient::new(stun_addr);
     let addr = client.query_external_address_async(&socket).await?;
     Ok(if addr.ip().is_ipv6() {
@@ -2751,16 +2755,20 @@ async fn stun_ipv4_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
     let local_addr = SocketAddr::from(([0u8; 4], 0));
 
     let socket = UdpSocket::bind(&local_addr).await?;
-    let Some(stun_addr) = stun_server
-        .to_socket_addrs()?
-        .filter(|x| x.is_ipv4())
-        .next()
-    else {
-        bail!(
-            "Failed to resolve STUN ipv4 server address: {}",
-            stun_server
-        );
-    };
+    // 同上：阻塞 DNS 必须放 spawn_blocking。v4 STUN 域名通常有 A 记录、
+    // 解析很快，但一旦某个域名解析失败，同步 DNS 的等待时间不可控。
+    let host = stun_server.to_owned();
+    let stun_addr = hbb_common::tokio::task::spawn_blocking(move || {
+        let a: std::io::Result<SocketAddr> = host
+            .to_socket_addrs()
+            .map_err(std::io::Error::other)
+            .and_then(|mut it| {
+                it.find(|x| x.is_ipv4())
+                    .ok_or_else(|| std::io::Error::other(format!("no ipv4 address for {}", host)))
+            });
+        a
+    })
+    .await??;
     let client = StunClient::new(stun_addr);
     let addr = client.query_external_address_async(&socket).await?;
     Ok(if addr.ip().is_ipv4() {
@@ -2950,17 +2958,25 @@ pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
 async fn test_bind_ipv6() -> ResultType<SocketAddr> {
     let local_addr = SocketAddr::from(([0u16; 8], 0)); // [::]:0
     let socket = UdpSocket::bind(local_addr).await?;
-    let addr = STUNS_V6[0]
-        .to_socket_addrs()?
-        .filter(|x| x.is_ipv6())
-        .next()
-        .ok_or_else(|| {
-            anyhow!(
-                "Failed to resolve STUN ipv6 server address: {}",
-                STUNS_V6[0]
-            )
-        })?;
-    socket.connect(addr).await?;
+    // to_socket_addrs() 是**同步阻塞**的 getaddrinfo，绝不能跑在 async 任务里：
+    // 纯 IPv4 环境下公网 STUN v6 域名没有 AAAA 记录，Windows resolver 失败
+    // 超时常见 5~10s，会占住 runtime 线程、拖慢同线程上的其它任务（连接建立、
+    // 消息收发都在上面）。用 spawn_blocking 把它挪到专用阻塞线程池。
+    let stun_host = STUNS_V6[0].to_owned();
+    let stun_addr = hbb_common::tokio::task::spawn_blocking(move || {
+        let a: std::io::Result<SocketAddr> = stun_host
+            .to_socket_addrs()
+            .map_err(std::io::Error::other)
+            .and_then(|mut it| {
+                it.find(|x| x.is_ipv6())
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!("no ipv6 address for {}", stun_host))
+                    })
+            });
+        a
+    })
+    .await??;
+    socket.connect(stun_addr).await?;
     Ok(socket.local_addr()?)
 }
 
@@ -3121,22 +3137,40 @@ pub async fn stun_query_with_socket(socket: &UdpSocket) -> ResultType<(SocketAdd
     const TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 
     // 1. Fire a binding request at every STUN server (best effort per server).
+    //    解析用 spawn_blocking：to_socket_addrs() 是同步阻塞 DNS，且这里是
+    //    for 循环串行解析多台——任一域名解析慢都会把整个 STUN 探测拖住。
     let mut tx_map: std::collections::HashMap<[u8; 12], String> = std::collections::HashMap::new();
-    for stun in get_stun_servers_v4().iter() {
-        let stun_addr = match stun.to_socket_addrs() {
-            Ok(mut addrs) => match addrs.find(|x| x.is_ipv4()) {
-                Some(a) => a,
-                None => continue,
-            },
-            Err(_) => continue,
-        };
+    let servers = get_stun_servers_v4();
+    let resolved: Vec<(String, SocketAddr)> = {
+        let mut out = Vec::new();
+        for stun in servers.iter() {
+            let host = stun.clone();
+            let r = hbb_common::tokio::task::spawn_blocking(move || {
+                let a: std::io::Result<SocketAddr> = host
+                    .to_socket_addrs()
+                    .map_err(std::io::Error::other)
+                    .and_then(|mut it| {
+                        it.find(|x| x.is_ipv4())
+                            .ok_or_else(|| std::io::Error::other(format!("no ipv4 address for {}", host)))
+                    });
+                a
+            })
+            .await;
+            match r {
+                Ok(Ok(a)) => out.push((stun.clone(), a)),
+                _ => continue, // 解析失败/超时：跳过该服务器，不影响其它
+            }
+        }
+        out
+    };
+    for (stun, stun_addr) in resolved.iter() {
         let mut req = vec![0u8; 20];
         req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
         req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
         let mut tx_id = [0u8; 12];
         rand::thread_rng().fill(&mut tx_id);
         req[8..20].copy_from_slice(&tx_id);
-        if socket.send_to(&req, stun_addr).await.is_err() {
+        if socket.send_to(&req, *stun_addr).await.is_err() {
             continue;
         }
         tx_map.insert(tx_id, stun.clone());
