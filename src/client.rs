@@ -1,4 +1,4 @@
-﻿#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::clipboard_listener;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -4612,15 +4612,27 @@ async fn select_best_relay(primary: &str, candidates: &[String], rtts_from_b: &[
         (host, b_rtt, ok, begin.elapsed().as_millis() as i64)
     });
     let results = hbb_common::futures::future::join_all(probes).await;
+    // B 侧只上报"候选列表"里各中继的 RTT，**不含主中继**（hbbs 把主中继单独放在
+    // relay_server 字段）。若对主中继按 B=0 计，会让它凭空占优、把真正更近的
+    // 候选挤掉。这里用已知 B 侧 RTT 的均值作为未知项的估计值，避免系统性偏差。
+    let known_b: Vec<i64> = results
+        .iter()
+        .filter(|(_, b, ok, _)| *ok && *b != i32::MAX && *b >= 0)
+        .map(|(_, b, _, _)| *b as i64)
+        .collect();
+    let default_b = if known_b.is_empty() {
+        0
+    } else {
+        known_b.iter().sum::<i64>() / known_b.len() as i64
+    };
     let mut best: Option<(i64, String)> = None;
     for (host, b_rtt, reachable, a_rtt) in results {
         if !reachable {
             log::info!("  relay '{}': unreachable, skip", host);
             continue;
         }
-        // B 侧 RTT 未知（-1 / MAX）时按 0 计：A 侧延迟已足以区分优劣。
         let b_known = b_rtt != i32::MAX && b_rtt >= 0;
-        let b = if b_known { b_rtt as i64 } else { 0 };
+        let b = if b_known { b_rtt as i64 } else { default_b };
         let score = a_rtt + b;
         log::info!(
             "  relay '{}': A_RTT={}ms B_RTT={} combined={}ms",
@@ -4629,7 +4641,7 @@ async fn select_best_relay(primary: &str, candidates: &[String], rtts_from_b: &[
             if b_known {
                 format!("{}ms", b_rtt)
             } else {
-                "unknown".to_owned()
+                format!("unknown(assume {}ms)", default_b)
             },
             score
         );
