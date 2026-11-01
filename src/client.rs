@@ -660,6 +660,25 @@ impl Client {
         // 导致后续 LAN 直连成功的 Session 也被 B 端关闭（登录中断）。
         let secure = !key.is_empty() && !token.is_empty();
         let relay_type = if use_ws() { "WebSocket" } else { "Relay" };
+
+        // 中继地址兜底：hbbs 的 PunchHoleResponse 偶尔不给 relay_server（打洞响应
+        // 丢失、候选列表为空），此时直接拿空串建连只会得到一个无意义的失败，
+        // 表现为"一直连不上"。依次回退：
+        //   1) 客户端配置的 relay-server（管理员显式指定，优先级最高）；
+        //   2) hbbs 同主机的 21117 端口（标准部署中 hbbr 与 hbbs 同机）。
+        // 注意：这里只补"空"的情况，hbbs 给出了地址时行为完全不变。
+        if relay_server.is_empty() {
+            let mut fallback = Config::get_option("relay-server");
+            if fallback.is_empty() {
+                fallback = crate::increase_port(&rendezvous_server, 1);
+            }
+            log::info!(
+                "hbbs returned empty relay_server, fallback to '{}'",
+                fallback
+            );
+            relay_server = fallback;
+        }
+
         let mut relay_conn = Self::request_relay(
             &peer,
             relay_server.clone(),
@@ -725,6 +744,71 @@ impl Client {
                 }
             }
         }
+
+        // ===== is_local 误判的兜底（B 方案）=====
+        //
+        // hbbs 的 is_local 由服务端根据双方上报的地址推断，可能误判：例如双方
+        // 出口同属一个运营商大内网、或两端内网网段相同但实际上并不互通。此时
+        // hbbs 会把对端的**内网地址**当作打洞目标下发，LAN 并行测试必然失败，
+        // 而上面的中继前打洞又因为 `!is_local` 被跳过——结果就是彻底失去直连
+        // 机会，只能死在中继上（中继再出问题就表现为"一直连不上"）。
+        //
+        // 这里在"声称同局域网但 LAN 实测不通"时补一次 api-server 打洞：
+        // 用对端真实上报的公网映射地址直连。真正的局域网场景在 LAN 测试成功
+        // 处就已返回，不会走到这里，因此对现有直连成功率没有负面影响，只是
+        // 多出一条兜底路径。
+        if is_local
+            && !interface.is_force_relay()
+            && !crate::common::should_skip_phase3()
+            && crate::hbbs_http::punch_exchange::available()
+        {
+            log::info!("is_local was claimed but LAN test failed, trying api-server punch as fallback");
+            match crate::common::punch_direct_via_api(
+                &peer,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            {
+                Ok((_, mut direct_stream, punched_peer_addr)) => {
+                    match Self::secure_connection(
+                        &peer,
+                        signed_id_pk.clone(),
+                        &key,
+                        &mut direct_stream,
+                    )
+                    .await
+                    {
+                        Ok(direct_pk) => {
+                            log::info!(
+                                "post-LAN api-server punch succeeded: {}, switching off relay",
+                                punched_peer_addr
+                            );
+                            interface.report_punch_status("succeeded", "UDP");
+                            return Ok((
+                                (direct_stream, true, direct_pk, None, "UDP"),
+                                (
+                                    feedback,
+                                    rendezvous_server,
+                                    relay_server,
+                                    punched_peer_addr,
+                                    Vec::new(),
+                                    udp_nat_port,
+                                    peer_nat_type as i32,
+                                ),
+                                false,
+                            ));
+                        }
+                        Err(e) => {
+                            log::info!("post-LAN punch: key exchange on direct stream failed: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::info!("post-LAN api-server punch failed, staying on relay: {:?}", e);
+                }
+            }
+        }
+
         return Ok((
             (relay_conn, false, pk, None, relay_type),
             (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),

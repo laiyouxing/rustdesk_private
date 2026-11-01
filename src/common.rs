@@ -1397,10 +1397,30 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     } else {
         primary_url.clone()
     };
-    if get_version_number(&latest_version) > get_version_number(crate::VERSION) {
+    // 「强制更新」的触发条件：新版本更高，或**版本相同但管理员要求强制重装**。
+    //
+    // 后者是实际需求：同一个版本号可能被重新构建多次（修 bug 后重打包，版本号
+    // 不变），此时 `latest > current` 不成立，强制更新永远不会触发——表现为
+    // "后台勾了强制更新但客户端没反应"。
+    //
+    // 防抖：安装前记录 "{版本}|{下载地址}" 标记，装完后同一对不再重复执行，
+    // 否则客户端每次启动都会重新下载安装，形成重启循环。管理员换了产物
+    // （地址变化）或升了版本号，标记自然失效，可以再次下发。
+    const FORCE_UPDATE_MARKER: &str = "force-update-marker";
+    let marker_now = format!("{}|{}", latest_version, download_url);
+    let forced_already = Config::get_option(FORCE_UPDATE_MARKER) == marker_now;
+    let same_version_force = force_update && !forced_already;
+    if get_version_number(&latest_version) > get_version_number(crate::VERSION)
+        || same_version_force
+    {
         if force_update {
             // Force update: auto-download and install without user prompt
-            log::info!("Force update to version {} from {}", latest_version, download_url);
+            log::info!(
+                "Force update to version {} from {} (same_version={})",
+                latest_version,
+                download_url,
+                same_version_force
+            );
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
                 // 下载前清理历史更新下载残留（保留本次文件名对应的缓存文件）
@@ -1421,6 +1441,12 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
                         if std::fs::write(&file_path, &bytes).is_ok() {
                             log::info!("Force update: downloaded to {:?}", file_path);
                             if let Some(path_str) = file_path.to_str() {
+                                // 先落标记再交给安装器：安装会重启进程，重启后
+                                // 再次检查时凭这个标记跳过，避免无限重装循环。
+                                Config::set_option(
+                                    FORCE_UPDATE_MARKER.to_owned(),
+                                    marker_now.clone(),
+                                );
                                 // Try to install via service IPC first (no UAC prompt on Windows).
                                 // Fallback to direct update if IPC fails.
                                 if let Ok(mut stream) = crate::ipc::connect(2000, "").await {
