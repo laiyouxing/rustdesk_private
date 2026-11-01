@@ -1,4 +1,4 @@
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+﻿#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::clipboard_listener;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -682,7 +682,7 @@ impl Client {
         // 控制端：如果能和 hbbr 走内网（relay-server-lan 配置的地址 TCP 可达），
         // 优先用内网地址连中继，避免流量出公网再绕回来。
         // hbbr 按 uuid 配对，对端即使走公网地址接入同一个 hbbr 也不影响配对。
-        if let Some(lan) = crate::common::pick_lan_relay().await {
+        if let Some(lan) = crate::common::pick_lan_relay(&relay_server).await {
             log::info!(
                 "using lan relay '{}' instead of '{}'",
                 lan,

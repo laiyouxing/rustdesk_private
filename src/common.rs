@@ -1357,34 +1357,68 @@ pub fn start_periodic_update_check() {
     });
 }
 
-/// 「内网中继地址」配置项：中继与客户端处于同一内网时，直连中继的**内网地址**，
-/// 避免流量出公网再绕回来（典型场景：客户端与 hbbr 都在同一个 VPN/局域网，
-/// 但中继的公网地址需要出网关再进网关，白白多两个公网往返）。
+/// 探测某个地址的 TCP 建连耗时（毫秒）；不可达返回 None。
+async fn tcp_rtt_ms(addr: &str) -> Option<u128> {
+    let begin = std::time::Instant::now();
+    match hbb_common::socket_client::connect_tcp(addr, 600).await {
+        Ok(_) => Some(begin.elapsed().as_millis()),
+        Err(_) => None,
+    }
+}
+
+/// 「内网中继」相对公网中继至少要先快这么多毫秒才值得切换。
 ///
-/// 配置格式：`relay-server-lan = 10.126.126.5:21117`，多个用英文逗号分隔。
+/// 为什么不能"内网可达就用"：内网地址未必更快——例如客户端通过 VPN 隧道连
+/// 内网，而公网中继反而就近；实测出现过内网 56ms / 公网 39ms 的情况。
+/// 盲目切到内网会让延迟变差，所以这里按**实测 TCP 建连耗时**取优。
+const LAN_RELAY_MIN_ADVANTAGE_MS: u128 = 5;
+
+/// 选择是否改用内网中继地址，返回"确实更快"的那个内网地址。
 ///
-/// 关键前提：hbbr 按 **uuid** 配对两端，而不是按接入地址。因此控制端走公网、
-/// 被控端走内网，只要连的是**同一个 hbbr 实例**，配对依然成立——两端可以各自
-/// 选择离自己最近的地址，互不影响。
+/// 配置项 `relay-server-lan` 支持逗号分隔多个地址；逐个探测（600ms 超时），
+/// 只有比当前公网中继**快出 [`LAN_RELAY_MIN_ADVANTAGE_MS`] 以上**才采用，
+/// 否则返回 None 保持原样——配置写错、内网不通、或内网反而更慢都不会让
+/// 连接变差或失败。
 ///
-/// 只有 TCP 能连通的地址才会被采用，配置写错或临时不可达时自动回退到服务端
-/// 下发的公网地址，不会把连接搞坏。
-pub async fn pick_lan_relay() -> Option<String> {
+/// 关于"一端在内网、一端在公网"：hbbr 按 uuid 配对而不看接入地址，两端可以
+/// 各用各的地址接入同一个 hbbr，所以内网那端走内网、公网那端走公网是允许的。
+pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
     let raw = Config::get_option("relay-server-lan");
     if raw.trim().is_empty() {
         return None;
     }
+    // 基准：服务端下发的公网中继。拿不到就退化为"内网可达即可用"。
+    let base_rtt = if base_relay.trim().is_empty() {
+        None
+    } else {
+        tcp_rtt_ms(base_relay).await
+    };
     for addr in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let begin = std::time::Instant::now();
-        if hbb_common::socket_client::connect_tcp(addr, 600).await.is_ok() {
+        let Some(rtt) = tcp_rtt_ms(addr).await else {
+            log::debug!("lan relay: '{}' unreachable, skip", addr);
+            continue;
+        };
+        let better = match base_rtt {
+            Some(base) => rtt + LAN_RELAY_MIN_ADVANTAGE_MS < base,
+            None => true,
+        };
+        if better {
             log::info!(
-                "lan relay: '{}' reachable ({}ms), prefer it over the public relay",
+                "lan relay: '{}' rtt={}ms vs public '{}' rtt={:?}ms, switching",
                 addr,
-                begin.elapsed().as_millis()
+                rtt,
+                base_relay,
+                base_rtt
             );
             return Some(addr.to_owned());
         }
-        log::debug!("lan relay: '{}' unreachable, skip", addr);
+        log::info!(
+            "lan relay: '{}' rtt={}ms not faster than public '{}' rtt={:?}ms, keep public",
+            addr,
+            rtt,
+            base_relay,
+            base_rtt
+        );
     }
     None
 }
