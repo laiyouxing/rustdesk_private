@@ -679,6 +679,18 @@ impl Client {
             relay_server = fallback;
         }
 
+        // 控制端：如果能和 hbbr 走内网（relay-server-lan 配置的地址 TCP 可达），
+        // 优先用内网地址连中继，避免流量出公网再绕回来。
+        // hbbr 按 uuid 配对，对端即使走公网地址接入同一个 hbbr 也不影响配对。
+        if let Some(lan) = crate::common::pick_lan_relay().await {
+            log::info!(
+                "using lan relay '{}' instead of '{}'",
+                lan,
+                relay_server
+            );
+            relay_server = lan;
+        }
+
         let mut relay_conn = Self::request_relay(
             &peer,
             relay_server.clone(),

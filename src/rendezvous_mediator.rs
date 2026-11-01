@@ -612,6 +612,18 @@ impl RendezvousMediator {
             uuid,
             secure,
         );
+        // 被控端：如果配置了内网中继（relay-server-lan），且该地址 TCP 可达，
+        // 就直接用它连中继——避免流量出公网再绕回来。hbbr 按 uuid 配对，
+        // 控制端仍可用公网地址接入同一个 hbbr，不影响配对。
+        let mut relay_server = relay_server;
+        if let Some(lan) = crate::common::pick_lan_relay().await {
+            log::info!(
+                "create_relay: switching relay from '{}' to lan address '{}'",
+                relay_server,
+                lan
+            );
+            relay_server = lan;
+        }
 
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
 

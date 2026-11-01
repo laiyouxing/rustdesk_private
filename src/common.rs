@@ -1330,6 +1330,38 @@ fn github_release_url(version: &str) -> String {
     }
 }
 
+/// 「内网中继地址」配置项：中继与客户端处于同一内网时，直连中继的**内网地址**，
+/// 避免流量出公网再绕回来（典型场景：客户端与 hbbr 都在同一个 VPN/局域网，
+/// 但中继的公网地址需要出网关再进网关，白白多两个公网往返）。
+///
+/// 配置格式：`relay-server-lan = 10.126.126.5:21117`，多个用英文逗号分隔。
+///
+/// 关键前提：hbbr 按 **uuid** 配对两端，而不是按接入地址。因此控制端走公网、
+/// 被控端走内网，只要连的是**同一个 hbbr 实例**，配对依然成立——两端可以各自
+/// 选择离自己最近的地址，互不影响。
+///
+/// 只有 TCP 能连通的地址才会被采用，配置写错或临时不可达时自动回退到服务端
+/// 下发的公网地址，不会把连接搞坏。
+pub async fn pick_lan_relay() -> Option<String> {
+    let raw = Config::get_option("relay-server-lan");
+    if raw.trim().is_empty() {
+        return None;
+    }
+    for addr in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let begin = std::time::Instant::now();
+        if hbb_common::socket_client::connect_tcp(addr, 600).await.is_ok() {
+            log::info!(
+                "lan relay: '{}' reachable ({}ms), prefer it over the public relay",
+                addr,
+                begin.elapsed().as_millis()
+            );
+            return Some(addr.to_owned());
+        }
+        log::debug!("lan relay: '{}' unreachable, skip", addr);
+    }
+    None
+}
+
 /// 「强制更新 / 自动更新」的防抖标记：记录最近一次成功交给安装器的
 /// "{版本}|{下载地址}"，避免同一版本被反复下载安装形成重启循环。
 const FORCE_UPDATE_MARKER: &str = "force-update-marker";
