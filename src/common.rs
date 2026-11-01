@@ -1330,6 +1330,33 @@ fn github_release_url(version: &str) -> String {
     }
 }
 
+/// 软件更新检查的周期：24 小时。
+const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// 保证"周期性检查更新"线程每个进程最多启动一次。
+static PERIODIC_UPDATE_CHECK_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// 启动「周期性检查更新」后台线程（每个进程最多一次）。
+///
+/// 为什么必须由**常驻进程**来跑：
+/// 原先只在 Flutter UI 初始化时启动（`flutter_ffi::init`），UI 进程一退出
+/// （用户关掉窗口/托盘）这个线程就跟着没了，于是"24 小时自动检查"实际上
+/// 永远不会触发——只有下次**打开软件**时的启动检查生效，表现为
+/// "强制更新非要我开软件才开始"。
+///
+/// 现在服务进程（`--service`，开机常驻，即使用户没登录也在跑）也会启动它，
+/// 因此即使没人打开界面，也能按周期发现新版本并按策略自动安装。
+pub fn start_periodic_update_check() {
+    PERIODIC_UPDATE_CHECK_STARTED.call_once(|| {
+        std::thread::spawn(|| loop {
+            // 先睡再查：启动时 UI 已经做过一次检查，避免立刻重复请求。
+            std::thread::sleep(UPDATE_CHECK_INTERVAL);
+            log::info!("periodic update check: running scheduled check");
+            check_software_update();
+        });
+    });
+}
+
 /// 「内网中继地址」配置项：中继与客户端处于同一内网时，直连中继的**内网地址**，
 /// 避免流量出公网再绕回来（典型场景：客户端与 hbbr 都在同一个 VPN/局域网，
 /// 但中继的公网地址需要出网关再进网关，白白多两个公网往返）。

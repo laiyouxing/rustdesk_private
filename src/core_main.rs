@@ -373,6 +373,9 @@ pub fn core_main() -> Option<Vec<String>> {
             return None;
         } else if args[0] == "--service" {
             log::info!("start --service");
+            // 服务进程开机常驻，由它承担"每 24 小时检查一次更新"，
+            // 这样即使用户从不打开界面，也能按策略发现并（自动）安装新版本。
+            crate::common::start_periodic_update_check();
             crate::start_os_service();
             return None;
         } else if args[0] == "--server" {
