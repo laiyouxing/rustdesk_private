@@ -1432,6 +1432,9 @@ const FORCE_UPDATE_MARKER: &str = "force-update-marker";
 /// 下载失败、写盘失败、IPC 失败且直装也失败时返回 false——调用方据此回退到
 /// "弹提示让用户手动更新"，避免静默失败后用户完全无感知（这正是此前
 /// "后台勾了强制更新但客户端毫无反应"难以排查的原因）。
+/// 仅在桌面平台编译：内部依赖 `platform::update_to`，Android/iOS 没有该实现。
+/// 调用点虽已带 cfg，但函数体仍会被编译，缺这个 cfg 会导致 android 构建失败。
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn try_silent_update(
     client: &reqwest::Client,
     download_url: &str,
