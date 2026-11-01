@@ -1330,6 +1330,93 @@ fn github_release_url(version: &str) -> String {
     }
 }
 
+/// 「强制更新 / 自动更新」的防抖标记：记录最近一次成功交给安装器的
+/// "{版本}|{下载地址}"，避免同一版本被反复下载安装形成重启循环。
+const FORCE_UPDATE_MARKER: &str = "force-update-marker";
+
+/// 尝试静默下载并安装更新，返回是否已成功把安装交给安装器。
+///
+/// 下载失败、写盘失败、IPC 失败且直装也失败时返回 false——调用方据此回退到
+/// "弹提示让用户手动更新"，避免静默失败后用户完全无感知（这正是此前
+/// "后台勾了强制更新但客户端毫无反应"难以排查的原因）。
+async fn try_silent_update(
+    client: &reqwest::Client,
+    download_url: &str,
+    fallback_url: &str,
+    marker: &str,
+) -> bool {
+    let Some(file_path) = crate::updater::get_download_file_from_url(download_url) else {
+        log::warn!("silent update: cannot derive file name from {}", download_url);
+        return false;
+    };
+    // 下载前清理历史更新下载残留（保留本次文件名对应的缓存文件）
+    crate::updater::cleanup_old_update_files(Some(&file_path));
+    // 主地址失败则自动回落到 GitHub（或服务端下发的 fallback_url），两边互补。
+    let mut dl = client.get(download_url).send().await;
+    if dl.is_err() && fallback_url != download_url {
+        log::info!(
+            "silent update: primary url failed ({:?}), falling back to {}",
+            dl.as_ref().err().map(|e| e.to_string()),
+            fallback_url
+        );
+        dl = client.get(fallback_url).send().await;
+    }
+    let resp = match dl {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("silent update: download request failed: {}", e);
+            return false;
+        }
+    };
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("silent update: read response body failed: {}", e);
+            return false;
+        }
+    };
+    if let Err(e) = std::fs::write(&file_path, &bytes) {
+        log::warn!("silent update: write {:?} failed: {}", file_path, e);
+        return false;
+    }
+    log::info!(
+        "silent update: downloaded {} bytes to {:?}",
+        bytes.len(),
+        file_path
+    );
+    let Some(path_str) = file_path.to_str() else {
+        log::warn!("silent update: non-utf8 path {:?}", file_path);
+        return false;
+    };
+    // 先落标记再交给安装器：安装会重启进程，重启后再次检查时凭标记跳过。
+    Config::set_option(FORCE_UPDATE_MARKER.to_owned(), marker.to_owned());
+    // 优先通过服务 IPC 安装（Windows 上 SYSTEM 权限，无需 UAC 弹窗）；
+    // 服务不可用时再直接运行安装器。
+    if let Ok(mut stream) = crate::ipc::connect(2000, "").await {
+        if stream
+            .send(&crate::ipc::Data::InstallUpdate(path_str.to_owned()))
+            .await
+            .is_ok()
+        {
+            log::info!("silent update: sent install command to service");
+            return true;
+        }
+        log::warn!("silent update: send install command to service failed");
+    } else {
+        log::info!("silent update: service IPC unavailable, running installer directly");
+    }
+    match crate::platform::update_to(path_str) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("silent update: update_to failed: {}", e);
+            // 安装没成功：撤销防抖标记，下次检查时重试，避免一次失败后
+            // 该版本永久不再尝试。
+            Config::set_option(FORCE_UPDATE_MARKER.to_owned(), String::new());
+            false
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     let api_server = get_api_server(
@@ -1406,63 +1493,39 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
     // 防抖：安装前记录 "{版本}|{下载地址}" 标记，装完后同一对不再重复执行，
     // 否则客户端每次启动都会重新下载安装，形成重启循环。管理员换了产物
     // （地址变化）或升了版本号，标记自然失效，可以再次下发。
-    const FORCE_UPDATE_MARKER: &str = "force-update-marker";
     let marker_now = format!("{}|{}", latest_version, download_url);
     let forced_already = Config::get_option(FORCE_UPDATE_MARKER) == marker_now;
     let same_version_force = force_update && !forced_already;
     if get_version_number(&latest_version) > get_version_number(crate::VERSION)
         || same_version_force
     {
-        if force_update {
-            // Force update: auto-download and install without user prompt
+        // 是否自动静默安装：
+        //   - 强制更新：所有客户端都装，**忽略**客户端的「自动更新」开关；
+        //   - 普通更新：仅当客户端勾选了「自动更新」(allow-auto-update=Y) 时静默
+        //     安装，未勾选则回退为弹提示，由用户自己决定。
+        let auto_update_enabled = hbb_common::config::option2bool(
+            hbb_common::config::keys::OPTION_ALLOW_AUTO_UPDATE,
+            &Config::get_option(hbb_common::config::keys::OPTION_ALLOW_AUTO_UPDATE),
+        );
+        let mut auto_installed = false;
+        if force_update || auto_update_enabled {
             log::info!(
-                "Force update to version {} from {} (same_version={})",
+                "Update to version {} from {} (force={}, auto_update={}, same_version={})",
                 latest_version,
                 download_url,
+                force_update,
+                auto_update_enabled,
                 same_version_force
             );
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if let Some(file_path) = crate::updater::get_download_file_from_url(&download_url) {
-                // 下载前清理历史更新下载残留（保留本次文件名对应的缓存文件）
-                crate::updater::cleanup_old_update_files(Some(&file_path));
-                // Download using the same HTTP client；主地址失败则自动回落到
-                // GitHub（或服务端下发的 fallback_url），两边互补。
-                let mut dl = client.get(&download_url).send().await;
-                if dl.is_err() && fallback_url != download_url {
-                    log::info!(
-                        "Force update: primary url failed ({:?}), falling back to {}",
-                        dl.as_ref().err().map(|e| e.to_string()),
-                        fallback_url
-                    );
-                    dl = client.get(&fallback_url).send().await;
-                }
-                if let Ok(resp) = dl {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if std::fs::write(&file_path, &bytes).is_ok() {
-                            log::info!("Force update: downloaded to {:?}", file_path);
-                            if let Some(path_str) = file_path.to_str() {
-                                // 先落标记再交给安装器：安装会重启进程，重启后
-                                // 再次检查时凭这个标记跳过，避免无限重装循环。
-                                Config::set_option(
-                                    FORCE_UPDATE_MARKER.to_owned(),
-                                    marker_now.clone(),
-                                );
-                                // Try to install via service IPC first (no UAC prompt on Windows).
-                                // Fallback to direct update if IPC fails.
-                                if let Ok(mut stream) = crate::ipc::connect(2000, "").await {
-                                    let _ = stream.send(&crate::ipc::Data::InstallUpdate(path_str.to_owned())).await;
-                                    log::info!("Force update: sent install command to service");
-                                } else {
-                                    log::info!("Force update: service IPC failed, running directly");
-                                    let _ = crate::platform::update_to(path_str);
-                                }
-                            }
-                        }
-                    }
-                }
+            {
+                auto_installed =
+                    try_silent_update(&client, &download_url, &fallback_url, &marker_now).await;
             }
-        } else {
-            // Normal update: notify Flutter to show dialog
+        }
+        if !auto_installed {
+            // 未勾选自动更新、或自动安装失败（下载/安装出错）：仍然通知 Flutter
+            // 弹提示，避免静默失败后用户完全无感知。
             #[cfg(feature = "flutter")]
             {
                 let mut m = std::collections::HashMap::new();
