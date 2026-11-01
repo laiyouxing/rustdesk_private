@@ -1,4 +1,4 @@
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+﻿#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::clipboard_listener;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -539,8 +539,40 @@ impl Client {
                             let relay_candidates = candidates_from_b.clone();
                             let relay_rtts = rtts_from_b.clone();
                             relay_test = tokio::spawn(async move {
-                                select_best_relay(&relay_primary, &relay_candidates, &relay_rtts)
-                                    .await
+                                // 集群调度：客户端地域优先取本地配置 relay-region，
+                                // 其次用 api-server 为设备记录的地域；都为空则纯延迟择优。
+                                // 接口不可用时返回空，不影响原有行为。
+                                let (sched, server_region, region_of) =
+                                    crate::hbbs_http::punch_exchange::get_region_relays(
+                                        &Config::get_id(),
+                                        &Config::get_option("relay-region"),
+                                    )
+                                    .await;
+                                let my_region = {
+                                    let local = Config::get_option("relay-region");
+                                    if !local.is_empty() {
+                                        local
+                                    } else {
+                                        server_region
+                                    }
+                                };
+                                let mut cands = relay_candidates;
+                                let mut rtts = relay_rtts;
+                                // 把调度表里、且不在 hbbs 候选中的中继补进来一起实测
+                                for a in sched {
+                                    if !cands.contains(&a) {
+                                        cands.push(a);
+                                        rtts.push(i32::MAX);
+                                    }
+                                }
+                                select_best_relay(
+                                    &relay_primary,
+                                    &cands,
+                                    &rtts,
+                                    &my_region,
+                                    &region_of,
+                                )
+                                .await
                             });
 
                             // Save LAN addresses for post-relay test (after relay is established,
@@ -4586,7 +4618,20 @@ async fn udp_nat_connect(
 ///   - 每个候选的实测结果都打日志，现场能直接看出走的是哪台。
 ///
 /// 这样中继临时离线/恢复都不需要改服务端配置，客户端会自动绕开。
-async fn select_best_relay(primary: &str, candidates: &[String], rtts_from_b: &[i32]) -> String {
+/// 地域不符的惩罚（以"毫秒等效"计入评分）。
+///
+/// A+B 延迟仍是主导因素，地域只做**轻微偏好**：同地域中继晚 40ms 以内仍然优先，
+/// 超过就让延迟说了算。这样既避免"地域配错把好中继排到最后"，
+/// 又能在延迟接近时优先就近，减少跨省绕行。
+const REGION_PENALTY_MS: i64 = 40;
+
+async fn select_best_relay(
+    primary: &str,
+    candidates: &[String],
+    rtts_from_b: &[i32],
+    my_region: &str,
+    region_of: &std::collections::HashMap<String, String>,
+) -> String {
     let mut hosts: Vec<(String, i32)> = Vec::new();
     if !primary.trim().is_empty() {
         hosts.push((primary.to_owned(), i32::MAX));
@@ -4633,7 +4678,15 @@ async fn select_best_relay(primary: &str, candidates: &[String], rtts_from_b: &[
         }
         let b_known = b_rtt != i32::MAX && b_rtt >= 0;
         let b = if b_known { b_rtt as i64 } else { default_b };
-        let score = a_rtt + b;
+        let mut score = a_rtt + b;
+        // 地域偏好：客户端已确定地域、且该中继有地域标注、两者不一致时加惩罚
+        if !my_region.is_empty() {
+            if let Some(peer_region) = region_of.get(&host) {
+                if !peer_region.is_empty() && peer_region != my_region {
+                    score += REGION_PENALTY_MS;
+                }
+            }
+        }
         log::info!(
             "  relay '{}': A_RTT={}ms B_RTT={} combined={}ms",
             host,

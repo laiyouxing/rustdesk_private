@@ -1,4 +1,4 @@
-//! 通过 api-server 交换打洞地址（UDP 打洞前置）。
+﻿//! 通过 api-server 交换打洞地址（UDP 打洞前置）。
 //!
 //! 背景：原来双方通过已建立的中继连接交换公网地址（PunchPeerAddr），
 //! 导致必须"先建中继 → 再打洞 → 再换流"，产生双连接与换流竞态。
@@ -24,6 +24,8 @@ const PUNCH_ADDR_PATH: &str = "/api/punch/addr";
 const PUNCH_INBOX_PATH: &str = "/api/punch/addr/inbox";
 /// 直连建立后的合规上报（客户端必须上报，否则服务端会下发强制断开）
 const DIRECT_OK_PATH: &str = "/api/punch/direct-ok";
+/// 集群调度：按区域偏好排序的中继列表
+const NODE_RELAYS_PATH: &str = "/api/node/relays";
 
 // 地址来源与建议优先级（越大越先试）
 pub const KIND_LAST_SUCCESS: &str = "last_success";
@@ -449,4 +451,72 @@ pub fn sort_addrs(mut addrs: Vec<PunchAddr>) -> Vec<PunchAddr> {
             .then(a.is_udp().cmp(&b.is_udp()).reverse())
     });
     addrs
+}
+
+/// 集群调度：拉取按「客户端地域」偏好排序的中继列表。
+///
+/// 返回 (中继地址列表, 服务端记录的本机地域, 地址->地域 映射)。
+/// 地域优先级：客户端本地配置的 `relay-region` 最高，其次用服务端为设备
+/// 记录的地域；两者都为空时纯按调度分数返回（等价于纯延迟择优）。
+///
+/// 该函数是**可选增强**：api-server 不可达或未部署该接口时返回空，
+/// 调用方保持原有行为，不影响连接建立。
+pub async fn get_region_relays(
+    peer_id: &str,
+    my_region: &str,
+) -> (Vec<String>, String, std::collections::HashMap<String, String>) {
+    let mut empty = (Vec::new(), String::new(), std::collections::HashMap::new());
+    let Some((api_server, token, key)) = ctx() else {
+        return empty;
+    };
+    let url = format!("{}{}", api_server, NODE_RELAYS_PATH);
+    let Ok(client) = client_for(&url).await else {
+        return empty;
+    };
+    let mut req = client.get(&url);
+    if !my_region.is_empty() {
+        req = req.query(&[("region", my_region)]);
+    }
+    if !peer_id.is_empty() {
+        req = req.query(&[("peer_id", peer_id)]);
+    }
+    let resp = req
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-Rustdesk-Key", key)
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return empty;
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return empty;
+    };
+    let data = match v.get("data") {
+        Some(d) => d,
+        None => return empty,
+    };
+    let server_region = data
+        .get("my_region")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut addrs = Vec::new();
+    let mut map = std::collections::HashMap::new();
+    if let Some(list) = data.get("relays").and_then(|x| x.as_array()) {
+        for it in list {
+            let Some(addr) = it.get("addr").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if addr.is_empty() {
+                continue;
+            }
+            let region = it.get("region").and_then(|x| x.as_str()).unwrap_or("");
+            addrs.push(addr.to_string());
+            if !region.is_empty() {
+                map.insert(addr.to_string(), region.to_string());
+            }
+        }
+    }
+    empty = (addrs, server_region, map);
+    empty
 }
