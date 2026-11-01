@@ -421,7 +421,7 @@ impl Client {
         let mut feedback = 0;
         let mut candidates_from_b: Vec<String> = Vec::new();
         let mut rtts_from_b: Vec<i32> = Vec::new();
-        let mut relay_test: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async { None });
+        let mut relay_test: tokio::task::JoinHandle<String> = tokio::spawn(async { String::new() });
         let mut lan_addrs: Vec<SocketAddr> = Vec::new();
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
@@ -535,10 +535,12 @@ impl Client {
 
                             // Start relay latency testing in background to run in
                             // parallel with LAN testing. If LAN succeeds, discard result.
+                            let relay_primary = relay_server.clone();
                             let relay_candidates = candidates_from_b.clone();
                             let relay_rtts = rtts_from_b.clone();
                             relay_test = tokio::spawn(async move {
-                                pick_best_relay_combined(&relay_candidates, &relay_rtts).await
+                                select_best_relay(&relay_primary, &relay_candidates, &relay_rtts)
+                                    .await
                             });
 
                             // Save LAN addresses for post-relay test (after relay is established,
@@ -565,9 +567,11 @@ impl Client {
             }
         }
         // Await the background relay latency test.
-        if let Some(best) = relay_test.await.unwrap_or(None) {
-            log::info!("A selected relay '{}' with best combined RTT (A+B)", best);
-            relay_server = best;
+        if let Ok(best) = relay_test.await {
+            if !best.is_empty() && best != relay_server {
+                log::info!("A relay selection: '{}' -> '{}'", relay_server, best);
+                relay_server = best;
+            }
         }
 
         // ===== 中继前打洞（优先直连）=====
@@ -4568,47 +4572,82 @@ async fn udp_nat_connect(
 
 /// Test TCP latency to each relay candidate and return the one with
 /// minimum combined (A_RTT + B_RTT). Called in background alongside LAN testing.
-async fn pick_best_relay_combined(candidates: &[String], rtts_from_b: &[i32]) -> Option<String> {
-    if candidates.len() < 2 || candidates.len() != rtts_from_b.len() {
-        return None;
+/// 从"服务端下发的主中继 + 候选列表"里实测选出最优中继。
+///
+/// 背景：hbbs 的 `-r` 里可能包含**临时离线**的中继（例如某台中继正在维护）。
+/// 原来的做法是只在候选数 >= 2 时择优，且完全相信服务端给的 RTT，主中继更是
+/// 直接盲信——一旦选中的那台实际不可达，整条连接就直接失败。
+///
+/// 现在：
+///   - **主中继也参与实测**，不再盲信；
+///   - 所有候选并发探测（1.2s 超时），不可达的一律排除；
+///   - 可达的按 A+B 综合延迟排序取最优；B 侧 RTT 未知时只按 A 侧算；
+///   - 全部不可达时回退到主中继尽力而为（保持原有行为，不额外制造失败）；
+///   - 每个候选的实测结果都打日志，现场能直接看出走的是哪台。
+///
+/// 这样中继临时离线/恢复都不需要改服务端配置，客户端会自动绕开。
+async fn select_best_relay(primary: &str, candidates: &[String], rtts_from_b: &[i32]) -> String {
+    let mut hosts: Vec<(String, i32)> = Vec::new();
+    if !primary.trim().is_empty() {
+        hosts.push((primary.to_owned(), i32::MAX));
     }
-    let mut results = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        if c.trim().is_empty() || hosts.iter().any(|(h, _)| h == c) {
+            continue;
+        }
+        hosts.push((c.clone(), rtts_from_b.get(i).copied().unwrap_or(i32::MAX)));
+    }
+    if hosts.len() <= 1 {
+        return primary.to_owned();
+    }
     log::info!(
-        "A testing {} relay candidates in parallel for combined RTT",
-        candidates.len()
+        "A probing {} relay candidate(s) for reachability + RTT",
+        hosts.len()
     );
-    for (i, host) in candidates.iter().enumerate() {
-        let b_rtt = rtts_from_b[i];
+    let probes = hosts.into_iter().map(|(host, b_rtt)| async move {
         let begin = std::time::Instant::now();
-        let reachable = hbb_common::socket_client::connect_tcp(host.as_str(), 2000)
+        let ok = hbb_common::socket_client::connect_tcp(host.as_str(), 1200)
             .await
             .is_ok();
-        let a_rtt = begin.elapsed().as_millis() as i32;
-        let combined = if reachable { a_rtt + b_rtt } else { i32::MAX };
+        (host, b_rtt, ok, begin.elapsed().as_millis() as i64)
+    });
+    let results = hbb_common::futures::future::join_all(probes).await;
+    let mut best: Option<(i64, String)> = None;
+    for (host, b_rtt, reachable, a_rtt) in results {
+        if !reachable {
+            log::info!("  relay '{}': unreachable, skip", host);
+            continue;
+        }
+        // B 侧 RTT 未知（-1 / MAX）时按 0 计：A 侧延迟已足以区分优劣。
+        let b_known = b_rtt != i32::MAX && b_rtt >= 0;
+        let b = if b_known { b_rtt as i64 } else { 0 };
+        let score = a_rtt + b;
         log::info!(
-            "  Candidate {}: host={}, A_RTT={}ms, B_RTT={}ms, combined={}",
-            i,
+            "  relay '{}': A_RTT={}ms B_RTT={} combined={}ms",
             host,
             a_rtt,
-            b_rtt,
-            if combined == i32::MAX {
-                "unreachable".to_string()
+            if b_known {
+                format!("{}ms", b_rtt)
             } else {
-                format!("{}ms", combined)
-            }
+                "unknown".to_owned()
+            },
+            score
         );
-        results.push((combined, host.clone()));
-    }
-    results.sort_by(|a, b| a.0.cmp(&b.0));
-    if let Some((combined, best)) = results.first() {
-        if *combined < i32::MAX {
-            log::info!(
-                "A selected relay '{}' with combined RTT {}ms (A+B)",
-                best,
-                combined
-            );
-            return Some(best.clone());
+        if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) {
+            best = Some((score, host));
         }
     }
-    None
+    match best {
+        Some((score, host)) => {
+            log::info!("A selected relay '{}' (combined {}ms)", host, score);
+            host
+        }
+        None => {
+            log::warn!(
+                "all relay candidates unreachable, falling back to '{}'",
+                primary
+            );
+            primary.to_owned()
+        }
+    }
 }
