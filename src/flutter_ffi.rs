@@ -1747,6 +1747,11 @@ pub fn main_get_last_remote_id() -> String {
 }
 
 pub fn main_get_software_update_url() {
+    // 服务进程曾静默安装失败时会留下一条"待提示"的更新：优先把它弹出来，
+    // 本轮不再重复请求 api-server（避免几秒内弹两次提示）。
+    if crate::common::flush_pending_update_notify() {
+        return;
+    }
     crate::common::check_software_update();
 }
 

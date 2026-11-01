@@ -1,4 +1,4 @@
-﻿#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::clipboard_listener;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -542,12 +542,31 @@ impl Client {
                                 // 集群调度：客户端地域优先取本地配置 relay-region，
                                 // 其次用 api-server 为设备记录的地域；都为空则纯延迟择优。
                                 // 接口不可用时返回空，不影响原有行为。
-                                let (sched, server_region, region_of) =
+                                //
+                                // ⚠️ 必须限时：这是**建连路径上的同步等待**（下面 await 它），
+                                // api-server 半通/卡住时不能把整个连接建立拖住。
+                                // 客户端自身超时 3s/2s，这里再兜 1.5s 总时限。
+                                let (sched, server_region, region_of) = match hbb_common::timeout(
+                                    1500,
                                     crate::hbbs_http::punch_exchange::get_region_relays(
                                         &Config::get_id(),
                                         &Config::get_option("relay-region"),
-                                    )
-                                    .await;
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        log::info!(
+                                            "get_region_relays: timed out (>1500ms), fall back to plain latency"
+                                        );
+                                        (
+                                            Vec::new(),
+                                            String::new(),
+                                            std::collections::HashMap::new(),
+                                        )
+                                    }
+                                };
                                 let my_region = {
                                     let local = Config::get_option("relay-region");
                                     if !local.is_empty() {
@@ -556,11 +575,24 @@ impl Client {
                                         server_region
                                     }
                                 };
+                                // 地址规范化（补端口 + 小写）后作为 region 映射的 key，
+                                // 否则 hbbs 下发的 "-r"、B 侧候选、api-server 的 addr 三种
+                                // 格式只要不一致，地域偏好就会静默失效。
+                                let region_of: std::collections::HashMap<String, String> =
+                                    region_of
+                                        .into_iter()
+                                        .map(|(k, v)| (norm_relay_addr(&k), v))
+                                        .collect();
                                 let mut cands = relay_candidates;
                                 let mut rtts = relay_rtts;
                                 // 把调度表里、且不在 hbbs 候选中的中继补进来一起实测
                                 for a in sched {
-                                    if !cands.contains(&a) {
+                                    let a = norm_relay_addr(&a);
+                                    if a.is_empty() {
+                                        continue;
+                                    }
+                                    // 候选表里的地址可能还没补端口，比较前统一规范化
+                                    if !cands.iter().any(|c| norm_relay_addr(c) == a) {
                                         cands.push(a);
                                         rtts.push(i32::MAX);
                                     }
@@ -716,13 +748,21 @@ impl Client {
         }
 
         // 控制端：如果能和 hbbr 走内网（relay-server-lan 配置的地址 TCP 可达），
-        // 优先用内网地址连中继，避免流量出公网再绕回来。
-        // hbbr 按 uuid 配对，对端即使走公网地址接入同一个 hbbr 也不影响配对。
+        // **本机**优先连内网地址，避免流量出公网再绕回来。
+        //
+        // ⚠️ 只改"本机连接目标"，**通告给对端的中继地址必须保持公网地址**：
+        // hbbs 收到 RequestRelay 后会把 `relay_server` 字段**原样**转发给被控端 B
+        // （见 rustdesk-server 的 handle RequestRelay 分支，它只改 socket_addr），
+        // B 就用这个地址去连中继。若这里填内网地址，外网 B 必然连不上，
+        // 表现为"配了内网中继之后，跨网会话直接失败"。
+        // 两者指向同一个 hbbr（hbbr 按 uuid 配对、不看接入地址），所以可以不同。
+        let public_relay = relay_server.clone();
         if let Some(lan) = crate::common::pick_lan_relay(&relay_server).await {
             log::info!(
-                "using lan relay '{}' instead of '{}'",
+                "using lan relay '{}' locally instead of '{}' (advertise '{}' to peer)",
                 lan,
-                relay_server
+                relay_server,
+                public_relay
             );
             relay_server = lan;
         }
@@ -730,6 +770,7 @@ impl Client {
         let mut relay_conn = Self::request_relay(
             &peer,
             relay_server.clone(),
+            public_relay.clone(),
             &rendezvous_server,
             secure,
             &key,
@@ -783,7 +824,7 @@ impl Client {
                     log::info!("Parallel LAN test succeeded! Switching to direct LAN.");
                     return Ok((
                         (stream, true, lan_pk, None, "LAN"),
-                        (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),
+                        (feedback, rendezvous_server, public_relay.clone(), peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),
                         false,
                     ));
                 }
@@ -837,7 +878,7 @@ impl Client {
                                 (
                                     feedback,
                                     rendezvous_server,
-                                    relay_server,
+                                    public_relay.clone(),
                                     punched_peer_addr,
                                     Vec::new(),
                                     udp_nat_port,
@@ -859,7 +900,7 @@ impl Client {
 
         return Ok((
             (relay_conn, false, pk, None, relay_type),
-            (feedback, rendezvous_server, relay_server, peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),
+            (feedback, rendezvous_server, public_relay, peer_addr, Vec::new(), udp_nat_port, peer_nat_type as i32),
             false,
         ));
     }
@@ -998,9 +1039,22 @@ impl Client {
         let mut direct = !conn.is_err();
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
+                // 与主路径一致：`relay_server` 是公网/通告地址，
+                // 本机可以额外切到内网中继（对端仍收到公网地址）。
+                let advertise_relay = relay_server.to_owned();
+                let mut local_relay = advertise_relay.clone();
+                if let Some(lan) = crate::common::pick_lan_relay(&local_relay).await {
+                    log::info!(
+                        "connect(): using lan relay '{}' locally instead of '{}'",
+                        lan,
+                        local_relay
+                    );
+                    local_relay = lan;
+                }
                 conn = Self::request_relay(
                     peer_id,
-                    relay_server.to_owned(),
+                    local_relay,
+                    advertise_relay,
                     rendezvous_server,
                     !signed_id_pk.is_empty(),
                     key,
@@ -1118,9 +1172,16 @@ impl Client {
     }
 
     /// Request a relay connection to the server.
+    ///
+    /// - `relay_server`：**本机实际去连**的中继地址（可能是内网地址）；
+    /// - `advertise_relay`：写进 `RequestRelay.relay_server`、由 hbbs **原样转发
+    ///   给对端**的地址，必须是对端可达的公网地址。
+    ///
+    /// 两者指向同一个 hbbr 即可（hbbr 按 uuid 配对，不按接入地址配对）。
     async fn request_relay(
         peer: &str,
         relay_server: String,
+        advertise_relay: String,
         rendezvous_server: &str,
         secure: bool,
         key: &str,
@@ -1146,10 +1207,11 @@ impl Client {
             let mut msg_out = RendezvousMessage::new();
             uuid = Uuid::new_v4().to_string();
             log::info!(
-                "#{} request relay attempt, id: {}, uuid: {}, relay_server: {}, secure: {}",
+                "#{} request relay attempt, id: {}, uuid: {}, relay_server(advertise): {}, relay_server(local): {}, secure: {}",
                 i,
                 peer,
                 uuid,
+                advertise_relay,
                 relay_server,
                 secure,
             );
@@ -1157,7 +1219,8 @@ impl Client {
                 id: peer.to_owned(),
                 token: token.to_owned(),
                 uuid: uuid.clone(),
-                relay_server: relay_server.clone(),
+                // 通告给 hbbs → 对端 B 的地址，必须是公网地址（见函数文档）
+                relay_server: advertise_relay.clone(),
                 secure,
                 ..Default::default()
             });
@@ -4625,6 +4688,15 @@ async fn udp_nat_connect(
 /// 又能在延迟接近时优先就近，减少跨省绕行。
 const REGION_PENALTY_MS: i64 = 40;
 
+/// 中继地址规范化：补默认中继端口 + 统一小写。
+///
+/// 为什么要统一：hbbs 的 `-r`、B 侧上报的候选表、api-server 下发的中继表，
+/// 三处格式不保证一致（有的带端口有的不带、主机名大小写不同）。不规范化会
+/// 导致同一台中继被测两次、"地址→地域"映射静默失配（地域偏好看似配了却没生效）。
+fn norm_relay_addr(addr: &str) -> String {
+    crate::check_port(addr.trim(), RELAY_PORT).to_lowercase()
+}
+
 async fn select_best_relay(
     primary: &str,
     candidates: &[String],
@@ -4633,14 +4705,31 @@ async fn select_best_relay(
     region_of: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut hosts: Vec<(String, i32)> = Vec::new();
-    if !primary.trim().is_empty() {
-        hosts.push((primary.to_owned(), i32::MAX));
-    }
+    // 顺序很重要：**先放候选**（带 B 侧实测 RTT），再补 primary。
+    //
+    // 本仓 hbbs 转发给 A 的 relay_servers/relay_rtts 正是 B 自己做延迟排序后的
+    // top-3，而 B 选中的那台通常就是 `relay_server`（primary）。如果先把 primary
+    // 以 i32::MAX 放进去，去重就会把它**真实的 B 侧 RTT 覆盖成未知**，只能拿均值
+    // 估计——反而系统性抬高它的分数（与"避免主中继凭空占优"的初衷相反）。
     for (i, c) in candidates.iter().enumerate() {
-        if c.trim().is_empty() || hosts.iter().any(|(h, _)| h == c) {
+        if c.trim().is_empty() {
             continue;
         }
-        hosts.push((c.clone(), rtts_from_b.get(i).copied().unwrap_or(i32::MAX)));
+        // 规范化：hbbs 的 "-r"、B 侧候选、api-server 的 addr 可能有的带端口有的不带，
+        // 统一补 RELAY_PORT / 小写后才能正确去重、探测、匹配 region。
+        let host = norm_relay_addr(c);
+        if hosts.iter().any(|(h, _)| *h == host) {
+            continue;
+        }
+        hosts.push((host, rtts_from_b.get(i).copied().unwrap_or(i32::MAX)));
+    }
+    if !primary.trim().is_empty() {
+        let primary_norm = norm_relay_addr(primary);
+        if !hosts.iter().any(|(h, _)| *h == primary_norm) {
+            // primary 不在候选表里（例如 B 配了 relay-server 覆盖，候选为空）：
+            // 它没有 B 侧 RTT，用 i32::MAX 标记未知，评分时用已知值均值估计。
+            hosts.push((primary_norm, i32::MAX));
+        }
     }
     if hosts.len() <= 1 {
         return primary.to_owned();
@@ -4679,16 +4768,19 @@ async fn select_best_relay(
         let b_known = b_rtt != i32::MAX && b_rtt >= 0;
         let b = if b_known { b_rtt as i64 } else { default_b };
         let mut score = a_rtt + b;
-        // 地域偏好：客户端已确定地域、且该中继有地域标注、两者不一致时加惩罚
+        // 地域偏好：客户端已确定地域、且该中继有地域标注、两者不一致时加惩罚。
+        // 注意 region_of 的 key 已由调用方规范化（补端口），与 host 同格式。
+        let mut region_penalty = 0i64;
         if !my_region.is_empty() {
             if let Some(peer_region) = region_of.get(&host) {
                 if !peer_region.is_empty() && peer_region != my_region {
-                    score += REGION_PENALTY_MS;
+                    region_penalty = REGION_PENALTY_MS;
+                    score += region_penalty;
                 }
             }
         }
         log::info!(
-            "  relay '{}': A_RTT={}ms B_RTT={} combined={}ms",
+            "  relay '{}': A_RTT={}ms B_RTT={} combined={}ms region_penalty={}ms score={}ms",
             host,
             a_rtt,
             if b_known {
@@ -4696,6 +4788,8 @@ async fn select_best_relay(
             } else {
                 format!("unknown(assume {}ms)", default_b)
             },
+            a_rtt + b,
+            region_penalty,
             score
         );
         if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) {
@@ -4704,7 +4798,7 @@ async fn select_best_relay(
     }
     match best {
         Some((score, host)) => {
-            log::info!("A selected relay '{}' (combined {}ms)", host, score);
+            log::info!("A selected relay '{}' (score {}ms)", host, score);
             host
         }
         None => {

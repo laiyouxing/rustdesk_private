@@ -187,6 +187,57 @@ fn normalize_danger(tls_type: TlsType, danger_accept_invalid_cert: bool) -> bool
     }
 }
 
+/// 和 [`create_http_client_async`] 相同，但**自带请求总超时与连接超时**，并单独缓存。
+///
+/// 用途：那些"失败也必须尽快返回、绝不能在关键路径上无限等"的请求
+/// （例如建连时拉取中继表的 `/api/node/relays`）。与不带超时的 client
+/// **分开缓存**（超时值进 key），避免互相拿到对方配置的 client。
+///
+/// 注意：降级 client 依旧不缓存；极端情况下（构建全失败）会拿到没有超时的
+/// 默认 client，调用方仍应在外层用 `hbb_common::timeout` 兜一层。
+pub fn create_http_client_async_with_timeout(
+    tls_type: TlsType,
+    danger_accept_invalid_cert: bool,
+    timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> AsyncClient {
+    let danger = normalize_danger(tls_type, danger_accept_invalid_cert);
+    let socks = Config::get_socks();
+    let key = format!(
+        "{:?}|{}|{:?}|t{}|c{}",
+        tls_type,
+        danger,
+        socks,
+        timeout.as_millis(),
+        connect_timeout.as_millis()
+    );
+
+    if let Ok(cache) = ASYNC_CLIENT_CACHE.lock() {
+        if let Some(client) = cache.as_ref().and_then(|m| m.get(&key)) {
+            return client.clone();
+        }
+    }
+    let mut degraded = false;
+    let client = configure_http_client!(
+        AsyncClient::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout),
+        tls_type,
+        danger,
+        AsyncClient,
+        &socks,
+        degraded
+    );
+    if degraded {
+        return client;
+    }
+    if let Ok(mut cache) = ASYNC_CLIENT_CACHE.lock() {
+        let map = cache.get_or_insert_with(Default::default);
+        return map.entry(key).or_insert(client).clone();
+    }
+    client
+}
+
 pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -> &'a str {
     if is_plain(url) {
         if let Some(conf) = proxy_conf {

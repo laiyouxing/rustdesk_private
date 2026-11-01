@@ -182,6 +182,14 @@ fn enabled() -> bool {
     ctx().is_some()
 }
 
+/// 打洞/中继相关 HTTP 请求的统一超时。
+///
+/// 这些都是"旁路增强"请求：api-server 卡住时宁可失败，也绝不能拖住建连
+/// （其中 `/api/node/relays` 是建连路径上的同步等待）。reqwest 默认**没有**
+/// 总超时，必须显式设置。
+const PUNCH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const PUNCH_HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 构造 HTTP 客户端：优先 rustls，TLS 类型未缓存时失败则降级 native-tls
 /// （与 common.rs::check_custom_update 的策略一致，兼容自签名证书）
 async fn client_for(url: &str) -> ResultType<reqwest::Client> {
@@ -194,11 +202,22 @@ async fn client_for(url: &str) -> ResultType<reqwest::Client> {
     // 是否接受无效证书优先用缓存值（与心跳/post_request 一致，缓存才能收敛到同一个
     // client、共用一条连接）；未缓存时默认 true，保持原有的"兼容自签名证书"行为。
     let danger = hbb_common::tls::get_cached_tls_accept_invalid_cert(&tls_url).unwrap_or(true);
-    let client = crate::hbbs_http::create_http_client_async(tls_type, danger);
+    // 带超时的 client（单独缓存）：这些请求都在建连/会话路径上，不能无限等。
+    let client = crate::hbbs_http::create_http_client_async_with_timeout(
+        tls_type,
+        danger,
+        PUNCH_HTTP_TIMEOUT,
+        PUNCH_HTTP_CONNECT_TIMEOUT,
+    );
     if is_tls_not_cached {
         let probe = client.get(url).send().await;
         if probe.is_err() {
-            let client2 = crate::hbbs_http::create_http_client_async(TlsType::NativeTls, danger);
+            let client2 = crate::hbbs_http::create_http_client_async_with_timeout(
+                TlsType::NativeTls,
+                danger,
+                PUNCH_HTTP_TIMEOUT,
+                PUNCH_HTTP_CONNECT_TIMEOUT,
+            );
             if client2.get(url).send().await.is_ok() {
                 return Ok(client2);
             }

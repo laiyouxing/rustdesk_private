@@ -16,7 +16,8 @@ use hbb_common::{
     bail, base64,
     bytes::Bytes,
     config::{
-        self, keys, use_ws, Config, LocalConfig, CONNECT_TIMEOUT, READ_TIMEOUT, RENDEZVOUS_PORT,
+        self, keys, use_ws, Config, LocalConfig, CONNECT_TIMEOUT, READ_TIMEOUT, RELAY_PORT,
+        RENDEZVOUS_PORT,
     },
     futures::future::join_all,
     futures_util::future::poll_fn,
@@ -1269,6 +1270,9 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
+    // 记录本轮"已发起检查"的时间戳：周期检查据此判断是否已满 24h。
+    // 持久化在配置里，进程/机器重启都不会把计时清零。
+    mark_update_check_now();
     // Custom build: check API server for new version
     // Note: we skip the is_custom_client check here because even the standard
     // RustDesk build should be able to check for updates from the custom API server
@@ -1333,8 +1337,76 @@ fn github_release_url(version: &str) -> String {
 /// 软件更新检查的周期：24 小时。
 const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+/// 进程启动后延迟多久做第一次"是否到期"判定：给 UI 启动检查/用户登录留时间，
+/// 避免服务进程开机就查、与用户刚打开软件的检查撞车。
+const UPDATE_CHECK_FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// 到期判定的轮询间隔（**不发起请求**，只读配置判断）：1 小时。
+///
+/// 周期仍是 24h，但"什么时候该查"改成看**持久化的上次检查时间戳**，
+/// 而不是"从进程启动算 24h"——后者在每天关机/重启的机器上永远等不到第一轮
+/// （旧实现先 sleep 24h 再查，正是"自动更新不生效"的一个根因）。
+const UPDATE_CHECK_TICK: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// 上次发起更新检查的时间戳（unix 秒），持久化在配置里，进程重启不丢。
+const LAST_UPDATE_CHECK_TS: &str = "last-update-check-ts";
+
+/// 「待向用户提示的更新」：服务进程静默安装失败（或无 UI 可提示）时落一条，
+/// 等 UI 进程启动后由 [`flush_pending_update_notify`] 读出来弹窗。
+const PENDING_UPDATE_NOTIFY: &str = "update-pending-notify";
+
+/// 落盘文件形式（跨 profile 可读，见 [`set_pending_update_notify`]）。
+const PENDING_UPDATE_FILE: &str = ".update-pending-notify";
+
+/// 已提示过的那一条（避免同一版本每次启动都弹一次）。
+const PENDING_UPDATE_SHOWN: &str = "update-pending-shown";
+
 /// 保证"周期性检查更新"线程每个进程最多启动一次。
 static PERIODIC_UPDATE_CHECK_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// 当前进程是否是常驻的系统服务进程（`--service`）。
+///
+/// 服务进程有两个与更新相关的特殊性：
+///   1. 没有 Flutter UI → `push_global_event` 推不出去（无感知）；
+///   2. 与用户进程使用**不同的配置 profile**（Windows 上服务跑在
+///      LocalService/SYSTEM 下）→ 读不到用户勾选的 `allow-auto-update`。
+/// 因此服务进程只处理服务端下发的 `force_update`，普通更新留给 UI 进程。
+static IS_SERVICE_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 由 `core_main` 的 `--service` 分支调用（每个进程最多一次）。
+pub fn mark_service_process() {
+    IS_SERVICE_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_service_process() -> bool {
+    IS_SERVICE_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 记录"本轮检查已发起"（周期检查据此判断是否已满 24h）。
+fn mark_update_check_now() {
+    let now = now_secs();
+    if now > 0 {
+        Config::set_option(LAST_UPDATE_CHECK_TS.to_owned(), now.to_string());
+    }
+}
+
+/// 距离上次检查是否已满 24h（从未检查过也算到期）。
+fn update_check_due() -> bool {
+    let now = now_secs();
+    match Config::get_option(LAST_UPDATE_CHECK_TS).parse::<u64>() {
+        Ok(last) if last > 0 => now.saturating_sub(last) >= UPDATE_CHECK_INTERVAL.as_secs(),
+        _ => true,
+    }
+}
 
 /// 启动「周期性检查更新」后台线程（每个进程最多一次）。
 ///
@@ -1344,26 +1416,55 @@ static PERIODIC_UPDATE_CHECK_STARTED: std::sync::Once = std::sync::Once::new();
 /// 永远不会触发——只有下次**打开软件**时的启动检查生效，表现为
 /// "强制更新非要我开软件才开始"。
 ///
-/// 现在服务进程（`--service`，开机常驻，即使用户没登录也在跑）也会启动它，
-/// 因此即使没人打开界面，也能按周期发现新版本并按策略自动安装。
+/// 现在服务进程（`--service`，开机常驻，即使用户没登录也在跑）也会启动它。
+/// **计时依据是持久化的"上次检查时间戳"**，不是进程存活时长，所以：
+///   - 进程/机器每天重启也不会把 24h 计时清零；
+///   - UI 进程与服务进程各有自己的配置，各自独立判断，不会互相打断；
+///   - 真正需要跨进程互斥的是**安装**动作，见 [`SilentUpdateLock`]。
 pub fn start_periodic_update_check() {
     PERIODIC_UPDATE_CHECK_STARTED.call_once(|| {
-        std::thread::spawn(|| loop {
-            // 先睡再查：启动时 UI 已经做过一次检查，避免立刻重复请求。
-            std::thread::sleep(UPDATE_CHECK_INTERVAL);
-            log::info!("periodic update check: running scheduled check");
-            check_software_update();
+        std::thread::spawn(|| {
+            // 先等 5 分钟再判定：UI 进程启动时已经查过一次，避免立刻重复请求。
+            std::thread::sleep(UPDATE_CHECK_FIRST_DELAY);
+            loop {
+                if update_check_due() {
+                    log::info!(
+                        "periodic update check: due (>24h since last), running scheduled check"
+                    );
+                    check_software_update();
+                } else {
+                    log::debug!("periodic update check: not due yet, skip");
+                }
+                std::thread::sleep(UPDATE_CHECK_TICK);
+            }
         });
     });
 }
 
+/// 单次 TCP 建连探测的超时（毫秒）。
+const LAN_PROBE_TIMEOUT_MS: u64 = 600;
+
+/// 每个地址的采样次数：取**中位数**，避免单次抖动把"谁更快"判反。
+const LAN_PROBE_SAMPLES: usize = 3;
+
 /// 探测某个地址的 TCP 建连耗时（毫秒）；不可达返回 None。
-async fn tcp_rtt_ms(addr: &str) -> Option<u128> {
+async fn tcp_rtt_once(addr: &str) -> Option<u128> {
     let begin = std::time::Instant::now();
-    match hbb_common::socket_client::connect_tcp(addr, 600).await {
+    match socket_client::connect_tcp(addr, LAN_PROBE_TIMEOUT_MS).await {
         Ok(_) => Some(begin.elapsed().as_millis()),
         Err(_) => None,
     }
+}
+
+/// 同一地址并发采样 [`LAN_PROBE_SAMPLES`] 次，取中位数；全部失败返回 None。
+async fn probe_rtt_median(addr: &str) -> Option<u128> {
+    let futs: Vec<_> = (0..LAN_PROBE_SAMPLES).map(|_| tcp_rtt_once(addr)).collect();
+    let mut samples: Vec<u128> = join_all(futs).await.into_iter().flatten().collect();
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    Some(samples[samples.len() / 2])
 }
 
 /// 「内网中继」相对公网中继至少要先快这么多毫秒才值得切换。
@@ -1375,26 +1476,52 @@ const LAN_RELAY_MIN_ADVANTAGE_MS: u128 = 5;
 
 /// 选择是否改用内网中继地址，返回"确实更快"的那个内网地址。
 ///
-/// 配置项 `relay-server-lan` 支持逗号分隔多个地址；逐个探测（600ms 超时），
-/// 只有比当前公网中继**快出 [`LAN_RELAY_MIN_ADVANTAGE_MS`] 以上**才采用，
-/// 否则返回 None 保持原样——配置写错、内网不通、或内网反而更慢都不会让
-/// 连接变差或失败。
+/// 配置项 `relay-server-lan` 支持逗号分隔多个地址，只有 IP 时自动补中继端口。
+/// **基准与所有候选并发探测**（每个地址采样 3 次取中位数），总耗时≈单次探测；
+/// 只有比当前公网中继**快出 [`LAN_RELAY_MIN_ADVANTAGE_MS`] 以上**才采用（多个候选
+/// 里取最快的那个），否则返回 None 保持原样——配置写错、内网不通、或内网反而
+/// 更慢都不会让连接变差或失败。
 ///
 /// 关于"一端在内网、一端在公网"：hbbr 按 uuid 配对而不看接入地址，两端可以
-/// 各用各的地址接入同一个 hbbr，所以内网那端走内网、公网那端走公网是允许的。
+/// 各用各的地址接入同一个 hbbr。但**注意**：通告给对端的中继地址必须是公网地址，
+/// 本函数只决定"本机连哪个"，调用方（client.rs::_start_inner / connect）负责把
+/// 公网地址放进 RequestRelay.relay_server。
 pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
     let raw = Config::get_option("relay-server-lan");
     if raw.trim().is_empty() {
         return None;
     }
-    // 基准：服务端下发的公网中继。拿不到就退化为"内网可达即可用"。
-    let base_rtt = if base_relay.trim().is_empty() {
+    // 配置里可能只写 IP：补默认中继端口，避免"配了没效果"。
+    let mut lans: Vec<String> = Vec::new();
+    for addr in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let addr = crate::check_port(addr, RELAY_PORT);
+        if !lans.iter().any(|a| *a == addr) {
+            lans.push(addr);
+        }
+    }
+    if lans.is_empty() {
+        return None;
+    }
+    // 基准：服务端下发的公网中继。拿不到就退化为"内网可达且最快即可用"。
+    let base = if base_relay.trim().is_empty() {
         None
     } else {
-        tcp_rtt_ms(base_relay).await
+        Some(crate::check_port(base_relay.trim(), RELAY_PORT))
     };
-    for addr in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let Some(rtt) = tcp_rtt_ms(addr).await else {
+    let mut targets = lans.clone();
+    if let Some(b) = &base {
+        targets.push(b.clone());
+    }
+    let rtts = join_all(targets.iter().map(|a| probe_rtt_median(a))).await;
+    let (cand_rtts, base_rtt) = if base.is_some() {
+        let n = rtts.len();
+        (&rtts[..n - 1], rtts[n - 1])
+    } else {
+        (&rtts[..], None)
+    };
+    let mut best: Option<(u128, &String)> = None;
+    for (addr, rtt) in lans.iter().zip(cand_rtts.iter()) {
+        let Some(rtt) = *rtt else {
             log::debug!("lan relay: '{}' unreachable, skip", addr);
             continue;
         };
@@ -1402,30 +1529,218 @@ pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
             Some(base) => rtt + LAN_RELAY_MIN_ADVANTAGE_MS < base,
             None => true,
         };
-        if better {
+        if !better {
             log::info!(
-                "lan relay: '{}' rtt={}ms vs public '{}' rtt={:?}ms, switching",
+                "lan relay: '{}' rtt={}ms not faster than public '{}' rtt={:?}ms, keep public",
                 addr,
                 rtt,
                 base_relay,
                 base_rtt
             );
-            return Some(addr.to_owned());
+            continue;
         }
-        log::info!(
-            "lan relay: '{}' rtt={}ms not faster than public '{}' rtt={:?}ms, keep public",
-            addr,
-            rtt,
-            base_relay,
-            base_rtt
-        );
+        // 多个候选都达标时取最快的，而不是配置文件里的第一个。
+        if best.as_ref().map(|(b, _)| rtt < *b).unwrap_or(true) {
+            best = Some((rtt, addr));
+        }
     }
-    None
+    match best {
+        Some((rtt, addr)) => {
+            log::info!(
+                "lan relay: '{}' rtt={}ms vs public '{}' rtt={:?}ms, switching (local connect only)",
+                addr,
+                rtt,
+                base_relay,
+                base_rtt
+            );
+            Some(addr.to_string())
+        }
+        None => None,
+    }
 }
 
 /// 「强制更新 / 自动更新」的防抖标记：记录最近一次成功交给安装器的
 /// "{版本}|{下载地址}"，避免同一版本被反复下载安装形成重启循环。
 const FORCE_UPDATE_MARKER: &str = "force-update-marker";
+
+/// 「静默更新」跨进程互斥。
+///
+/// UI 进程和服务进程都跑周期检查，可能同时命中同一版本：若不互斥会并发下载、
+/// 并发拉起两个安装器（安装器之间会互相踩，可能装坏）。用"原子创建锁文件"
+/// 实现（`create_new` 是原子操作），锁文件放**二进制所在目录**——系统服务
+/// 一定可写，且两个进程看到的是同一个文件。
+///
+/// 用户进程对安装目录没有写权限时退化为 best effort（不阻塞更新，只打日志）。
+struct SilentUpdateLock {
+    held: Option<std::path::PathBuf>,
+}
+
+impl SilentUpdateLock {
+    /// 超过这个时长的锁视为残留（进程崩溃/被杀），自动回收，避免永久卡住更新。
+    const STALE_SECS: u64 = 30 * 60;
+
+    /// 加锁；返回 `None` 表示**另一个进程正在下载/安装**，本轮应跳过。
+    fn acquire() -> Option<Self> {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join(".silent-update.lock"));
+            }
+        }
+        // 兜底位置：进程自己的配置目录（只有同 profile 的进程才共享，best effort）
+        candidates.push(Config::path(".silent-update.lock"));
+        for path in candidates {
+            // 回收过期残留锁
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .map(|e| e.as_secs() > Self::STALE_SECS)
+                    .unwrap_or(false);
+                if stale {
+                    match std::fs::remove_file(&path) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            // 删不掉（例如文件属主是 SYSTEM，用户进程无权限）：
+                            // 不能因为一个残留锁就永久阻塞更新，换下一个候选位置。
+                            log::warn!(
+                                "silent update: stale lock {:?} cannot be removed: {}",
+                                path,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Some(Self { held: Some(path) }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    log::info!(
+                        "silent update: another process is updating (lock {:?}), skip this round",
+                        path
+                    );
+                    return None;
+                }
+                // 无权限/目录不存在等：换下一个候选位置
+                Err(_) => continue,
+            }
+        }
+        log::info!("silent update: cannot create lock file, proceed without cross-process guard");
+        Some(Self { held: None })
+    }
+}
+
+impl Drop for SilentUpdateLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.held.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// 记录一条"待向用户提示的更新"（服务进程/无 UI 进程写入，UI 进程读出后弹窗）。
+///
+/// 为什么需要：服务进程里没有 Flutter 事件通道，`push_global_event` 直接返回
+/// None 把事件丢掉——"自动安装失败回退为提示"在服务进程里等于什么也没发生，
+/// 用户全程无感知。这里改成落一条持久化信息，等 UI 进程起来再提示。
+///
+/// 写两份：
+///   1. 配置项 `update-pending-notify`（同 profile 的进程直接可读）；
+///   2. 二进制目录下的 `.update-pending-notify` 文件——Windows 上服务进程
+///      （SYSTEM/LocalService）与用户进程用的是**不同 profile 的配置文件**，
+///      只有这个文件两边都能看到（服务一定可写，UI 至少可读）。
+fn set_pending_update_notify(version: &str, url: &str) {
+    let value = format!("{}|{}", version, url);
+    if Config::get_option(PENDING_UPDATE_NOTIFY) == value {
+        return;
+    }
+    Config::set_option(PENDING_UPDATE_NOTIFY.to_owned(), value.clone());
+    for path in pending_update_file_paths() {
+        if std::fs::write(&path, &value).is_ok() {
+            break;
+        }
+    }
+    log::info!(
+        "update: no UI here, recorded a pending notification (version={})",
+        version
+    );
+}
+
+/// 候选的"待提示"落盘文件位置（第一个是二进制目录，两个进程共享）。
+fn pending_update_file_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join(PENDING_UPDATE_FILE));
+        }
+    }
+    paths.push(Config::path(PENDING_UPDATE_FILE));
+    paths
+}
+
+/// UI 进程启动时调用：若有"待提示的更新"，推一条 Flutter 事件把提示弹出来。
+///
+/// 返回 true 表示已接管本轮提示（调用方不必再自行检查一次，避免短时间弹两遍）。
+pub fn flush_pending_update_notify() -> bool {
+    // 优先读配置项（同 profile），读不到再读跨 profile 的落盘文件
+    let mut raw = Config::get_option(PENDING_UPDATE_NOTIFY);
+    if raw.trim().is_empty() {
+        for path in pending_update_file_paths() {
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    raw = s;
+                    // 删不掉也无妨（文件属主可能是 SYSTEM），下面有 shown 兜底
+                    let _ = std::fs::remove_file(&path);
+                    break;
+                }
+            }
+        }
+    }
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return false;
+    }
+    // 同一条已经提示过：不再重复（落盘文件删不掉时的兜底）
+    let already_shown = Config::get_option(PENDING_UPDATE_SHOWN) == raw;
+    Config::set_option(PENDING_UPDATE_NOTIFY.to_owned(), String::new());
+    if already_shown {
+        return false;
+    }
+    let mut it = raw.splitn(2, '|');
+    let version = it.next().unwrap_or("").to_string();
+    let url = it.next().unwrap_or("").to_string();
+    if url.is_empty() || get_version_number(&version) <= get_version_number(crate::VERSION) {
+        // 已经不新了（或信息不完整）：丢弃，不打扰用户
+        return false;
+    }
+    Config::set_option(PENDING_UPDATE_SHOWN.to_owned(), raw);
+    // 本轮信息已经是最新的（服务进程刚查过）：把"上次检查时间"也更新掉，
+    // 避免周期线程 5 分钟后立刻再查一次、又弹一遍提示。
+    mark_update_check_now();
+    log::info!(
+        "update: flushing pending notification for version {}",
+        version
+    );
+    *SOFTWARE_UPDATE_URL.lock().unwrap() = url.clone();
+    *SOFTWARE_UPDATE_VERSION.lock().unwrap() = version;
+    #[cfg(feature = "flutter")]
+    {
+        let mut m = HashMap::new();
+        m.insert("name", "check_software_update_finish");
+        m.insert("url", &url);
+        if let Ok(data) = serde_json::to_string(&m) {
+            let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+        }
+    }
+    true
+}
 
 /// 尝试静默下载并安装更新，返回是否已成功把安装交给安装器。
 ///
@@ -1444,6 +1759,11 @@ async fn try_silent_update(
     let Some(file_path) = crate::updater::get_download_file_from_url(download_url) else {
         log::warn!("silent update: cannot derive file name from {}", download_url);
         return false;
+    };
+    // 跨进程互斥：服务进程与 UI 进程可能同时命中同一版本，避免并发下载+并发安装。
+    let _update_lock = match SilentUpdateLock::acquire() {
+        Some(lock) => lock,
+        None => return false,
     };
     // 下载前清理历史更新下载残留（保留本次文件名对应的缓存文件）
     crate::updater::cleanup_old_update_files(Some(&file_path));
@@ -1464,20 +1784,81 @@ async fn try_silent_update(
             return false;
         }
     };
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
+    // 安装包大小上限：正常产物 100~300MB。超过视为异常响应（错误页/被劫持），
+    // 直接放弃而不是把内存/磁盘写爆。
+    const MAX_UPDATE_BYTES: u64 = 300 * 1024 * 1024;
+    if let Some(len) = resp.content_length() {
+        if len == 0 || len > MAX_UPDATE_BYTES {
+            log::warn!(
+                "silent update: suspicious content-length {} for {}",
+                len,
+                download_url
+            );
+            return false;
+        }
+    }
+    // 流式写盘：不要 `resp.bytes()` 把整个安装包读进内存——这段代码现在也会跑在
+    // 常驻的服务进程里，100MB+ 的临时缓冲没有意义。
+    // 先写 .part 临时文件，校验通过后原子 rename，避免把半截文件当成品交给安装器。
+    let tmp_path = file_path.with_extension("part");
+    let mut file = match std::fs::File::create(&tmp_path) {
+        Ok(f) => f,
         Err(e) => {
-            log::warn!("silent update: read response body failed: {}", e);
+            log::warn!("silent update: create {:?} failed: {}", tmp_path, e);
             return false;
         }
     };
-    if let Err(e) = std::fs::write(&file_path, &bytes) {
-        log::warn!("silent update: write {:?} failed: {}", file_path, e);
+    use std::io::Write as _;
+    let mut resp = resp;
+    let mut downloaded: u64 = 0;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                downloaded += chunk.len() as u64;
+                if downloaded > MAX_UPDATE_BYTES {
+                    log::warn!(
+                        "silent update: response exceeds {} bytes, abort",
+                        MAX_UPDATE_BYTES
+                    );
+                    drop(file);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return false;
+                }
+                if let Err(e) = file.write_all(&chunk) {
+                    log::warn!("silent update: write {:?} failed: {}", tmp_path, e);
+                    drop(file);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return false;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("silent update: read response body failed: {}", e);
+                drop(file);
+                let _ = std::fs::remove_file(&tmp_path);
+                return false;
+            }
+        }
+    }
+    drop(file);
+    if downloaded == 0 {
+        log::warn!("silent update: empty body from {}", download_url);
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
+        log::warn!(
+            "silent update: rename {:?} -> {:?} failed: {}",
+            tmp_path,
+            file_path,
+            e
+        );
+        let _ = std::fs::remove_file(&tmp_path);
         return false;
     }
     log::info!(
         "silent update: downloaded {} bytes to {:?}",
-        bytes.len(),
+        downloaded,
         file_path
     );
     let Some(path_str) = file_path.to_str() else {
@@ -1599,19 +1980,26 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
         //   - 强制更新：所有客户端都装，**忽略**客户端的「自动更新」开关；
         //   - 普通更新：仅当客户端勾选了「自动更新」(allow-auto-update=Y) 时静默
         //     安装，未勾选则回退为弹提示，由用户自己决定。
+        //
+        // ⚠️ 服务进程（--service）跑的是**另一份配置**（Windows 上服务与用户
+        // 进程使用不同 profile 的配置文件），读不到用户勾选的 allow-auto-update
+        // （`option2bool("allow-…", "")` = false）。所以**服务进程只处理
+        // force_update**；普通更新的静默安装/提示都由 UI 进程负责。
+        let is_service = is_service_process();
         let auto_update_enabled = hbb_common::config::option2bool(
             hbb_common::config::keys::OPTION_ALLOW_AUTO_UPDATE,
             &Config::get_option(hbb_common::config::keys::OPTION_ALLOW_AUTO_UPDATE),
         );
         let mut auto_installed = false;
-        if force_update || auto_update_enabled {
+        if force_update || (auto_update_enabled && !is_service) {
             log::info!(
-                "Update to version {} from {} (force={}, auto_update={}, same_version={})",
+                "Update to version {} from {} (force={}, auto_update={}, same_version={}, service={})",
                 latest_version,
                 download_url,
                 force_update,
                 auto_update_enabled,
-                same_version_force
+                same_version_force,
+                is_service
             );
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
@@ -1620,15 +2008,37 @@ pub async fn check_custom_update() -> hbb_common::ResultType<()> {
             }
         }
         if !auto_installed {
-            // 未勾选自动更新、或自动安装失败（下载/安装出错）：仍然通知 Flutter
-            // 弹提示，避免静默失败后用户完全无感知。
-            #[cfg(feature = "flutter")]
-            {
-                let mut m = std::collections::HashMap::new();
-                m.insert("name", "check_software_update_finish");
-                m.insert("url", &download_url);
-                if let Ok(data) = serde_json::to_string(&m) {
-                    let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+            if is_service && !force_update {
+                // 服务进程读不到用户的自动更新开关：普通更新交给 UI 进程处理，
+                // 这里既不用装、也不该留"待提示"（否则会和 UI 的提示重复）。
+                log::debug!(
+                    "update: non-forced update in service process, left to the UI process"
+                );
+            } else {
+                // 未勾选自动更新、或自动安装失败（下载/安装出错）：仍然通知用户，
+                // 避免静默失败后完全无感知。
+                //
+                // 注意：`push_global_event` 在**没有 UI 的进程**（--service）里返回
+                // None（事件通道不存在），原来那种写法在服务进程里等于什么也没做。
+                // 因此没推成功时落一条"待提示"，等 UI 进程起来再弹。
+                #[cfg(feature = "flutter")]
+                let notified = {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("name", "check_software_update_finish");
+                    m.insert("url", &download_url);
+                    match serde_json::to_string(&m) {
+                        Ok(data) => {
+                            crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data)
+                                .is_some()
+                        }
+                        Err(_) => false,
+                    }
+                };
+                // 非 flutter 构建没有事件通道，直接走"待提示"
+                #[cfg(not(feature = "flutter"))]
+                let notified = false;
+                if !notified {
+                    set_pending_update_notify(&latest_version, &download_url);
                 }
             }
         }

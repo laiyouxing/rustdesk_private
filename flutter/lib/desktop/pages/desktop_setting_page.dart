@@ -564,7 +564,7 @@ class _GeneralState extends State<_General> {
             kOptionEnableIpv6Punch,
             isServer: false,
           ),
-          _OptionRegion(context),
+          const _OptionRegion(),
         ],
       ],
     ];
@@ -3279,20 +3279,52 @@ void changeSocks5Proxy() async {
 /// 选择后立即生效（下次建立连接参与选路）：同地域中继在 A+B 实测延迟
 /// 相近时优先，减少跨省绕行；不影响原有的延迟择优逻辑。
 class _OptionRegion extends StatefulWidget {
-  final BuildContext parentContext;
-  const _OptionRegion(this.parentContext);
+  const _OptionRegion();
 
   @override
   State<_OptionRegion> createState() => _OptionRegionState();
 }
 
 class _OptionRegionState extends State<_OptionRegion> {
+  /// 空串表示"未设置"（不参与地域偏好）。
   String _value = '';
+  bool _saving = false;
 
   @override
   void initState() {
     super.initState();
-    _value = bind.mainGetOptionSync(key: kOptionRelayRegion);
+    final v = bind.mainGetOptionSync(key: kOptionRelayRegion);
+    // 只接受 34 个省级 code：历史值/后台批量下发的值可能是别的格式，
+    // 直接塞给 DropdownButton 会触发 "value 必须恰好命中一个 item" 的断言
+    // （debug 构建红屏、release 构建显示空白）。非法值一律回落为"未设置"。
+    _value = isValidRegionCode(v) ? v : '';
+    if (v.isNotEmpty && _value.isEmpty) {
+      debugPrint('relay-region: ignoring invalid value "$v"');
+    }
+  }
+
+  Future<void> _setRegion(String? v) async {
+    final next = v ?? '';
+    if (next == _value || _saving) {
+      return;
+    }
+    final prev = _value;
+    setState(() => _saving = true);
+    var ok = true;
+    try {
+      await bind.mainSetOption(key: kOptionRelayRegion, value: next);
+    } catch (e) {
+      ok = false;
+      debugPrint('relay-region: save failed: $e');
+    }
+    if (!mounted) {
+      return;
+    }
+    // 写成功才更新显示；失败回滚，避免"界面显示新值、实际配置没变"。
+    setState(() {
+      _saving = false;
+      _value = ok ? next : prev;
+    });
   }
 
   @override
@@ -3320,10 +3352,7 @@ class _OptionRegionState extends State<_OptionRegion> {
                     child: Text('${r.name} (${r.code})'),
                   )),
             ],
-            onChanged: (v) async {
-              setState(() => _value = v ?? '');
-              await bind.mainSetOption(key: kOptionRelayRegion, value: _value);
-            },
+            onChanged: _saving ? null : _setRegion,
           ),
         ],
       ),

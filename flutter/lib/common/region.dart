@@ -59,3 +59,16 @@ String regionName(String code) {
   }
   return code;
 }
+
+/// code 是否为 34 个省级行政区之一。
+///
+/// 用于校验 `relay-region` 的存量值：后台批量下发/历史配置可能是别的格式，
+/// 直接放进 DropdownButton 会触发 "value 必须恰好命中一个 item" 的断言。
+bool isValidRegionCode(String code) {
+  if (code.isEmpty) return false;
+  for (final r in kRegions) {
+    if (r.code == code) return true;
+  }
+  return false;
+}
+

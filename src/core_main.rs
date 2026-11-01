@@ -373,6 +373,10 @@ pub fn core_main() -> Option<Vec<String>> {
             return None;
         } else if args[0] == "--service" {
             log::info!("start --service");
+            // 标记"本进程是常驻服务进程"：它没有 Flutter UI（事件推不出去），
+            // 且使用独立配置 profile（读不到用户勾选的 allow-auto-update）。
+            // 更新逻辑据此把普通更新交给 UI 进程、只处理 force_update。
+            crate::common::mark_service_process();
             // 服务进程开机常驻，由它承担"每 24 小时检查一次更新"，
             // 这样即使用户从不打开界面，也能按策略发现并（自动）安装新版本。
             crate::common::start_periodic_update_check();
