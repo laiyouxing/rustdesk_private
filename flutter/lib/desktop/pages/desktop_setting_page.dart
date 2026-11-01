@@ -25,6 +25,7 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 
+import '../../common/region.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
 
@@ -563,6 +564,7 @@ class _GeneralState extends State<_General> {
             kOptionEnableIpv6Punch,
             isServer: false,
           ),
+          _OptionRegion(context),
         ],
       ],
     ];
@@ -3269,4 +3271,63 @@ void changeSocks5Proxy() async {
   });
 }
 
+//#endregion
+
+//#region 所属地区（中继就近调度）
+/// 「所属地区」下拉：写入选项 relay-region。
+///
+/// 选择后立即生效（下次建立连接参与选路）：同地域中继在 A+B 实测延迟
+/// 相近时优先，减少跨省绕行；不影响原有的延迟择优逻辑。
+class _OptionRegion extends StatefulWidget {
+  final BuildContext parentContext;
+  const _OptionRegion(this.parentContext);
+
+  @override
+  State<_OptionRegion> createState() => _OptionRegionState();
+}
+
+class _OptionRegionState extends State<_OptionRegion> {
+  String _value = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _value = bind.mainGetOptionSync(key: kOptionRelayRegion);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              translate('Region'),
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.normal,
+                color: Theme.of(context).textTheme.titleLarge?.color,
+              ),
+            ),
+          ),
+          DropdownButton<String>(
+            value: _value,
+            items: [
+              const DropdownMenuItem<String>(value: '', child: Text('--')),
+              ...kRegions.map((r) => DropdownMenuItem<String>(
+                    value: r.code,
+                    child: Text('${r.name} (${r.code})'),
+                  )),
+            ],
+            onChanged: (v) async {
+              setState(() => _value = v ?? '');
+              await bind.mainSetOption(key: kOptionRelayRegion, value: _value);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
 //#endregion
