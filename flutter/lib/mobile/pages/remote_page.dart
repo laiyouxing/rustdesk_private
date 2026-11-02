@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
+import 'package:flutter_hbb/mobile/widgets/extra_keys_bar.dart';
 import 'package:flutter_hbb/common/widgets/toolbar.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/mobile/widgets/floating_mouse.dart';
@@ -74,6 +75,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   final FocusNode _mobileFocusNode = FocusNode();
   final FocusNode _physicalFocusNode = FocusNode();
   var _showEdit = false; // use soft keyboard
+  // 扩展按键条（Ctrl/Alt/Win/F1~F12/方向键/组合键）是否展开
+  var _showExtraKeys = false;
 
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
@@ -345,7 +348,19 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Widget _bottomWidget() => _showGestureHelp
       ? getGestureHelp()
       : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
-          ? getBottomAppBar()
+          ? Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 手机没有物理键盘，扩展按键条补上 Ctrl/Alt/Win、F1~F12、
+                // 方向键与高频组合键（原先只能按 Ctrl+Alt+Del）
+                if (_showExtraKeys)
+                  ExtraKeysBar(
+                    sessionId: sessionId,
+                    onClose: () => setState(() => _showExtraKeys = false),
+                  ),
+                getBottomAppBar(),
+              ],
+            )
           : Offstage());
 
   @override
@@ -492,6 +507,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
                                   onPressed: openKeyboard),
+                              // 展开/收起扩展按键条
+                              IconButton(
+                                  color: Colors.white,
+                                  icon: Icon(_showExtraKeys
+                                      ? Icons.keyboard_hide
+                                      : Icons.keyboard_alt_outlined),
+                                  onPressed: () => setState(
+                                      () => _showExtraKeys = !_showExtraKeys)),
                               IconButton(
                                 color: Colors.white,
                                 icon: const Icon(Icons.build),
@@ -504,6 +527,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
                                   onPressed: openKeyboard),
+                              IconButton(
+                                  color: Colors.white,
+                                  icon: Icon(_showExtraKeys
+                                      ? Icons.keyboard_hide
+                                      : Icons.keyboard_alt_outlined),
+                                  onPressed: () => setState(
+                                      () => _showExtraKeys = !_showExtraKeys)),
                               IconButton(
                                 color: Colors.white,
                                 icon: Icon(gFFI.ffiModel.touchMode
