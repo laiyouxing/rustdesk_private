@@ -157,29 +157,64 @@ class _PortForwardPageState extends State<PortForwardPage>
       data: Theme.of(context).copyWith(
         colorScheme: Theme.of(context).colorScheme,
       ),
-      child: Obx(() => ListView.builder(
-          controller: ScrollController(),
-          itemCount: pfs.length + 2,
-          itemBuilder: ((context, index) {
-            if (index == 0) {
-              return Container(
-                height: 25,
-                color: Theme.of(context).scaffoldBackgroundColor,
-                child: Row(children: [
-                  text('Local Port'),
-                  const SizedBox(width: _kColumn1Width),
-                  text('Remote Host'),
-                  text('Remote Port'),
-                  SizedBox(
-                      width: _kColumn4Width, child: Text(translate('Action')))
-                ]),
-              );
-            } else if (index == 1) {
-              return buildTunnelAddRow(context);
-            } else {
-              return buildTunnelDataRow(context, pfs[index - 2], index - 2);
-            }
-          }))),
+      child: Obx(() => Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              buildTunnelHint(context),
+              Expanded(
+                child: ListView.builder(
+                    controller: ScrollController(),
+                    itemCount: pfs.length + 2,
+                    itemBuilder: ((context, index) {
+                      if (index == 0) {
+                        return Container(
+                          height: 25,
+                          color: Theme.of(context).scaffoldBackgroundColor,
+                          child: Row(children: [
+                            text('Local Port'),
+                            const SizedBox(width: _kColumn1Width),
+                            text('Remote Host'),
+                            text('Remote Port'),
+                            SizedBox(
+                                width: _kColumn4Width,
+                                child: Text(translate('Action')))
+                          ]),
+                        );
+                      } else if (index == 1) {
+                        return buildTunnelAddRow(context);
+                      } else {
+                        return buildTunnelDataRow(
+                            context, pfs[index - 2], index - 2);
+                      }
+                    })),
+              ),
+            ],
+          )),
+    );
+  }
+
+  /// 端口转发用法说明。
+  ///
+  /// 此前界面只有三个空输入框，用户不知道
+  /// 「本地端口 / 远程主机 / 远程端口」分别该填什么。
+  Widget buildTunnelHint(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(_kTextLeftMargin, 8, 10, 6),
+      color: Theme.of(context).scaffoldBackgroundColor,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(translate('PortForwardTip'),
+              style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).textTheme.bodySmall?.color)),
+          const SizedBox(height: 2),
+          Text(translate('PortForwardExample'),
+              style:
+                  TextStyle(fontSize: 12, color: Theme.of(context).hintColor)),
+        ],
+      ),
     );
   }
 
@@ -196,14 +231,16 @@ class _PortForwardPageState extends State<PortForwardPage>
       child: Row(children: [
         buildTunnelInputCell(context,
             controller: localPortController,
-            inputFormatters: portInputFormatter),
+            inputFormatters: portInputFormatter,
+            hint: translate('PortForwardLocalPortHint')),
         const SizedBox(
             width: _kColumn1Width, child: Icon(Icons.arrow_forward_sharp)),
         buildTunnelInputCell(context,
             controller: remoteHostController, hint: 'localhost'),
         buildTunnelInputCell(context,
             controller: remotePortController,
-            inputFormatters: portInputFormatter),
+            inputFormatters: portInputFormatter,
+            hint: translate('PortForwardRemotePortHint')),
         ElevatedButton(
           onPressed: () async {
             int? localPort = int.tryParse(localPortController.text);
