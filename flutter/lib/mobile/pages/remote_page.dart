@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
-import 'package:flutter_hbb/mobile/widgets/extra_keys_bar.dart';
 import 'package:flutter_hbb/common/widgets/toolbar.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/mobile/widgets/floating_mouse.dart';
@@ -75,8 +74,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   final FocusNode _mobileFocusNode = FocusNode();
   final FocusNode _physicalFocusNode = FocusNode();
   var _showEdit = false; // use soft keyboard
-  // 扩展按键条（Ctrl/Alt/Win/F1~F12/方向键/组合键）是否展开
-  var _showExtraKeys = false;
 
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
@@ -348,19 +345,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Widget _bottomWidget() => _showGestureHelp
       ? getGestureHelp()
       : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
-          ? Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // 手机没有物理键盘，扩展按键条补上 Ctrl/Alt/Win、F1~F12、
-                // 方向键与高频组合键（原先只能按 Ctrl+Alt+Del）
-                if (_showExtraKeys)
-                  ExtraKeysBar(
-                    sessionId: sessionId,
-                    onClose: () => setState(() => _showExtraKeys = false),
-                  ),
-                getBottomAppBar(),
-              ],
-            )
+          ? getBottomAppBar()
           : Offstage());
 
   @override
@@ -507,14 +492,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
                                   onPressed: openKeyboard),
-                              // 展开/收起扩展按键条
-                              IconButton(
-                                  color: Colors.white,
-                                  icon: Icon(_showExtraKeys
-                                      ? Icons.keyboard_hide
-                                      : Icons.keyboard_alt_outlined),
-                                  onPressed: () => setState(
-                                      () => _showExtraKeys = !_showExtraKeys)),
                               IconButton(
                                 color: Colors.white,
                                 icon: const Icon(Icons.build),
@@ -527,13 +504,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
                                   onPressed: openKeyboard),
-                              IconButton(
-                                  color: Colors.white,
-                                  icon: Icon(_showExtraKeys
-                                      ? Icons.keyboard_hide
-                                      : Icons.keyboard_alt_outlined),
-                                  onPressed: () => setState(
-                                      () => _showExtraKeys = !_showExtraKeys)),
                               IconButton(
                                 color: Colors.white,
                                 icon: Icon(gFFI.ffiModel.touchMode
@@ -884,7 +854,8 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
     return TextButton(
         style: TextButton.styleFrom(
           minimumSize: Size(0, 0),
-          padding: EdgeInsets.symmetric(vertical: 10, horizontal: 9.75),
+          // 原来 10/9.75 的 padding + 11px 字，手指很难点准
+          padding: EdgeInsets.symmetric(vertical: 12, horizontal: 11),
           //adds padding inside the button
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           //limits the touch area to the button area
@@ -898,6 +869,50 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
             : Text(translate(text),
                 style: TextStyle(color: Colors.white, fontSize: 11)),
         onPressed: onPressed);
+  }
+
+  /// 发送普通按键后**立即清除修饰键**。
+  ///
+  /// 原实现里 Ctrl/Alt/Shift/Win 是纯开关，按一次就常亮，之后每次按键都带修饰，
+  /// 想打普通字符必须再点回去——这是最难用的点之一。
+  void _tapKey(String vk) {
+    inputModel.inputKey(vk);
+    _clearModifiers();
+  }
+
+  void _clearModifiers() {
+    if (inputModel.ctrl ||
+        inputModel.alt ||
+        inputModel.shift ||
+        inputModel.command) {
+      setState(() {
+        inputModel.ctrl = false;
+        inputModel.alt = false;
+        inputModel.shift = false;
+        inputModel.command = false;
+      });
+    }
+  }
+
+  /// 发送固定修饰的组合键，结束后恢复用户原来的修饰键状态。
+  void _combo(String vk,
+      {bool ctrl = false,
+      bool alt = false,
+      bool shift = false,
+      bool command = false}) {
+    final c0 = inputModel.ctrl;
+    final a0 = inputModel.alt;
+    final s0 = inputModel.shift;
+    final m0 = inputModel.command;
+    inputModel.ctrl = ctrl;
+    inputModel.alt = alt;
+    inputModel.shift = shift;
+    inputModel.command = command;
+    inputModel.inputKey(vk);
+    inputModel.ctrl = c0;
+    inputModel.alt = a0;
+    inputModel.shift = s0;
+    inputModel.command = m0;
   }
 
   _updateRect() {
@@ -983,47 +998,47 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
     for (var i = 1; i <= 12; ++i) {
       final name = 'F$i';
       fn.add(wrap(name, () {
-        inputModel.inputKey('VK_$name');
+        _tapKey('VK_$name');
       }));
     }
     final more = <Widget>[
       SizedBox(width: 9999),
       wrap('Esc', () {
-        inputModel.inputKey('VK_ESCAPE');
+        _tapKey('VK_ESCAPE');
       }),
       wrap('Tab', () {
-        inputModel.inputKey('VK_TAB');
+        _tapKey('VK_TAB');
       }),
       wrap('Home', () {
-        inputModel.inputKey('VK_HOME');
+        _tapKey('VK_HOME');
       }),
       wrap('End', () {
-        inputModel.inputKey('VK_END');
+        _tapKey('VK_END');
       }),
       wrap('Ins', () {
-        inputModel.inputKey('VK_INSERT');
+        _tapKey('VK_INSERT');
       }),
       wrap('Del', () {
-        inputModel.inputKey('VK_DELETE');
+        _tapKey('VK_DELETE');
       }),
       wrap('PgUp', () {
-        inputModel.inputKey('VK_PRIOR');
+        _tapKey('VK_PRIOR');
       }),
       wrap('PgDn', () {
-        inputModel.inputKey('VK_NEXT');
+        _tapKey('VK_NEXT');
       }),
       // to-do: support PrtScr on Mac
       if (isWin || isLinux)
         wrap('PrtScr', () {
-          inputModel.inputKey('VK_SNAPSHOT');
+          _tapKey('VK_SNAPSHOT');
         }),
       if (isWin || isLinux)
         wrap('ScrollLock', () {
-          inputModel.inputKey('VK_SCROLL');
+          _tapKey('VK_SCROLL');
         }),
       if (isWin || isLinux)
         wrap('Pause', () {
-          inputModel.inputKey('VK_PAUSE');
+          _tapKey('VK_PAUSE');
         }),
       if (isWin || isLinux)
         // Maybe it's better to call it "Menu"
@@ -1032,20 +1047,20 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
           inputModel.inputKey('Apps');
         }),
       wrap('Enter', () {
-        inputModel.inputKey('VK_ENTER');
+        _tapKey('VK_ENTER');
       }),
       SizedBox(width: 9999),
       wrap('', () {
-        inputModel.inputKey('VK_LEFT');
+        _tapKey('VK_LEFT');
       }, icon: Icons.keyboard_arrow_left),
       wrap('', () {
-        inputModel.inputKey('VK_UP');
+        _tapKey('VK_UP');
       }, icon: Icons.keyboard_arrow_up),
       wrap('', () {
-        inputModel.inputKey('VK_DOWN');
+        _tapKey('VK_DOWN');
       }, icon: Icons.keyboard_arrow_down),
       wrap('', () {
-        inputModel.inputKey('VK_RIGHT');
+        _tapKey('VK_RIGHT');
       }, icon: Icons.keyboard_arrow_right),
       wrap(isMac ? 'Cmd+C' : 'Ctrl+C', () {
         sendPrompt(isMac, 'VK_C');
@@ -1056,6 +1071,17 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
       wrap(isMac ? 'Cmd+S' : 'Ctrl+S', () {
         sendPrompt(isMac, 'VK_S');
       }),
+      // ===== 高频组合键 =====
+      wrap(' Ctrl+X ', () => _combo('VK_X', ctrl: true)),
+      wrap(' Ctrl+A ', () => _combo('VK_A', ctrl: true)),
+      wrap(' Ctrl+Z ', () => _combo('VK_Z', ctrl: true)),
+      wrap(' Alt+Tab ', () => _combo('VK_TAB', alt: true)),
+      wrap(' Alt+F4 ', () => _combo('VK_F4', alt: true)),
+      if (isWin || isLinux) wrap(' Win+D ', () => _combo('VK_D', command: true)),
+      if (isWin || isLinux) wrap(' Win+L ', () => _combo('VK_L', command: true)),
+      if (isWin || isLinux)
+        wrap(' Ctrl+Shift+Esc ',
+            () => _combo('VK_ESCAPE', ctrl: true, shift: true)),
     ];
     final space = size.width > 320 ? 4.0 : 2.0;
     // 500 ms is long enough for this widget to be built!
