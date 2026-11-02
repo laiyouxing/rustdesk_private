@@ -973,9 +973,34 @@ async fn handle(data: Data, stream: &mut Connection) {
                     }
                     crate::platform::launch_client_after_update();
                 } else {
-                    let _ = std::process::Command::new(&file)
+                    // 必须**等安装器结束**再启动客户端：原先用 spawn 后立即返回，
+                    // 安装器还在替换文件时就去拉起 exe，经常拉到旧文件或直接失败，
+                    // 结果是"更新完了但应用没起来、平台显示离线"。
+                    let status = std::process::Command::new(&file)
                         .arg("--update")
-                        .spawn();
+                        .status();
+                    let exit_code = match &status {
+                        Ok(s) => {
+                            if s.success() {
+                                log::info!("update installer finished: success");
+                            } else {
+                                log::error!("update installer finished: code={:?}", s.code());
+                            }
+                            s.code()
+                        }
+                        Err(e) => {
+                            log::error!("run update installer failed: {}", e);
+                            None
+                        }
+                    };
+                    // 安装器可能自举成另一个进程/延迟落盘，给它一点时间
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    // 服务没起来设备就不会上线，先确保服务在跑
+                    crate::platform::ensure_service_running_after_update();
+                    // 再把用户会话里的客户端拉起来（原实现漏了这一步，msi 分支有）
+                    crate::platform::launch_client_after_update();
+                    // 落一份结果，现场排查"更新完为什么没启动"直接看这个文件
+                    crate::platform::write_update_result(&file, exit_code, true);
                 }
             }
             #[cfg(all(not(windows), not(any(target_os = "android", target_os = "ios"))))]

@@ -3894,6 +3894,101 @@ pub fn ensure_service_running() {
     });
 }
 
+/// 把一行启动记录追加到安装目录下的 `startup.log`。
+///
+/// 现场排查"到底有没有起来"时直接看这个文件：
+/// 服务每次启动、UI 每次启动都会各留一行（角色 / 版本 / pid / 会话 / 时间）。
+/// 只保留最近约 200 行，避免长期运行把磁盘写满。
+pub fn append_startup_log(role: &str) {
+    let (install_dir, _, _, _) = get_install_info();
+    if install_dir.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(&install_dir).join("startup.log");
+    // 超过 64KB 就清空重来（这类日志只在排障时看最近几条）
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 64 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let now = hbb_common::chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let line = format!(
+        "[{}] role={} version={} pid={} session={}\n",
+        now,
+        role,
+        crate::VERSION,
+        get_current_pid(),
+        get_current_session_id(true)
+    );
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 把更新结果写到安装目录下的 `update-result.log`（SYSTEM 可写）。
+///
+/// 记：安装器退出码、更新后 exe 是否存在、服务是否在跑、是否成功拉起客户端。
+/// 排查"更新完之后应用起不来 / 平台显示离线"时，先看这个文件。
+pub fn write_update_result(installer: &str, exit_code: Option<i32>, launched: bool) {
+    let (install_dir, _, _, exe) = get_install_info();
+    if install_dir.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(&install_dir).join("update-result.log");
+    let now = hbb_common::chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let app_name = crate::get_app_name();
+    let line = format!(
+        "[{}] installer={} exit={:?} exe_exists={} service_running={} client_launched={} version={}\n",
+        now,
+        installer,
+        exit_code,
+        std::path::Path::new(&exe).exists(),
+        is_service_running(&app_name),
+        launched,
+        crate::VERSION
+    );
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+    log::info!("update result: {}", line.trim_end());
+}
+
+/// 更新后确保服务在跑：服务没起来时客户端不会上线，平台就显示离线。
+pub fn ensure_service_running_after_update() {
+    let app_name = crate::get_app_name();
+    if is_service_running(&app_name) {
+        log::info!("service {} already running after update", app_name);
+        return;
+    }
+    log::warn!("service {} not running after update, starting it", app_name);
+    let _ = std::process::Command::new("sc")
+        .arg("start")
+        .arg(&app_name)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .status();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    log::info!(
+        "service {} running after start attempt: {}",
+        app_name,
+        is_service_running(&app_name)
+    );
+}
+
 pub fn is_service_running(service_name: &str) -> bool {
     unsafe {
         let service_name = wide_string(service_name);

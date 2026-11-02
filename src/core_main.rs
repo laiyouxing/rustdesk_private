@@ -372,6 +372,9 @@ pub fn core_main() -> Option<Vec<String>> {
             crate::platform::uninstall_service(false, true);
             return None;
         } else if args[0] == "--service" {
+        #[cfg(target_os = "windows")]
+        crate::platform::append_startup_log("service");
+
             log::info!("start --service");
             // 标记"本进程是常驻服务进程"：它没有 Flutter UI（事件推不出去），
             // 且使用独立配置 profile（读不到用户勾选的 allow-auto-update）。

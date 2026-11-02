@@ -104,6 +104,8 @@ fn load_plugin_in_app_path(dll_name: &str) -> Result<Library, LibError> {
 #[cfg(not(windows))]
 #[no_mangle]
 pub extern "C" fn rustdesk_core_main() -> bool {
+    #[cfg(target_os = "windows")]
+    crate::platform::append_startup_log("ui");
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if crate::core_main::core_main().is_some() {
         return true;
