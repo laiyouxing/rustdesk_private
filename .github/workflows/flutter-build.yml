@@ -591,6 +591,11 @@ jobs:
       - name: Build rustdesk
         shell: bash
         run: |
+          # Override flutter version to match BUILD_VERSION（iOS 原先漏了这一步）。
+          # 注意：此作业跑在 macOS，BSD sed 的 -i 必须带一个空备份后缀。
+          flutter_ver=$(echo "${{ env.VERSION }}" | sed 's/^v//' | cut -d. -f1-3)
+          sed -i '' "s/^version:.*/version: ${flutter_ver}+64/" flutter/pubspec.yaml
+          echo "Overrode flutter version to ${flutter_ver}+64"
           pushd flutter
           # flutter build ipa --release --obfuscate --split-debug-info=./split-debug-info --no-codesign
           # for easy debugging
@@ -1077,7 +1082,8 @@ jobs:
           # temporary use debug sign config
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
           # Override flutter version to match BUILD_VERSION (same as Windows/Linux via build.py)
-          flutter_ver=$(echo "${{ env.VERSION }}" | cut -d. -f1-3)
+          # 剥掉可能的 v 前缀：tag 允许 v1.2.3，但 pubspec 的 version 必须是纯数字。
+          flutter_ver=$(echo "${{ env.VERSION }}" | sed 's/^v//' | cut -d. -f1-3)
           sed -i "s/^version:.*/version: ${flutter_ver}+64/" flutter/pubspec.yaml
           echo "Overrode flutter version to ${flutter_ver}+64"
           case ${{ matrix.job.target }} in
@@ -1292,6 +1298,11 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
           # temporary use debug sign config
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          # Override flutter version to match BUILD_VERSION（universal APK 原先漏了这一步，
+          # 导致安装包内 versionName 一直是 pubspec 里写死的 1.5.4，不跟随 tag）。
+          flutter_ver=$(echo "${{ env.VERSION }}" | sed 's/^v//' | cut -d. -f1-3)
+          sed -i "s/^version:.*/version: ${flutter_ver}+64/" flutter/pubspec.yaml
+          echo "Overrode flutter version to ${flutter_ver}+64"
           mv ./flutter/android/app/src/main/jniLibs/arm64-v8a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
           mv ./flutter/android/app/src/main/jniLibs/armeabi-v7a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
