@@ -473,21 +473,14 @@ pub fn sort_addrs(mut addrs: Vec<PunchAddr>) -> Vec<PunchAddr> {
     addrs
 }
 
-/// 集群调度：拉取按「客户端地域」偏好排序的中继列表。
-///
-/// 返回 (中继地址列表, 服务端记录的本机地域, 地址->地域 映射)。
-/// 地域优先级：客户端本地配置的 `relay-region` 最高，其次用服务端为设备
-/// 记录的地域；两者都为空时纯按调度分数返回（等价于纯延迟择优）。
-///
-/// 该函数是**可选增强**：api-server 不可达或未部署该接口时返回空，
-/// 调用方保持原有行为，不影响连接建立。
-/// 中继的「公网地址 → 候选内网地址」映射缓存。
-///
-/// 数据来自 api-server `/node/relays` 响应里每个节点的 `lan_addrs`（节点自动上报的
-/// 多网卡地址）。客户端选中某台公网中继后，用这里的候选做内网直连：
-/// 本机改连内网地址、通告对端的仍是公网地址（同一台 hbbr 按 uuid 配对）。
-///
-/// 复用 `/node/relays` 的响应填充，**不额外发请求**。
+// 中继的「公网地址 → 候选内网地址」映射缓存。
+//
+// 数据来自 api-server `/node/relays` 响应里每个节点的 `lan_addrs`（节点自动上报的
+// 多网卡地址）。客户端选中某台公网中继后，用这里的候选做内网直连：
+// 本机改连内网地址、通告对端的仍是公网地址（同一台 hbbr 按 uuid 配对）。
+//
+// 复用 `/node/relays` 的响应填充；被控端没有那条路径，靠 `/node/relay-lan-map`
+// 在后台按需补齐（见 `ensure_relay_lan_map_bg`）。
 lazy_static::lazy_static! {
     pub static ref RELAY_LAN_MAP: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
@@ -496,6 +489,24 @@ lazy_static::lazy_static! {
 /// 映射最近一次成功刷新的时间（用于决定是否需要重新拉取）。
 static RELAY_LAN_MAP_AT: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
+
+/// 最近一次拉取失败的时间（负缓存：冷却期内不再重试，避免每次建连白等 800ms）。
+static RELAY_LAN_MAP_FAIL_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// 拉取失败后的重试冷却时间（秒）。
+const RELAY_LAN_MAP_FAIL_COOLDOWN_SECS: u64 = 60;
+
+/// 映射是否为空（从未成功拉取过，或服务端没有下发任何内网候选）。
+///
+/// 建连路径据此判断"这一跳要不要等映射"：为空时本次直接走公网、后台刷新，
+/// 下一次建连再享受内网中继，避免首次建连被 HTTP 请求拖住。
+pub fn relay_lan_map_is_empty() -> bool {
+    match RELAY_LAN_MAP.lock() {
+        Ok(g) => g.is_empty(),
+        Err(_) => true,
+    }
+}
 
 /// 读取某台公网中继对应的候选内网地址（无则空）。
 pub fn relay_lan_candidates(base_relay: &str) -> Vec<String> {
@@ -518,22 +529,63 @@ fn mark_relay_lan_map_fresh() {
     }
 }
 
+fn relay_lan_map_fail_age_secs() -> u64 {
+    match RELAY_LAN_MAP_FAIL_AT.lock() {
+        Ok(g) => g.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX),
+        Err(_) => u64::MAX,
+    }
+}
+
+fn mark_relay_lan_map_failed() {
+    if let Ok(mut g) = RELAY_LAN_MAP_FAIL_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+fn clear_relay_lan_map_failed() {
+    if let Ok(mut g) = RELAY_LAN_MAP_FAIL_AT.lock() {
+        *g = None;
+    }
+}
+
+/// 后台刷新中继内网映射：**不阻塞调用方**，同一时刻只跑一个刷新任务。
+///
+/// 建连路径上不能同步等这次 HTTP（最长 800ms）：首次建连/映射过期时由它在后台补齐，
+/// 本次仍走公网，下一次建连自然生效。
+pub fn ensure_relay_lan_map_bg(max_age_secs: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REFRESHING: AtomicBool = AtomicBool::new(false);
+    if REFRESHING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    hbb_common::tokio::spawn(async move {
+        let _ = hbb_common::timeout(800, ensure_relay_lan_map(max_age_secs)).await;
+        REFRESHING.store(false, Ordering::Release);
+    });
+}
+
 /// 按需刷新中继内网映射（默认 60 秒内复用缓存）。
 ///
 /// 为什么需要它：只有**控制端**会调 `get_region_relays()` 顺带填充缓存，
 /// 被控端（B）走的不是那条路径，于是 B 与中继同内网时无法自动使用内网地址。
 /// 这里让两端都能主动拉一次 `/api/node/relay-lan-map`，代价是每 60 秒一次小请求。
 ///
-/// 失败静默（api-server 不可达时保持原有行为，不影响建连）。
+/// **失败负缓存**：任何失败路径都记下尝试时间，60 秒内不再重试——否则 api-server
+/// 挂掉时每次建连都要白等一次 800ms 超时。
 pub async fn ensure_relay_lan_map(max_age_secs: u64) {
     if relay_lan_map_age_secs() < max_age_secs {
         return;
     }
+    if relay_lan_map_fail_age_secs() < RELAY_LAN_MAP_FAIL_COOLDOWN_SECS {
+        return;
+    }
     let Some((api_server, token, key)) = ctx() else {
+        mark_relay_lan_map_failed();
         return;
     };
     let url = format!("{}{}", api_server, NODE_RELAY_LAN_MAP_PATH);
     let Ok(client) = client_for(&url).await else {
+        mark_relay_lan_map_failed();
         return;
     };
     let resp = client
@@ -543,15 +595,19 @@ pub async fn ensure_relay_lan_map(max_age_secs: u64) {
         .send()
         .await;
     let Ok(resp) = resp else {
+        mark_relay_lan_map_failed();
         return;
     };
     let Ok(v) = resp.json::<serde_json::Value>().await else {
+        mark_relay_lan_map_failed();
         return;
     };
     let Some(map) = v.get("data").and_then(|d| d.get("map")) else {
+        mark_relay_lan_map_failed();
         return;
     };
     let Some(obj) = map.as_object() else {
+        mark_relay_lan_map_failed();
         return;
     };
     let mut new_map: std::collections::HashMap<String, Vec<String>> =
@@ -574,9 +630,19 @@ pub async fn ensure_relay_lan_map(max_age_secs: u64) {
     if let Ok(mut g) = RELAY_LAN_MAP.lock() {
         *g = new_map;
     }
+    clear_relay_lan_map_failed();
     mark_relay_lan_map_fresh();
     hbb_common::log::debug!("relay lan map refreshed");
 }
+
+/// 集群调度：拉取按「客户端地域」偏好排序的中继列表。
+///
+/// 返回 (中继地址列表, 服务端记录的本机地域, 地址->地域 映射)。
+/// 地域优先级：客户端本地配置的 `relay-region` 最高，其次用服务端为设备
+/// 记录的地域；两者都为空时纯按调度分数返回（等价于纯延迟择优）。
+///
+/// 该函数是**可选增强**：api-server 不可达或未部署该接口时返回空，
+/// 调用方保持原有行为，不影响连接建立。
 pub async fn get_region_relays(
     peer_id: &str,
     my_region: &str,

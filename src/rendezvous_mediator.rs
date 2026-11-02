@@ -423,9 +423,9 @@ impl RendezvousMediator {
                             sorted_rtts.first().copied().unwrap_or(0),
                             provided_relay_server,
                         );
-                        // 回传候选给 A 评估。**不能只给 top-3**：B 连不上的地址可能正是
-                        // A 所在内网的中继地址（B 在公网、A 与中继同内网），裁掉后
-                        // A 就永远选不到内网中继。上限 8 条控制 A 侧探测耗时。
+                        // 回传候选给 A 评估：只含 B **实测可达**的地址（不可达项已在
+                        // sort_relays_by_latency 里丢弃——A 选中后会原样通告给 B，
+                        // B 连不上会直接导致会话建不起来）。上限 8 条控制 A 侧探测耗时。
                         let top_n: Vec<String> =
                             sorted_hosts.into_iter().take(8).collect();
                         let top_rtts: Vec<i32> =
@@ -1432,13 +1432,13 @@ async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i
                 Ok(_) => {
                     let rtt_ms = begin.elapsed().as_millis() as i32;
                     log::debug!("Relay {} latency: {}ms", host, rtt_ms);
-                    (host, rtt_ms)
+                    Some((host, rtt_ms))
                 }
                 Err(e) => {
-                    // 保留不可达项：它可能是"与本机不同网段、但控制端同网段"的内网地址，
-                    // 直接丢掉会让同内网的控制端永远用不到内网中继。
-                    log::debug!("Relay {} unreachable from B: {}", host, e);
-                    (host, i32::MAX)
+                    // 不可达项**丢弃**：A 选中的地址会被原样通告给 B，B 连不上会直接
+                    // 导致会话建不起来；内网场景由 relay-lan-map（本机改连、通告公网）覆盖。
+                    log::debug!("Relay {} unreachable from B: {}, dropped", host, e);
+                    None
                 }
             }
         }));
@@ -1447,7 +1447,7 @@ async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i
     let results = join_all(futs).await;
     let mut sorted: Vec<_> = results
         .into_iter()
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.ok().flatten())
         .collect();
     sorted.sort_by(|a, b| a.1.cmp(&b.1));
 

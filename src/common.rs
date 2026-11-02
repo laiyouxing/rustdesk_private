@@ -1447,10 +1447,16 @@ const LAN_PROBE_TIMEOUT_MS: u64 = 600;
 /// 每个地址的采样次数：取**中位数**，避免单次抖动把"谁更快"判反。
 const LAN_PROBE_SAMPLES: usize = 3;
 
+/// 内网候选的探测超时：比公网基准短得多。
+///
+/// 内网地址要么很快连上、要么根本不在本机网段（Docker/VMware/WSL 网桥），
+/// 200ms 足够区分；条目多时这一项直接决定建连多付多少延迟。
+const LAN_PROBE_LAN_TIMEOUT_MS: u64 = 200;
+
 /// 探测某个地址的 TCP 建连耗时（毫秒）；不可达返回 None。
-async fn tcp_rtt_once(addr: &str) -> Option<u128> {
+async fn tcp_rtt_once(addr: &str, timeout_ms: u64) -> Option<u128> {
     let begin = std::time::Instant::now();
-    match socket_client::connect_tcp(addr, LAN_PROBE_TIMEOUT_MS).await {
+    match socket_client::connect_tcp(addr, timeout_ms).await {
         Ok(_) => Some(begin.elapsed().as_millis()),
         Err(_) => None,
     }
@@ -1458,13 +1464,23 @@ async fn tcp_rtt_once(addr: &str) -> Option<u128> {
 
 /// 同一地址并发采样 [`LAN_PROBE_SAMPLES`] 次，取中位数；全部失败返回 None。
 async fn probe_rtt_median(addr: &str) -> Option<u128> {
-    let futs: Vec<_> = (0..LAN_PROBE_SAMPLES).map(|_| tcp_rtt_once(addr)).collect();
+    let futs: Vec<_> = (0..LAN_PROBE_SAMPLES)
+        .map(|_| tcp_rtt_once(addr, LAN_PROBE_TIMEOUT_MS))
+        .collect();
     let mut samples: Vec<u128> = join_all(futs).await.into_iter().flatten().collect();
     if samples.is_empty() {
         return None;
     }
     samples.sort_unstable();
     Some(samples[samples.len() / 2])
+}
+
+/// 内网候选探测：只采样 1 次、超时 [`LAN_PROBE_LAN_TIMEOUT_MS`]。
+///
+/// 内网要么快、要么不可达，不需要像公网基准那样 3 次取中位；单次能把整轮探测
+/// 从 3×600ms 压到 200ms。
+async fn probe_lan_rtt_once(addr: &str) -> Option<u128> {
+    tcp_rtt_once(addr, LAN_PROBE_LAN_TIMEOUT_MS).await
 }
 
 /// 「内网中继」相对公网中继至少要先快这么多毫秒才值得切换。
@@ -1474,10 +1490,68 @@ async fn probe_rtt_median(addr: &str) -> Option<u128> {
 /// 盲目切到内网会让延迟变差，所以这里按**实测 TCP 建连耗时**取优。
 const LAN_RELAY_MIN_ADVANTAGE_MS: u128 = 5;
 
+// 「内网中继选择」结果缓存：key = 规范化后的公网中继，value = (缓存时刻, 选中结果)。
+//
+// 为什么必须缓存：服务端下发的候选包含**整台机器的所有网卡地址**（Docker / VMware /
+// WSL 网桥），本机不在那些网段时每条都要等满探测超时（join_all 取最慢）；
+// 而同一会话/多次建连反复算同一结论毫无意义。命中缓存（**含"决定不切"的 None**）
+// 直接返回，不再发 HTTP、不再探测。
+lazy_static::lazy_static! {
+    static ref LAN_PICK_CACHE: Mutex<HashMap<String, (std::time::Instant, Option<String>)>> =
+        Mutex::new(HashMap::new());
+}
+
+/// 内网中继选择结果的缓存有效期（秒）。
+const LAN_PICK_CACHE_TTL_SECS: u64 = 300;
+
+/// 两个 IPv4 是否属于"同一内网网段"：同 /24，或同为私网且前两段相同（/16）。
+fn same_lan_subnet(cand: std::net::Ipv4Addr, local: std::net::Ipv4Addr) -> bool {
+    let (c, l) = (cand.octets(), local.octets());
+    if c[0..3] == l[0..3] {
+        return true;
+    }
+    // /16 的放宽只对私网生效，避免把公网地址误判成同网段。
+    let private = |o: [u8; 4]| {
+        o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+    };
+    private(c) && private(l) && c[0..2] == l[0..2]
+}
+
+/// 候选地址是否与本机某张网卡同网段（用于过滤服务端下发的多网卡候选）。
+fn candidate_in_local_subnet(addr: &str, local_ips: &[std::net::Ipv4Addr]) -> bool {
+    let ip_str = addr.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(addr);
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    local_ips.iter().any(|l| same_lan_subnet(ip, *l))
+}
+
+/// 本机全部 IPv4（候选预过滤用）。
+fn local_ipv4_addrs() -> Vec<std::net::Ipv4Addr> {
+    collect_report_lan_addrs()
+        .iter()
+        .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        .collect()
+}
+
+/// 写入内网中继选择结果缓存（`None` = "决定不切"也算结论），顺手淘汰过期条目。
+fn cache_lan_pick(cache_key: &str, result: Option<String>) {
+    if let Ok(mut g) = LAN_PICK_CACHE.lock() {
+        let ttl = LAN_PICK_CACHE_TTL_SECS;
+        g.retain(|_, (at, _)| at.elapsed().as_secs() < ttl * 4);
+        g.insert(cache_key.to_string(), (std::time::Instant::now(), result));
+    }
+}
+
 /// 选择是否改用内网中继地址，返回"确实更快"的那个内网地址。
 ///
-/// 配置项 `relay-server-lan` 支持逗号分隔多个地址，只有 IP 时自动补中继端口。
-/// **基准与所有候选并发探测**（每个地址采样 3 次取中位数），总耗时≈单次探测；
+/// 都发生在建连关键路径上，所以代价被逐项压缩：
+///   - **结果缓存 300 秒**：命中直接返回（含"决定不切"的 None），不发 HTTP、不探测；
+///   - **映射后台刷新**：过期/首次缺失时 `tokio::spawn` 刷新，本次不等待；
+///   - **候选预过滤**：服务端下发的多网卡地址里，只保留与本机某张网卡同 /24
+///     （或同为私网且前两段相同）的候选，其余（Docker/VMware/WSL 网桥）直接跳过；
+///   - **轻量探测**：内网候选单次采样、超时 200ms（公网基准仍 3 次取中位）。
+///
 /// 只有比当前公网中继**快出 [`LAN_RELAY_MIN_ADVANTAGE_MS`] 以上**才采用（多个候选
 /// 里取最快的那个），否则返回 None 保持原样——配置写错、内网不通、或内网反而
 /// 更慢都不会让连接变差或失败。
@@ -1487,59 +1561,94 @@ const LAN_RELAY_MIN_ADVANTAGE_MS: u128 = 5;
 /// 本函数只决定"本机连哪个"，调用方（client.rs::_start_inner / connect）负责把
 /// 公网地址放进 RequestRelay.relay_server。
 pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
-    // 控制端/被控端都走这里，顺手刷新中继内网映射（60 秒内复用缓存，限时 800ms）。
-    // 被控端原本没有拉过 `/node/relays`，不刷就会永远拿不到内网地址。
-    let _ = hbb_common::timeout(
-        800,
-        crate::hbbs_http::punch_exchange::ensure_relay_lan_map(60),
-    )
-    .await;
-    let raw = Config::get_option("relay-server-lan");
-    // 配置里可能只写 IP：补默认中继端口，避免"配了没效果"。
+    let base_raw = base_relay.trim();
+    // 缓存 key 用规范化后的公网中继；未给 base 时用空串（仍可缓存"不切"结论）。
+    let cache_key = if base_raw.is_empty() {
+        String::new()
+    } else {
+        crate::check_port(base_raw, RELAY_PORT)
+    };
+    // 1) 缓存命中：直接返回，不发 HTTP、不探测（含上次"决定不切"的 None）。
+    if let Ok(g) = LAN_PICK_CACHE.lock() {
+        if let Some((at, cached)) = g.get(&cache_key) {
+            if at.elapsed().as_secs() < LAN_PICK_CACHE_TTL_SECS {
+                log::debug!(
+                    "lan relay: cache hit for '{}' -> {:?}",
+                    cache_key,
+                    cached.as_deref().unwrap_or("(keep public)")
+                );
+                return cached.clone();
+            }
+        }
+    }
+
+    // 2) 映射过期/从未拉取：**后台**刷新，本次不等待（同步等最多 800ms 拖慢建连）。
+    crate::hbbs_http::punch_exchange::ensure_relay_lan_map_bg(60);
+
+    // 3) 显式配置的候选（运维强制指定，不参与网段预过滤）。
     let mut lans: Vec<String> = Vec::new();
-    for addr in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    for addr in Config::get_option("relay-server-lan")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         let addr = crate::check_port(addr, RELAY_PORT);
         if !lans.iter().any(|a| *a == addr) {
             lans.push(addr);
         }
     }
-    // 服务端下发的内网候选（中继节点自己上报的多网卡地址）。
-    //
-    // 只取**当前这台公网中继**对应的那条：不同 hbbr 是两套配对表，换到别台的
-    // 内网地址连，uuid 对不上，会话直接失败。
-    if !base_relay.trim().is_empty() {
-        let base_raw = base_relay.trim().to_string();
-        let base_norm = crate::check_port(&base_raw, RELAY_PORT);
-        let mut served = crate::hbbs_http::punch_exchange::relay_lan_candidates(&base_raw);
+
+    // 4) 服务端下发的候选：只取**当前这台公网中继**对应的那条（不同 hbbr 是两套配对表，
+    //    换到别台的内网地址连，uuid 对不上、会话直接失败），再按本机网段预过滤。
+    if !base_raw.is_empty() {
+        let base_norm = crate::check_port(base_raw, RELAY_PORT);
+        let mut served = crate::hbbs_http::punch_exchange::relay_lan_candidates(base_raw);
         if served.is_empty() {
             served = crate::hbbs_http::punch_exchange::relay_lan_candidates(&base_norm);
         }
+        let local_ips = local_ipv4_addrs();
         for a in served {
             let addr = crate::check_port(a.trim(), RELAY_PORT);
+            if !candidate_in_local_subnet(&addr, &local_ips) {
+                log::debug!(
+                    "lan relay: '{}' not in local subnets {:?}, skip",
+                    addr,
+                    local_ips
+                );
+                continue;
+            }
             if !lans.iter().any(|x| *x == addr) {
                 lans.push(addr);
             }
         }
     }
+
+    // 5) 没有候选：映射还没拉过时本次直接走公网（后台刷新完成后下一次建连生效）。
+    //    **不写缓存**：若缓存 None，刷新完成后 300 秒内都用不上内网中继。
     if lans.is_empty() {
+        if crate::hbbs_http::punch_exchange::relay_lan_map_is_empty() {
+            log::debug!("lan relay: map not ready yet, keep public for this connection");
+            return None;
+        }
+        // 映射已就绪但没有同网段候选：这是"决定不切"的结论，缓存 300 秒不必重算。
+        log::debug!("lan relay: no candidate in local subnets, keep public");
+        cache_lan_pick(&cache_key, None);
         return None;
     }
-    // 基准：服务端下发的公网中继。拿不到就退化为"内网可达且最快即可用"。
-    let base = if base_relay.trim().is_empty() {
+
+    // 6) 探测：候选 1 次/200ms，公网基准 3 次取中位，两者并发。
+    let base = if base_raw.is_empty() {
         None
     } else {
-        Some(crate::check_port(base_relay.trim(), RELAY_PORT))
+        Some(crate::check_port(base_raw, RELAY_PORT))
     };
-    let mut targets = lans.clone();
-    if let Some(b) = &base {
-        targets.push(b.clone());
-    }
-    let rtts = join_all(targets.iter().map(|a| probe_rtt_median(a))).await;
-    let (cand_rtts, base_rtt) = if base.is_some() {
-        let n = rtts.len();
-        (&rtts[..n - 1], rtts[n - 1])
-    } else {
-        (&rtts[..], None)
+    let base_task = base
+        .clone()
+        .map(|b| tokio::spawn(async move { probe_rtt_median(&b).await }));
+    let cand_rtts = join_all(lans.iter().map(|a| probe_lan_rtt_once(a))).await;
+    let base_rtt = match base_task {
+        Some(t) => t.await.ok().flatten(),
+        None => None,
     };
     let mut best: Option<(u128, &String)> = None;
     for (addr, rtt) in lans.iter().zip(cand_rtts.iter()) {
@@ -1566,7 +1675,7 @@ pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
             best = Some((rtt, addr));
         }
     }
-    match best {
+    let result = match best {
         Some((rtt, addr)) => {
             log::info!(
                 "lan relay: '{}' rtt={}ms vs public '{}' rtt={:?}ms, switching (local connect only)",
@@ -1578,7 +1687,10 @@ pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
             Some(addr.to_string())
         }
         None => None,
-    }
+    };
+    // 7) 缓存结论（含"决定不切"的 None）：300 秒内不再重复探测。
+    cache_lan_pick(&cache_key, result.clone());
+    result
 }
 
 /// 「强制更新 / 自动更新」的防抖标记：记录最近一次成功交给安装器的
