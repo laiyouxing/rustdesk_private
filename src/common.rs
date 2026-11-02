@@ -1487,6 +1487,13 @@ const LAN_RELAY_MIN_ADVANTAGE_MS: u128 = 5;
 /// 本函数只决定"本机连哪个"，调用方（client.rs::_start_inner / connect）负责把
 /// 公网地址放进 RequestRelay.relay_server。
 pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
+    // 控制端/被控端都走这里，顺手刷新中继内网映射（60 秒内复用缓存，限时 800ms）。
+    // 被控端原本没有拉过 `/node/relays`，不刷就会永远拿不到内网地址。
+    let _ = hbb_common::timeout(
+        800,
+        crate::hbbs_http::punch_exchange::ensure_relay_lan_map(60),
+    )
+    .await;
     let raw = Config::get_option("relay-server-lan");
     // 配置里可能只写 IP：补默认中继端口，避免"配了没效果"。
     let mut lans: Vec<String> = Vec::new();

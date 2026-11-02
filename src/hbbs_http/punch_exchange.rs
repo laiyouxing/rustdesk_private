@@ -26,6 +26,7 @@ const PUNCH_INBOX_PATH: &str = "/api/punch/addr/inbox";
 const DIRECT_OK_PATH: &str = "/api/punch/direct-ok";
 /// 集群调度：按区域偏好排序的中继列表
 const NODE_RELAYS_PATH: &str = "/api/node/relays";
+const NODE_RELAY_LAN_MAP_PATH: &str = "/api/node/relay-lan-map";
 
 // 地址来源与建议优先级（越大越先试）
 pub const KIND_LAST_SUCCESS: &str = "last_success";
@@ -492,12 +493,89 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
+/// 映射最近一次成功刷新的时间（用于决定是否需要重新拉取）。
+static RELAY_LAN_MAP_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
 /// 读取某台公网中继对应的候选内网地址（无则空）。
 pub fn relay_lan_candidates(base_relay: &str) -> Vec<String> {
     let Ok(g) = RELAY_LAN_MAP.lock() else {
         return Vec::new();
     };
     g.get(base_relay.trim()).cloned().unwrap_or_default()
+}
+
+fn relay_lan_map_age_secs() -> u64 {
+    match RELAY_LAN_MAP_AT.lock() {
+        Ok(g) => g.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX),
+        Err(_) => u64::MAX,
+    }
+}
+
+fn mark_relay_lan_map_fresh() {
+    if let Ok(mut g) = RELAY_LAN_MAP_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// 按需刷新中继内网映射（默认 60 秒内复用缓存）。
+///
+/// 为什么需要它：只有**控制端**会调 `get_region_relays()` 顺带填充缓存，
+/// 被控端（B）走的不是那条路径，于是 B 与中继同内网时无法自动使用内网地址。
+/// 这里让两端都能主动拉一次 `/api/node/relay-lan-map`，代价是每 60 秒一次小请求。
+///
+/// 失败静默（api-server 不可达时保持原有行为，不影响建连）。
+pub async fn ensure_relay_lan_map(max_age_secs: u64) {
+    if relay_lan_map_age_secs() < max_age_secs {
+        return;
+    }
+    let Some((api_server, token, key)) = ctx() else {
+        return;
+    };
+    let url = format!("{}{}", api_server, NODE_RELAY_LAN_MAP_PATH);
+    let Ok(client) = client_for(&url).await else {
+        return;
+    };
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-Rustdesk-Key", key)
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return;
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(map) = v.get("data").and_then(|d| d.get("map")) else {
+        return;
+    };
+    let Some(obj) = map.as_object() else {
+        return;
+    };
+    let mut new_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::with_capacity(obj.len());
+    for (k, v) in obj.iter() {
+        let list: Vec<String> = v
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !list.is_empty() {
+            new_map.insert(k.trim().to_string(), list);
+        }
+    }
+    if let Ok(mut g) = RELAY_LAN_MAP.lock() {
+        *g = new_map;
+    }
+    mark_relay_lan_map_fresh();
+    hbb_common::log::debug!("relay lan map refreshed");
 }
 pub async fn get_region_relays(
     peer_id: &str,
@@ -565,6 +643,7 @@ pub async fn get_region_relays(
                     if let Ok(mut g) = RELAY_LAN_MAP.lock() {
                         g.insert(addr.to_string(), list);
                     }
+                    mark_relay_lan_map_fresh();
                 }
             }
         }
