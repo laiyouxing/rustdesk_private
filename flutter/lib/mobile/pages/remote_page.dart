@@ -78,6 +78,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// 底部按键面板是否展开（纯手动控制，不靠键盘可见性猜）
   var _showKeysPanel = false;
 
+  /// 右侧竖排工具条是否显示
+  var _showRail = true;
+
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
 
@@ -347,19 +350,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   Widget _bottomWidget() => _showGestureHelp
       ? getGestureHelp()
-      : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
-          ? Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // 按键面板在底部栏**上方**，属于布局的一部分，
-                // 不再浮在远程画面上遮内容；软键盘弹出时自然排在键盘上面。
-                if (_showKeysPanel)
-                  KeysPanel(
-                    onCollapse: () => setState(() => _showKeysPanel = false),
-                    onOpenSoftKeyboard: openKeyboard,
-                  ),
-                getBottomAppBar(),
-              ],
+      // 参照 UU：控制入口挪到右侧竖排工具条，底部只保留按键面板。
+      : (_showKeysPanel
+          ? KeysPanel(
+              onCollapse: () => setState(() => _showKeysPanel = false),
+              onOpenSoftKeyboard: openKeyboard,
             )
           : Offstage());
 
@@ -587,6 +582,100 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 发送 Win+<key> 组合（显示桌面 / 切换窗口等）。
+  void _sendWinCombo(String vk) {
+    final m0 = gFFI.inputModel.command;
+    gFFI.inputModel.command = true;
+    gFFI.inputModel.inputKey(vk);
+    gFFI.inputModel.command = m0;
+  }
+
+  /// 右侧竖排工具条的一个入口（图标 + 中文小字），对齐 UU 远程的交互。
+  Widget _railItem(IconData icon, String label, VoidCallback onTap,
+      {bool active = false}) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon,
+                size: 22,
+                color: active ? const Color(0xFF4C8DFF) : Colors.white),
+            const SizedBox(height: 3),
+            Text(label, style: const TextStyle(color: Colors.white, fontSize: 11)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 右侧竖排工具条：操作 / 键盘 / 显示桌面 / 展示所有窗口 / 关闭
+  Widget buildRightRail() {
+    return Positioned(
+      right: 6,
+      top: 0,
+      bottom: 0,
+      width: 62,
+      child: Center(
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xCC1B1B1B),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _railItem(Icons.tune, '操作', () {
+                setState(() => _showEdit = false);
+                showActions(widget.id);
+              }),
+              _railItem(Icons.keyboard, '键盘',
+                  () => setState(() => _showKeysPanel = !_showKeysPanel),
+                  active: _showKeysPanel),
+              _railItem(Icons.desktop_windows, '显示桌面',
+                  () => _sendWinCombo('VK_D')),
+              _railItem(Icons.grid_view, '展示窗口',
+                  () => _sendWinCombo('VK_TAB')),
+              _railItem(Icons.tv, '显示设置', () {
+                setState(() => _showEdit = false);
+                showOptions(context, widget.id, gFFI.dialogManager);
+              }),
+              _railItem(Icons.close, '关闭', () => clientClose(sessionId, gFFI)),
+              _railItem(Icons.chevron_right, '隐藏',
+                  () => setState(() => _showRail = false)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 工具条隐藏后，右侧角落留一个小把手用来重新展开。
+  Widget buildRailHandle() {
+    return Positioned(
+      right: 0,
+      top: 0,
+      bottom: 0,
+      width: 20,
+      child: Center(
+        child: InkWell(
+          onTap: () => setState(() => _showRail = true),
+          child: Container(
+            width: 18,
+            height: 48,
+            decoration: const BoxDecoration(
+              color: Color(0xCC1B1B1B),
+              borderRadius: BorderRadius.horizontal(left: Radius.circular(8)),
+            ),
+            child: const Icon(Icons.chevron_left, color: Colors.white, size: 18),
+          ),
+        ),
+      ),
+    );
+  }
+
   bool get showCursorPaint =>
       !gFFI.ffiModel.isPeerAndroid &&
       !gFFI.canvasModel.cursorEmbedded &&
@@ -603,6 +692,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               right: 10,
               child: QualityMonitor(gFFI.qualityMonitorModel),
             ),
+            if (_showRail) buildRightRail() else buildRailHandle(),
             SizedBox(
               width: 0,
               height: 0,
@@ -958,7 +1048,12 @@ class _KeysPanelState extends State<KeysPanel> {
     final selected = _tab == tab;
     return Expanded(
       child: InkWell(
-        onTap: () => setState(() => _tab = tab),
+        onTap: () {
+          setState(() => _tab = tab);
+          // UU 的「输入法」标签本质就是调起 Android 系统键盘，
+          // 这里同样直接唤起，省掉再点一次按钮。
+          if (tab == _KeysTab.ime) widget.onOpenSoftKeyboard();
+        },
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
