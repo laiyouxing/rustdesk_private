@@ -356,6 +356,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 if (_showKeysPanel)
                   KeysPanel(
                     onCollapse: () => setState(() => _showKeysPanel = false),
+                    onOpenSoftKeyboard: openKeyboard,
                   ),
                 getBottomAppBar(),
               ],
@@ -848,57 +849,86 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   // }
 }
 
-/// 移动端按键面板（重做版）。
+/// 移动端按键面板（对齐 UU 远程的三标签方案）。
 ///
-/// 与旧的 `KeyHelpTools` 的区别（对应实际使用中的痛点）：
-///   1. **位置**：从「浮在远程画面顶部的半透明条」改为**底部面板**，贴拇指且不遮挡画面；
-///   2. **显隐**：完全由底部工具栏按钮控制，不再靠"键盘可见性 / 有修饰键 / 图钉"等
-///      启发式条件拼出来（原来会出现打字时冒出、不打字又消失的怪异行为）；
-///   3. **不再分页**：F1~F12、方向键、组合键全部放在各自一行里**横向滚动**，
-///      不用再在 `Fn` / `…` 两页之间来回切；
-///   4. **修饰键单次生效**：点 Ctrl/Alt/Shift/Win 后按任意键即自动清除；
-///      长按可锁定（标签显示"锁"），再点取消。
+/// 结构：
+///   ┌──────────────────────────────────────────────┐
+///   │   输入法     快捷键     电脑键盘           ✕  │  ← 标签栏
+///   ├──────────────────────────────────────────────┤
+///   │  （对应标签内容）                              │
+///   └──────────────────────────────────────────────┘
+///
+/// - **输入法**：用手机自带输入法输入（中文候选/语音都由系统提供），
+///   输入内容通过 input_string 直接发给被控端；不自己做 T9 词库。
+/// - **快捷键**：磁贴网格，键位在上、中文说明在下（与 UU 一致）。
+/// - **电脑键盘**：完整 QWERTY + 数字行 + 修饰键行；「组合键模式」勾选后
+///   修饰键保持按下（可连续组合），不勾选则只对下一个键生效。
 class KeysPanel extends StatefulWidget {
-  const KeysPanel({Key? key, required this.onCollapse}) : super(key: key);
+  const KeysPanel({
+    Key? key,
+    required this.onCollapse,
+    required this.onOpenSoftKeyboard,
+  }) : super(key: key);
 
-  /// 收起面板（底部工具栏里的按钮也会切换）
   final VoidCallback onCollapse;
+
+  /// 唤起系统输入法（输入法标签页用）
+  final VoidCallback onOpenSoftKeyboard;
 
   @override
   State<KeysPanel> createState() => _KeysPanelState();
 }
 
+enum _KeysTab { ime, shortcuts, keyboard }
+
 class _KeysPanelState extends State<KeysPanel> {
-  bool _lockCtrl = false;
-  bool _lockAlt = false;
-  bool _lockShift = false;
-  bool _lockWin = false;
+  _KeysTab _tab = _KeysTab.shortcuts;
+
+  /// 组合键模式：勾选后修饰键保持按下，可连续按组合
+  bool _comboMode = false;
+
+  bool _ctrl = false;
+  bool _alt = false;
+  bool _shift = false;
+  bool _win = false;
 
   InputModel get inputModel => gFFI.inputModel;
   FfiModel get ffiModel => gFFI.ffiModel;
   bool get _isMac => ffiModel.pi.platform == kPeerPlatformMacOS;
 
-  /// 清除未锁定的修饰键。
-  void _clearModifiers() {
-    if (_lockCtrl && _lockAlt && _lockShift && _lockWin) return;
-    inputModel.ctrl = _lockCtrl;
-    inputModel.alt = _lockAlt;
-    inputModel.shift = _lockShift;
-    inputModel.command = _lockWin;
-    if (mounted) setState(() {});
+  void _syncModifiers() {
+    inputModel.ctrl = _ctrl;
+    inputModel.alt = _alt;
+    inputModel.shift = _shift;
+    inputModel.command = _win;
   }
 
+  void _clearModifiersIfNotCombo() {
+    if (_comboMode) return;
+    if (_ctrl || _alt || _shift || _win) {
+      setState(() {
+        _ctrl = false;
+        _alt = false;
+        _shift = false;
+        _win = false;
+        _syncModifiers();
+      });
+    }
+  }
+
+  /// 发送单个按键（带上当前修饰键状态）。
   void _tapKey(String vk) {
+    _syncModifiers();
     inputModel.inputKey(vk);
-    _clearModifiers();
+    _clearModifiersIfNotCombo();
   }
 
-  /// 发送固定修饰的组合键，结束后恢复原来的修饰键状态。
+  /// 发送固定组合（不影响用户当前修饰键状态）。
   void _combo(String vk,
       {bool ctrl = false,
       bool alt = false,
       bool shift = false,
-      bool command = false}) {
+      bool win = false}) {
     final c0 = inputModel.ctrl;
     final a0 = inputModel.alt;
     final s0 = inputModel.shift;
@@ -906,7 +936,7 @@ class _KeysPanelState extends State<KeysPanel> {
     inputModel.ctrl = ctrl;
     inputModel.alt = alt;
     inputModel.shift = shift;
-    inputModel.command = command;
+    inputModel.command = win;
     inputModel.inputKey(vk);
     inputModel.ctrl = c0;
     inputModel.alt = a0;
@@ -915,28 +945,135 @@ class _KeysPanelState extends State<KeysPanel> {
     if (mounted) setState(() {});
   }
 
-  Widget _btn(String label, VoidCallback onTap,
-      {VoidCallback? onLongPress,
+  void _toggleModifier(void Function(bool v) set, bool value) {
+    setState(() {
+      set(value);
+      _syncModifiers();
+    });
+  }
+
+  // ---------------- UI 片段 ----------------
+
+  Widget _tabButton(String label, _KeysTab tab) {
+    final selected = _tab == tab;
+    return Expanded(
+      child: InkWell(
+        onTap: () => setState(() => _tab = tab),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(label,
+                style: TextStyle(
+                    fontSize: 15,
+                    color: selected ? const Color(0xFF4C8DFF) : Colors.white)),
+            const SizedBox(height: 6),
+            Container(
+              height: 3,
+              width: 64,
+              decoration: BoxDecoration(
+                color: selected ? const Color(0xFF4C8DFF) : Colors.transparent,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 快捷键磁贴：键位 + 中文说明
+  Widget _shortcutTile(String comboText, String desc, VoidCallback onTap) {
+    return Material(
+      color: const Color(0xFF3A3A3C),
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(comboText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 15,
+                      color: Colors.white,
+                      fontWeight: FontWeight.w500)),
+              const SizedBox(height: 2),
+              Text(desc,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12, color: Colors.white70)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildShortcuts() {
+    final winName = _isMac ? 'Cmd' : 'Win';
+    final items = <Widget>[
+      _shortcutTile('Caps Lock', '大小写锁定', () => _tapKey('VK_CAPITAL')),
+      _shortcutTile('Ctrl+C', '复制', () => _combo('VK_C', ctrl: true)),
+      _shortcutTile('Ctrl+V', '粘贴', () => _combo('VK_V', ctrl: true)),
+      _shortcutTile('Ctrl+X', '剪切', () => _combo('VK_X', ctrl: true)),
+      _shortcutTile('Ctrl+A', '全选', () => _combo('VK_A', ctrl: true)),
+      _shortcutTile('Ctrl+Z', '撤销', () => _combo('VK_Z', ctrl: true)),
+      _shortcutTile('Ctrl+S', '保存', () => _combo('VK_S', ctrl: true)),
+      _shortcutTile(winName, '开始菜单', () => _tapKey('Meta')),
+      _shortcutTile('$winName+D', '显示桌面', () => _combo('VK_D', win: true)),
+      _shortcutTile('$winName+Tab', '切换窗口', () => _combo('VK_TAB', win: true)),
+      _shortcutTile('$winName+L', '锁定屏幕', () => _combo('VK_L', win: true)),
+      _shortcutTile('Alt+Tab', '切换应用', () => _combo('VK_TAB', alt: true)),
+      _shortcutTile('Alt+F4', '关闭窗口', () => _combo('VK_F4', alt: true)),
+      _shortcutTile('Ctrl+Shift+Esc', '任务管理器',
+          () => _combo('VK_ESCAPE', ctrl: true, shift: true)),
+      _shortcutTile('Ctrl+Alt+Del', '安全选项',
+          () => bind.sessionCtrlAltDel(sessionId: gFFI.sessionId)),
+      _shortcutTile('PrtScr', '截屏', () => _tapKey('VK_SNAPSHOT')),
+      _shortcutTile('Esc', '退出/取消', () => _tapKey('VK_ESCAPE')),
+      _shortcutTile('Tab', '下一项', () => _tapKey('VK_TAB')),
+      _shortcutTile('Enter', '回车', () => _tapKey('VK_ENTER')),
+      _shortcutTile('F5', '刷新', () => _tapKey('VK_F5')),
+      _shortcutTile('Home', '行首', () => _tapKey('VK_HOME')),
+      _shortcutTile('End', '行尾', () => _tapKey('VK_END')),
+      _shortcutTile('PgUp', '上一页', () => _tapKey('VK_PRIOR')),
+      _shortcutTile('PgDn', '下一页', () => _tapKey('VK_NEXT')),
+    ];
+    return GridView.count(
+      padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+      crossAxisCount: MediaQuery.of(context).size.width > 600 ? 6 : 4,
+      mainAxisSpacing: 8,
+      crossAxisSpacing: 8,
+      childAspectRatio: 2.1,
+      children: items,
+    );
+  }
+
+  /// 电脑键盘的一个键（等宽自适应）
+  Widget _kbKey(String label,
+      {void Function()? onTap,
+      Widget? child,
+      int flex = 1,
       bool active = false,
-      IconData? icon,
-      double width = 46}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: SizedBox(
-        width: width,
-        height: 40,
+      double fontSize = 15}) {
+    return Expanded(
+      flex: flex,
+      child: Padding(
+        padding: const EdgeInsets.all(2.5),
         child: Material(
-          color: active ? MyTheme.accent : Colors.white12,
+          color: active ? const Color(0xFF4C8DFF) : const Color(0xFF3A3A3C),
           borderRadius: BorderRadius.circular(6),
           child: InkWell(
             borderRadius: BorderRadius.circular(6),
-            onTap: onTap,
-            onLongPress: onLongPress,
+            onTap: onTap ?? () => _tapKey(label),
             child: Center(
-              child: icon != null
-                  ? Icon(icon, size: 18, color: Colors.white)
-                  : Text(label,
-                      style: const TextStyle(color: Colors.white, fontSize: 13)),
+              child: child ??
+                  Text(label,
+                      style: TextStyle(color: Colors.white, fontSize: fontSize)),
             ),
           ),
         ),
@@ -944,120 +1081,152 @@ class _KeysPanelState extends State<KeysPanel> {
     );
   }
 
-  Widget _mod(String label, bool active, bool locked, VoidCallback onTap,
-      VoidCallback onLongPress) {
-    return _btn(
-      locked ? '$label 锁' : label,
-      onTap,
-      onLongPress: onLongPress,
-      active: active,
-      width: locked ? 62 : 46,
+  Widget _kbRow(List<Widget> keys) =>
+      Expanded(child: Row(children: keys));
+
+  Widget _buildKeyboard() {
+    final winName = _isMac ? 'Cmd' : 'Win';
+    const letters = [
+      ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+      ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'],
+      ['Z', 'X', 'C', 'V', 'B', 'N', 'M'],
+    ];
+    return Column(
+      children: [
+        // 组合键模式 + 修饰键
+        Padding(
+          padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 132,
+                child: Row(children: [
+                  Checkbox(
+                    value: _comboMode,
+                    onChanged: (v) => setState(() => _comboMode = v ?? false),
+                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  const Expanded(
+                      child: Text('组合键模式',
+                          style:
+                              TextStyle(color: Colors.white, fontSize: 13))),
+                ]),
+              ),
+              _kbKey('Ctrl',
+                  onTap: () => _toggleModifier((v) => _ctrl = v, !_ctrl),
+                  active: _ctrl),
+              _kbKey('Shift',
+                  onTap: () => _toggleModifier((v) => _shift = v, !_shift),
+                  active: _shift),
+              _kbKey('Alt',
+                  onTap: () => _toggleModifier((v) => _alt = v, !_alt),
+                  active: _alt),
+              _kbKey(winName,
+                  onTap: () => _toggleModifier((v) => _win = v, !_win),
+                  active: _win),
+            ],
+          ),
+        ),
+        // 数字行
+        _kbRow([
+          for (var d = 1; d <= 9; d++) _kbKey('$d', onTap: () => _tapKey('VK_$d')),
+          _kbKey('0', onTap: () => _tapKey('VK_0')),
+        ]),
+        // 字母行
+        for (final row in letters)
+          _kbRow([
+            for (final ch in row) _kbKey(ch, onTap: () => _tapKey('VK_$ch')),
+            if (row == letters.last) ...[
+              _kbKey('', flex: 2, child: const Icon(Icons.backspace_outlined,
+                  color: Colors.white, size: 18), onTap: () => _tapKey('VK_BACK')),
+            ],
+          ]),
+        // 空格 / 回车
+        _kbRow([
+          _kbKey('Space', flex: 6, onTap: () => _tapKey('VK_SPACE')),
+          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_left, color: Colors.white, size: 20), onTap: () => _tapKey('VK_LEFT')),
+          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_up, color: Colors.white, size: 20), onTap: () => _tapKey('VK_UP')),
+          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 20), onTap: () => _tapKey('VK_DOWN')),
+          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_right, color: Colors.white, size: 20), onTap: () => _tapKey('VK_RIGHT')),
+          _kbKey('Enter', flex: 2, onTap: () => _tapKey('VK_ENTER')),
+        ]),
+      ],
     );
   }
 
-  Widget _row(List<Widget> children) => SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        child: Row(mainAxisSize: MainAxisSize.min, children: children),
-      );
+  Widget _buildIme() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('使用手机自带输入法输入',
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500)),
+          const SizedBox(height: 8),
+          const Text(
+            '中文候选词、拼音、语音、手写都由系统输入法提供，'
+            '输入的内容会作为文本直接发送到被控端（相当于在被控端粘贴）。',
+            style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            height: 46,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF4C8DFF),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8)),
+              ),
+              icon: const Icon(Icons.keyboard, size: 20),
+              label: const Text('打开系统输入法', style: TextStyle(fontSize: 15)),
+              onPressed: widget.onOpenSoftKeyboard,
+            ),
+          ),
+          const Spacer(),
+          const Text(
+            '提示：需要连续输入英文或组合键时，用「电脑键盘」标签更直接。',
+            style: TextStyle(color: Colors.white38, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final winLabel = _isMac ? 'Cmd' : 'Win';
     return Container(
-      color: const Color(0xFF1B1B1B),
-      padding: const EdgeInsets.fromLTRB(4, 4, 4, 2),
+      height: 360,
+      color: const Color(0xFF242424),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
         children: [
-          // 修饰键 + 编辑/翻页键
-          _row([
-            _mod('Ctrl', inputModel.ctrl, _lockCtrl, () {
-              setState(() {
-                inputModel.ctrl = !inputModel.ctrl;
-                if (!inputModel.ctrl) _lockCtrl = false;
-              });
-            }, () {
-              setState(() {
-                _lockCtrl = !_lockCtrl;
-                inputModel.ctrl = _lockCtrl;
-              });
-            }),
-            _mod('Alt', inputModel.alt, _lockAlt, () {
-              setState(() {
-                inputModel.alt = !inputModel.alt;
-                if (!inputModel.alt) _lockAlt = false;
-              });
-            }, () {
-              setState(() {
-                _lockAlt = !_lockAlt;
-                inputModel.alt = _lockAlt;
-              });
-            }),
-            _mod('Shift', inputModel.shift, _lockShift, () {
-              setState(() {
-                inputModel.shift = !inputModel.shift;
-                if (!inputModel.shift) _lockShift = false;
-              });
-            }, () {
-              setState(() {
-                _lockShift = !_lockShift;
-                inputModel.shift = _lockShift;
-              });
-            }),
-            _mod(winLabel, inputModel.command, _lockWin, () {
-              setState(() {
-                inputModel.command = !inputModel.command;
-                if (!inputModel.command) _lockWin = false;
-              });
-            }, () {
-              setState(() {
-                _lockWin = !_lockWin;
-                inputModel.command = _lockWin;
-              });
-            }),
-            _btn('Esc', () => _tapKey('VK_ESCAPE')),
-            _btn('Tab', () => _tapKey('VK_TAB')),
-            _btn('', () => _tapKey('VK_BACK'), icon: Icons.backspace_outlined),
-            _btn('Enter', () => _tapKey('VK_ENTER'), width: 56),
-            _btn('Del', () => _tapKey('VK_DELETE')),
-            _btn('Home', () => _tapKey('VK_HOME')),
-            _btn('End', () => _tapKey('VK_END')),
-            _btn('PgUp', () => _tapKey('VK_PRIOR'), width: 52),
-            _btn('PgDn', () => _tapKey('VK_NEXT'), width: 52),
-            _btn('Ins', () => _tapKey('VK_INSERT')),
-            _btn('', () => widget.onCollapse(), icon: Icons.expand_more),
-          ]),
-          // 方向键 + F1~F12（同一行横向滚动，不再翻页）
-          _row([
-            _btn('', () => _tapKey('VK_LEFT'), icon: Icons.keyboard_arrow_left),
-            _btn('', () => _tapKey('VK_UP'), icon: Icons.keyboard_arrow_up),
-            _btn('', () => _tapKey('VK_DOWN'), icon: Icons.keyboard_arrow_down),
-            _btn('', () => _tapKey('VK_RIGHT'),
-                icon: Icons.keyboard_arrow_right),
-            for (var i = 1; i <= 12; ++i)
-              _btn('F$i', () => _tapKey('VK_F$i'), width: 42),
-          ]),
-          // 高频组合键
-          _row([
-            _btn('Ctrl+C', () => _combo('VK_C', ctrl: true), width: 60),
-            _btn('Ctrl+V', () => _combo('VK_V', ctrl: true), width: 60),
-            _btn('Ctrl+X', () => _combo('VK_X', ctrl: true), width: 60),
-            _btn('Ctrl+A', () => _combo('VK_A', ctrl: true), width: 60),
-            _btn('Ctrl+Z', () => _combo('VK_Z', ctrl: true), width: 60),
-            _btn('Ctrl+S', () => _combo('VK_S', ctrl: true), width: 60),
-            _btn('Alt+Tab', () => _combo('VK_TAB', alt: true), width: 64),
-            _btn('Alt+F4', () => _combo('VK_F4', alt: true), width: 62),
-            _btn('$winLabel+D', () => _combo('VK_D', command: true), width: 66),
-            _btn('$winLabel+L', () => _combo('VK_L', command: true), width: 62),
-            _btn('Ctrl+Shift+Esc',
-                () => _combo('VK_ESCAPE', ctrl: true, shift: true),
-                width: 104),
-            _btn('PrtScr', () => _tapKey('VK_SNAPSHOT'), width: 58),
-            _btn('Ctrl+Alt+Del',
-                () => bind.sessionCtrlAltDel(sessionId: gFFI.sessionId),
-                width: 96),
-          ]),
+          SizedBox(
+            height: 52,
+            child: Row(
+              children: [
+                _tabButton('输入法', _KeysTab.ime),
+                _tabButton('快捷键', _KeysTab.shortcuts),
+                _tabButton('电脑键盘', _KeysTab.keyboard),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white, size: 22),
+                  onPressed: widget.onCollapse,
+                ),
+              ],
+            ),
+          ),
+          Container(height: 1, color: Colors.white12),
+          Expanded(
+            child: _tab == _KeysTab.ime
+                ? _buildIme()
+                : (_tab == _KeysTab.shortcuts
+                    ? _buildShortcuts()
+                    : _buildKeyboard()),
+          ),
         ],
       ),
     );
