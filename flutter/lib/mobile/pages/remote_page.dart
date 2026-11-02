@@ -75,6 +75,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   final FocusNode _physicalFocusNode = FocusNode();
   var _showEdit = false; // use soft keyboard
 
+  /// 底部按键面板是否展开（纯手动控制，不靠键盘可见性猜）
+  var _showKeysPanel = false;
+
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
 
@@ -345,7 +348,18 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Widget _bottomWidget() => _showGestureHelp
       ? getGestureHelp()
       : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
-          ? getBottomAppBar()
+          ? Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 按键面板在底部栏**上方**，属于布局的一部分，
+                // 不再浮在远程画面上遮内容；软键盘弹出时自然排在键盘上面。
+                if (_showKeysPanel)
+                  KeysPanel(
+                    onCollapse: () => setState(() => _showKeysPanel = false),
+                  ),
+                getBottomAppBar(),
+              ],
+            )
           : Offstage());
 
   @override
@@ -492,6 +506,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
                                   onPressed: openKeyboard),
+                              // 按键面板开关
+                              IconButton(
+                                  color: _showKeysPanel ? MyTheme.accent : Colors.white,
+                                  icon: Icon(_showKeysPanel
+                                      ? Icons.keyboard_hide
+                                      : Icons.grid_view),
+                                  onPressed: () => setState(
+                                      () => _showKeysPanel = !_showKeysPanel)),
                               IconButton(
                                 color: Colors.white,
                                 icon: const Icon(Icons.build),
@@ -504,6 +526,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   color: Colors.white,
                                   icon: Icon(Icons.keyboard),
                                   onPressed: openKeyboard),
+                              // 按键面板开关
+                              IconButton(
+                                  color: _showKeysPanel ? MyTheme.accent : Colors.white,
+                                  icon: Icon(_showKeysPanel
+                                      ? Icons.keyboard_hide
+                                      : Icons.grid_view),
+                                  onPressed: () => setState(
+                                      () => _showKeysPanel = !_showKeysPanel)),
                               IconButton(
                                 color: Colors.white,
                                 icon: Icon(gFFI.ffiModel.touchMode
@@ -562,7 +592,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       !gFFI.inputModel.relativeMouseMode.value;
 
   Widget getBodyForMobile() {
-    final keyboardIsVisible = keyboardVisibilityController.isVisible;
     return Container(
         color: MyTheme.canvasColor,
         child: Stack(children: () {
@@ -573,10 +602,6 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               right: 10,
               child: QualityMonitor(gFFI.qualityMonitorModel),
             ),
-            KeyHelpTools(
-                keyboardIsVisible: keyboardIsVisible,
-                showGestureHelp: _showGestureHelp,
-                showBar: _showBar),
             SizedBox(
               width: 0,
               height: 0,
@@ -823,78 +848,52 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   // }
 }
 
-class KeyHelpTools extends StatefulWidget {
-  final bool keyboardIsVisible;
-  final bool showGestureHelp;
-  final bool showBar;
+/// 移动端按键面板（重做版）。
+///
+/// 与旧的 `KeyHelpTools` 的区别（对应实际使用中的痛点）：
+///   1. **位置**：从「浮在远程画面顶部的半透明条」改为**底部面板**，贴拇指且不遮挡画面；
+///   2. **显隐**：完全由底部工具栏按钮控制，不再靠"键盘可见性 / 有修饰键 / 图钉"等
+///      启发式条件拼出来（原来会出现打字时冒出、不打字又消失的怪异行为）；
+///   3. **不再分页**：F1~F12、方向键、组合键全部放在各自一行里**横向滚动**，
+///      不用再在 `Fn` / `…` 两页之间来回切；
+///   4. **修饰键单次生效**：点 Ctrl/Alt/Shift/Win 后按任意键即自动清除；
+///      长按可锁定（标签显示"锁"），再点取消。
+class KeysPanel extends StatefulWidget {
+  const KeysPanel({Key? key, required this.onCollapse}) : super(key: key);
 
-  /// need to show by external request, etc [keyboardIsVisible] or [changeTouchMode]
-  bool get requestShow => keyboardIsVisible || showGestureHelp;
-
-  KeyHelpTools(
-      {required this.keyboardIsVisible,
-      required this.showGestureHelp,
-      required this.showBar});
+  /// 收起面板（底部工具栏里的按钮也会切换）
+  final VoidCallback onCollapse;
 
   @override
-  State<KeyHelpTools> createState() => _KeyHelpToolsState();
+  State<KeysPanel> createState() => _KeysPanelState();
 }
 
-class _KeyHelpToolsState extends State<KeyHelpTools> {
-  var _more = true;
-  var _fn = false;
-  var _pin = false;
-  final _keyboardVisibilityController = KeyboardVisibilityController();
-  final _key = GlobalKey();
+class _KeysPanelState extends State<KeysPanel> {
+  bool _lockCtrl = false;
+  bool _lockAlt = false;
+  bool _lockShift = false;
+  bool _lockWin = false;
 
   InputModel get inputModel => gFFI.inputModel;
+  FfiModel get ffiModel => gFFI.ffiModel;
+  bool get _isMac => ffiModel.pi.platform == kPeerPlatformMacOS;
 
-  Widget wrap(String text, void Function() onPressed,
-      {bool? active, IconData? icon}) {
-    return TextButton(
-        style: TextButton.styleFrom(
-          minimumSize: Size(0, 0),
-          // 原来 10/9.75 的 padding + 11px 字，手指很难点准
-          padding: EdgeInsets.symmetric(vertical: 12, horizontal: 11),
-          //adds padding inside the button
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          //limits the touch area to the button area
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(5.0),
-          ),
-          backgroundColor: active == true ? MyTheme.accent80 : null,
-        ),
-        child: icon != null
-            ? Icon(icon, size: 14, color: Colors.white)
-            : Text(translate(text),
-                style: TextStyle(color: Colors.white, fontSize: 11)),
-        onPressed: onPressed);
+  /// 清除未锁定的修饰键。
+  void _clearModifiers() {
+    if (_lockCtrl && _lockAlt && _lockShift && _lockWin) return;
+    inputModel.ctrl = _lockCtrl;
+    inputModel.alt = _lockAlt;
+    inputModel.shift = _lockShift;
+    inputModel.command = _lockWin;
+    if (mounted) setState(() {});
   }
 
-  /// 发送普通按键后**立即清除修饰键**。
-  ///
-  /// 原实现里 Ctrl/Alt/Shift/Win 是纯开关，按一次就常亮，之后每次按键都带修饰，
-  /// 想打普通字符必须再点回去——这是最难用的点之一。
   void _tapKey(String vk) {
     inputModel.inputKey(vk);
     _clearModifiers();
   }
 
-  void _clearModifiers() {
-    if (inputModel.ctrl ||
-        inputModel.alt ||
-        inputModel.shift ||
-        inputModel.command) {
-      setState(() {
-        inputModel.ctrl = false;
-        inputModel.alt = false;
-        inputModel.shift = false;
-        inputModel.command = false;
-      });
-    }
-  }
-
-  /// 发送固定修饰的组合键，结束后恢复用户原来的修饰键状态。
+  /// 发送固定修饰的组合键，结束后恢复原来的修饰键状态。
   void _combo(String vk,
       {bool ctrl = false,
       bool alt = false,
@@ -913,195 +912,155 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
     inputModel.alt = a0;
     inputModel.shift = s0;
     inputModel.command = m0;
+    if (mounted) setState(() {});
   }
 
-  _updateRect() {
-    RenderObject? renderObject = _key.currentContext?.findRenderObject();
-    if (renderObject == null) {
-      return;
-    }
-    if (renderObject is RenderBox) {
-      final size = renderObject.size;
-      Offset pos = renderObject.localToGlobal(Offset.zero);
-      gFFI.cursorModel.keyHelpToolsVisibilityChanged(
-          Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height),
-          widget.keyboardIsVisible);
-    }
+  Widget _btn(String label, VoidCallback onTap,
+      {VoidCallback? onLongPress,
+      bool active = false,
+      IconData? icon,
+      double width = 46}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: SizedBox(
+        width: width,
+        height: 40,
+        child: Material(
+          color: active ? MyTheme.accent : Colors.white12,
+          borderRadius: BorderRadius.circular(6),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: onTap,
+            onLongPress: onLongPress,
+            child: Center(
+              child: icon != null
+                  ? Icon(icon, size: 18, color: Colors.white)
+                  : Text(label,
+                      style: const TextStyle(color: Colors.white, fontSize: 13)),
+            ),
+          ),
+        ),
+      ),
+    );
   }
+
+  Widget _mod(String label, bool active, bool locked, VoidCallback onTap,
+      VoidCallback onLongPress) {
+    return _btn(
+      locked ? '$label 锁' : label,
+      onTap,
+      onLongPress: onLongPress,
+      active: active,
+      width: locked ? 62 : 46,
+    );
+  }
+
+  Widget _row(List<Widget> children) => SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(mainAxisSize: MainAxisSize.min, children: children),
+      );
 
   @override
   Widget build(BuildContext context) {
-    final hasModifierOn = inputModel.ctrl ||
-        inputModel.alt ||
-        inputModel.shift ||
-        inputModel.command;
-
-    if (!widget.showBar && !_pin && !hasModifierOn && !widget.requestShow) {
-      gFFI.cursorModel
-          .keyHelpToolsVisibilityChanged(null, widget.keyboardIsVisible);
-      return Offstage();
-    }
-    final size = MediaQuery.of(context).size;
-
-    final pi = gFFI.ffiModel.pi;
-    final isMac = pi.platform == kPeerPlatformMacOS;
-    final isWin = pi.platform == kPeerPlatformWindows;
-    final isLinux = pi.platform == kPeerPlatformLinux;
-    final modifiers = <Widget>[
-      wrap('Ctrl ', () {
-        setState(() => inputModel.ctrl = !inputModel.ctrl);
-      }, active: inputModel.ctrl),
-      wrap(' Alt ', () {
-        setState(() => inputModel.alt = !inputModel.alt);
-      }, active: inputModel.alt),
-      wrap('Shift', () {
-        setState(() => inputModel.shift = !inputModel.shift);
-      }, active: inputModel.shift),
-      wrap(isMac ? ' Cmd ' : ' Win ', () {
-        setState(() => inputModel.command = !inputModel.command);
-      }, active: inputModel.command),
-    ];
-    final keys = <Widget>[
-      wrap(
-          ' Fn ',
-          () => setState(
-                () {
-                  _fn = !_fn;
-                  if (_fn) {
-                    _more = false;
-                  }
-                },
-              ),
-          active: _fn),
-      wrap(
-          '',
-          () => setState(
-                () => _pin = !_pin,
-              ),
-          active: _pin,
-          icon: Icons.push_pin),
-      wrap(
-          ' ... ',
-          () => setState(
-                () {
-                  _more = !_more;
-                  if (_more) {
-                    _fn = false;
-                  }
-                },
-              ),
-          active: _more),
-    ];
-    final fn = <Widget>[
-      SizedBox(width: 9999),
-    ];
-    for (var i = 1; i <= 12; ++i) {
-      final name = 'F$i';
-      fn.add(wrap(name, () {
-        _tapKey('VK_$name');
-      }));
-    }
-    final more = <Widget>[
-      SizedBox(width: 9999),
-      wrap('Esc', () {
-        _tapKey('VK_ESCAPE');
-      }),
-      wrap('Tab', () {
-        _tapKey('VK_TAB');
-      }),
-      wrap('Home', () {
-        _tapKey('VK_HOME');
-      }),
-      wrap('End', () {
-        _tapKey('VK_END');
-      }),
-      wrap('Ins', () {
-        _tapKey('VK_INSERT');
-      }),
-      wrap('Del', () {
-        _tapKey('VK_DELETE');
-      }),
-      wrap('PgUp', () {
-        _tapKey('VK_PRIOR');
-      }),
-      wrap('PgDn', () {
-        _tapKey('VK_NEXT');
-      }),
-      // to-do: support PrtScr on Mac
-      if (isWin || isLinux)
-        wrap('PrtScr', () {
-          _tapKey('VK_SNAPSHOT');
-        }),
-      if (isWin || isLinux)
-        wrap('ScrollLock', () {
-          _tapKey('VK_SCROLL');
-        }),
-      if (isWin || isLinux)
-        wrap('Pause', () {
-          _tapKey('VK_PAUSE');
-        }),
-      if (isWin || isLinux)
-        // Maybe it's better to call it "Menu"
-        // https://en.wikipedia.org/wiki/Menu_key
-        wrap('Menu', () {
-          inputModel.inputKey('Apps');
-        }),
-      wrap('Enter', () {
-        _tapKey('VK_ENTER');
-      }),
-      SizedBox(width: 9999),
-      wrap('', () {
-        _tapKey('VK_LEFT');
-      }, icon: Icons.keyboard_arrow_left),
-      wrap('', () {
-        _tapKey('VK_UP');
-      }, icon: Icons.keyboard_arrow_up),
-      wrap('', () {
-        _tapKey('VK_DOWN');
-      }, icon: Icons.keyboard_arrow_down),
-      wrap('', () {
-        _tapKey('VK_RIGHT');
-      }, icon: Icons.keyboard_arrow_right),
-      wrap(isMac ? 'Cmd+C' : 'Ctrl+C', () {
-        sendPrompt(isMac, 'VK_C');
-      }),
-      wrap(isMac ? 'Cmd+V' : 'Ctrl+V', () {
-        sendPrompt(isMac, 'VK_V');
-      }),
-      wrap(isMac ? 'Cmd+S' : 'Ctrl+S', () {
-        sendPrompt(isMac, 'VK_S');
-      }),
-      // ===== 高频组合键 =====
-      wrap(' Ctrl+X ', () => _combo('VK_X', ctrl: true)),
-      wrap(' Ctrl+A ', () => _combo('VK_A', ctrl: true)),
-      wrap(' Ctrl+Z ', () => _combo('VK_Z', ctrl: true)),
-      wrap(' Alt+Tab ', () => _combo('VK_TAB', alt: true)),
-      wrap(' Alt+F4 ', () => _combo('VK_F4', alt: true)),
-      if (isWin || isLinux) wrap(' Win+D ', () => _combo('VK_D', command: true)),
-      if (isWin || isLinux) wrap(' Win+L ', () => _combo('VK_L', command: true)),
-      if (isWin || isLinux)
-        wrap(' Ctrl+Shift+Esc ',
-            () => _combo('VK_ESCAPE', ctrl: true, shift: true)),
-    ];
-    final space = size.width > 320 ? 4.0 : 2.0;
-    // 500 ms is long enough for this widget to be built!
-    Future.delayed(Duration(milliseconds: 500), () {
-      _updateRect();
-    });
+    final winLabel = _isMac ? 'Cmd' : 'Win';
     return Container(
-        key: _key,
-        color: Color(0xAA000000),
-        padding: EdgeInsets.only(
-            top: _keyboardVisibilityController.isVisible ? 24 : 4, bottom: 8),
-        child: Wrap(
-          spacing: space,
-          runSpacing: space,
-          children: <Widget>[SizedBox(width: 9999)] +
-              modifiers +
-              keys +
-              (_fn ? fn : []) +
-              (_more ? more : []),
-        ));
+      color: const Color(0xFF1B1B1B),
+      padding: const EdgeInsets.fromLTRB(4, 4, 4, 2),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // 修饰键 + 编辑/翻页键
+          _row([
+            _mod('Ctrl', inputModel.ctrl, _lockCtrl, () {
+              setState(() {
+                inputModel.ctrl = !inputModel.ctrl;
+                if (!inputModel.ctrl) _lockCtrl = false;
+              });
+            }, () {
+              setState(() {
+                _lockCtrl = !_lockCtrl;
+                inputModel.ctrl = _lockCtrl;
+              });
+            }),
+            _mod('Alt', inputModel.alt, _lockAlt, () {
+              setState(() {
+                inputModel.alt = !inputModel.alt;
+                if (!inputModel.alt) _lockAlt = false;
+              });
+            }, () {
+              setState(() {
+                _lockAlt = !_lockAlt;
+                inputModel.alt = _lockAlt;
+              });
+            }),
+            _mod('Shift', inputModel.shift, _lockShift, () {
+              setState(() {
+                inputModel.shift = !inputModel.shift;
+                if (!inputModel.shift) _lockShift = false;
+              });
+            }, () {
+              setState(() {
+                _lockShift = !_lockShift;
+                inputModel.shift = _lockShift;
+              });
+            }),
+            _mod(winLabel, inputModel.command, _lockWin, () {
+              setState(() {
+                inputModel.command = !inputModel.command;
+                if (!inputModel.command) _lockWin = false;
+              });
+            }, () {
+              setState(() {
+                _lockWin = !_lockWin;
+                inputModel.command = _lockWin;
+              });
+            }),
+            _btn('Esc', () => _tapKey('VK_ESCAPE')),
+            _btn('Tab', () => _tapKey('VK_TAB')),
+            _btn('', () => _tapKey('VK_BACK'), icon: Icons.backspace_outlined),
+            _btn('Enter', () => _tapKey('VK_ENTER'), width: 56),
+            _btn('Del', () => _tapKey('VK_DELETE')),
+            _btn('Home', () => _tapKey('VK_HOME')),
+            _btn('End', () => _tapKey('VK_END')),
+            _btn('PgUp', () => _tapKey('VK_PRIOR'), width: 52),
+            _btn('PgDn', () => _tapKey('VK_NEXT'), width: 52),
+            _btn('Ins', () => _tapKey('VK_INSERT')),
+            _btn('', () => widget.onCollapse(), icon: Icons.expand_more),
+          ]),
+          // 方向键 + F1~F12（同一行横向滚动，不再翻页）
+          _row([
+            _btn('', () => _tapKey('VK_LEFT'), icon: Icons.keyboard_arrow_left),
+            _btn('', () => _tapKey('VK_UP'), icon: Icons.keyboard_arrow_up),
+            _btn('', () => _tapKey('VK_DOWN'), icon: Icons.keyboard_arrow_down),
+            _btn('', () => _tapKey('VK_RIGHT'),
+                icon: Icons.keyboard_arrow_right),
+            for (var i = 1; i <= 12; ++i)
+              _btn('F$i', () => _tapKey('VK_F$i'), width: 42),
+          ]),
+          // 高频组合键
+          _row([
+            _btn('Ctrl+C', () => _combo('VK_C', ctrl: true), width: 60),
+            _btn('Ctrl+V', () => _combo('VK_V', ctrl: true), width: 60),
+            _btn('Ctrl+X', () => _combo('VK_X', ctrl: true), width: 60),
+            _btn('Ctrl+A', () => _combo('VK_A', ctrl: true), width: 60),
+            _btn('Ctrl+Z', () => _combo('VK_Z', ctrl: true), width: 60),
+            _btn('Ctrl+S', () => _combo('VK_S', ctrl: true), width: 60),
+            _btn('Alt+Tab', () => _combo('VK_TAB', alt: true), width: 64),
+            _btn('Alt+F4', () => _combo('VK_F4', alt: true), width: 62),
+            _btn('$winLabel+D', () => _combo('VK_D', command: true), width: 66),
+            _btn('$winLabel+L', () => _combo('VK_L', command: true), width: 62),
+            _btn('Ctrl+Shift+Esc',
+                () => _combo('VK_ESCAPE', ctrl: true, shift: true),
+                width: 104),
+            _btn('PrtScr', () => _tapKey('VK_SNAPSHOT'), width: 58),
+            _btn('Ctrl+Alt+Del',
+                () => bind.sessionCtrlAltDel(sessionId: gFFI.sessionId),
+                width: 96),
+          ]),
+        ],
+      ),
+    );
   }
 }
 
