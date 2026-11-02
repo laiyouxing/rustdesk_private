@@ -58,6 +58,19 @@ pub async fn listen(
     let addr = listener.local_addr()?;
     log::info!("listening on port {:?}", addr);
     let is_rdp = port == 0;
+    // 用户可见反馈：原实现只有一行 log，界面上完全看不出隧道有没有起来。
+    // RDP（port==0）会自己拉起 mstsc，不需要额外弹窗。
+    if !is_rdp {
+        interface.msgbox(
+            "success",
+            "Port Forward",
+            &format!(
+                "本地 {} 已开始监听\n{} -> {}:{}",
+                addr, id, remote_host, remote_port
+            ),
+            "",
+        );
+    }
     if is_rdp {
         run_rdp(addr.port());
     }
@@ -73,12 +86,38 @@ pub async fn listen(
                 match connect_and_login(&id, &password, &mut ui_receiver, interface.clone(), &mut forward, key, token, is_rdp).await {
                     Ok(Some(stream)) => {
                         let interface = interface.clone();
+                        let target = format!("{}:{}", remote_host, remote_port);
                         tokio::spawn(async move {
-                            if let Err(err) = run_forward(forward, stream).await {
-                                interface.msgbox("error", "Error", &err.to_string(), "");
+                            let began = std::time::Instant::now();
+                            match run_forward(forward, stream).await {
+                                Ok(nbytes) => {
+                                    let elapsed = began.elapsed();
+                                    log::info!(
+                                        "connection from {:?} closed ({} bytes, {:?})",
+                                        addr,
+                                        nbytes,
+                                        elapsed
+                                    );
+                                    // 秒断且零字节：几乎一定是目标端口没开/被拒绝。
+                                    // 原实现这里只写 log，界面上毫无反馈，用户以为隧道没生效。
+                                    if nbytes == 0 && elapsed.as_secs() < 2 {
+                                        interface.msgbox(
+                                            "error",
+                                            "Port Forward",
+                                            &format!(
+                                                "{} 立即断开了连接（0 字节）。\n目标端口可能没有服务在监听，或被防火墙/对端拒绝。",
+                                                target
+                                            ),
+                                            "",
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    interface.msgbox("error", "Error", &err.to_string(), "");
+                                    log::info!("connection from {:?} closed with error", addr);
+                                }
                             }
-                            log::info!("connection from {:?} closed", addr);
-                       });
+                        });
                     }
                     Err(err) => {
                         interface.on_establish_connection_error(err.to_string());
@@ -194,14 +233,19 @@ async fn connect_and_login(
     Ok(Some(stream))
 }
 
-async fn run_forward(forward: Framed<TcpStream, BytesCodec>, stream: Stream) -> ResultType<()> {
+async fn run_forward(
+    forward: Framed<TcpStream, BytesCodec>,
+    stream: Stream,
+) -> ResultType<u64> {
     log::info!("new port forwarding connection started");
     let mut forward = forward;
     let mut stream = stream;
+    let mut nbytes: u64 = 0;
     loop {
         tokio::select! {
             res = forward.next() => {
                 if let Some(Ok(bytes)) = res {
+                    nbytes += bytes.len() as u64;
                     allow_err!(stream.send_bytes(bytes.into()).await);
                 } else {
                     break;
@@ -209,6 +253,7 @@ async fn run_forward(forward: Framed<TcpStream, BytesCodec>, stream: Stream) -> 
             },
             res = stream.next() => {
                 if let Some(Ok(bytes)) = res {
+                    nbytes += bytes.len() as u64;
                     allow_err!(forward.send(bytes).await);
                 } else {
                     break;
@@ -216,5 +261,5 @@ async fn run_forward(forward: Framed<TcpStream, BytesCodec>, stream: Stream) -> 
             },
         }
     }
-    Ok(())
+    Ok(nbytes)
 }
