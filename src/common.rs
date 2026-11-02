@@ -1488,15 +1488,30 @@ const LAN_RELAY_MIN_ADVANTAGE_MS: u128 = 5;
 /// 公网地址放进 RequestRelay.relay_server。
 pub async fn pick_lan_relay(base_relay: &str) -> Option<String> {
     let raw = Config::get_option("relay-server-lan");
-    if raw.trim().is_empty() {
-        return None;
-    }
     // 配置里可能只写 IP：补默认中继端口，避免"配了没效果"。
     let mut lans: Vec<String> = Vec::new();
     for addr in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let addr = crate::check_port(addr, RELAY_PORT);
         if !lans.iter().any(|a| *a == addr) {
             lans.push(addr);
+        }
+    }
+    // 服务端下发的内网候选（中继节点自己上报的多网卡地址）。
+    //
+    // 只取**当前这台公网中继**对应的那条：不同 hbbr 是两套配对表，换到别台的
+    // 内网地址连，uuid 对不上，会话直接失败。
+    if !base_relay.trim().is_empty() {
+        let base_raw = base_relay.trim().to_string();
+        let base_norm = crate::check_port(&base_raw, RELAY_PORT);
+        let mut served = crate::hbbs_http::punch_exchange::relay_lan_candidates(&base_raw);
+        if served.is_empty() {
+            served = crate::hbbs_http::punch_exchange::relay_lan_candidates(&base_norm);
+        }
+        for a in served {
+            let addr = crate::check_port(a.trim(), RELAY_PORT);
+            if !lans.iter().any(|x| *x == addr) {
+                lans.push(addr);
+            }
         }
     }
     if lans.is_empty() {

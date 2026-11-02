@@ -1,4 +1,4 @@
-﻿use std::{
+use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -423,11 +423,13 @@ impl RendezvousMediator {
                             sorted_rtts.first().copied().unwrap_or(0),
                             provided_relay_server,
                         );
-                        // Take top 3 for A to also evaluate
+                        // 回传候选给 A 评估。**不能只给 top-3**：B 连不上的地址可能正是
+                        // A 所在内网的中继地址（B 在公网、A 与中继同内网），裁掉后
+                        // A 就永远选不到内网中继。上限 8 条控制 A 侧探测耗时。
                         let top_n: Vec<String> =
-                            sorted_hosts.into_iter().take(3).collect();
+                            sorted_hosts.into_iter().take(8).collect();
                         let top_rtts: Vec<i32> =
-                            sorted_rtts.into_iter().take(3).collect();
+                            sorted_rtts.into_iter().take(8).collect();
                         (best, top_n, top_rtts)
                     } else if relay_servers.len() == 1 {
                         (relay_servers[0].clone(), vec![], vec![])
@@ -1430,11 +1432,13 @@ async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i
                 Ok(_) => {
                     let rtt_ms = begin.elapsed().as_millis() as i32;
                     log::debug!("Relay {} latency: {}ms", host, rtt_ms);
-                    Some((host, rtt_ms))
+                    (host, rtt_ms)
                 }
                 Err(e) => {
-                    log::debug!("Relay {} unreachable: {}", host, e);
-                    None
+                    // 保留不可达项：它可能是"与本机不同网段、但控制端同网段"的内网地址，
+                    // 直接丢掉会让同内网的控制端永远用不到内网中继。
+                    log::debug!("Relay {} unreachable from B: {}", host, e);
+                    (host, i32::MAX)
                 }
             }
         }));
@@ -1443,7 +1447,7 @@ async fn sort_relays_by_latency(relay_servers: &[String]) -> (Vec<String>, Vec<i
     let results = join_all(futs).await;
     let mut sorted: Vec<_> = results
         .into_iter()
-        .filter_map(|r| r.ok().flatten())
+        .filter_map(|r| r.ok())
         .collect();
     sorted.sort_by(|a, b| a.1.cmp(&b.1));
 

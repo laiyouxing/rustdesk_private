@@ -1,4 +1,4 @@
-﻿//! 通过 api-server 交换打洞地址（UDP 打洞前置）。
+//! 通过 api-server 交换打洞地址（UDP 打洞前置）。
 //!
 //! 背景：原来双方通过已建立的中继连接交换公网地址（PunchPeerAddr），
 //! 导致必须"先建中继 → 再打洞 → 再换流"，产生双连接与换流竞态。
@@ -480,6 +480,25 @@ pub fn sort_addrs(mut addrs: Vec<PunchAddr>) -> Vec<PunchAddr> {
 ///
 /// 该函数是**可选增强**：api-server 不可达或未部署该接口时返回空，
 /// 调用方保持原有行为，不影响连接建立。
+/// 中继的「公网地址 → 候选内网地址」映射缓存。
+///
+/// 数据来自 api-server `/node/relays` 响应里每个节点的 `lan_addrs`（节点自动上报的
+/// 多网卡地址）。客户端选中某台公网中继后，用这里的候选做内网直连：
+/// 本机改连内网地址、通告对端的仍是公网地址（同一台 hbbr 按 uuid 配对）。
+///
+/// 复用 `/node/relays` 的响应填充，**不额外发请求**。
+lazy_static::lazy_static! {
+    pub static ref RELAY_LAN_MAP: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+}
+
+/// 读取某台公网中继对应的候选内网地址（无则空）。
+pub fn relay_lan_candidates(base_relay: &str) -> Vec<String> {
+    let Ok(g) = RELAY_LAN_MAP.lock() else {
+        return Vec::new();
+    };
+    g.get(base_relay.trim()).cloned().unwrap_or_default()
+}
 pub async fn get_region_relays(
     peer_id: &str,
     my_region: &str,
@@ -533,6 +552,20 @@ pub async fn get_region_relays(
             addrs.push(addr.to_string());
             if !region.is_empty() {
                 map.insert(addr.to_string(), region.to_string());
+            }
+            // 顺带记住这台中继的内网候选地址（供 pick_lan_relay 做内网直连）
+            if let Some(lans) = it.get("lan_addrs").and_then(|x| x.as_array()) {
+                let list: Vec<String> = lans
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !list.is_empty() {
+                    if let Ok(mut g) = RELAY_LAN_MAP.lock() {
+                        g.insert(addr.to_string(), list);
+                    }
+                }
             }
         }
     }
