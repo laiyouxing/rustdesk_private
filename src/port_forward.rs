@@ -332,8 +332,8 @@ async fn connect_and_login(
         log::info!("port forward: 对端 {peer_version} 不支持加密，退回裸流");
         stream.set_raw();
     }
-    // 让隧道窗口能显示「直连 / 中继」和是否加密。
-    interface.report_connection_type(encrypted, direct);
+    // 状态条（直连/中继、是否加密）由 status_set_connected 经
+    // main_get_common("port-forward-status") 下发，不需要再单独推事件。
     if !buffer.is_empty() {
         if encrypted {
             allow_err!(stream.send_raw(buffer).await);
