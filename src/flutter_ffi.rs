@@ -1,4 +1,4 @@
-﻿#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::keyboard::input_source::{change_input_source, get_cur_session_input_source};
 #[cfg(target_os = "linux")]
 use crate::platform::linux::is_x11;
@@ -2853,6 +2853,12 @@ pub fn main_get_common(key: String) -> String {
         return ui_interface::is_permanent_password_set().to_string();
     } else if key == "local-permanent-password-set" {
         return ui_interface::is_local_permanent_password_set().to_string();
+    } else if key == "port-forward-status" {
+        // 端口转发窗口用它显示当前链路（直连/中继）和流量。
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        return crate::port_forward::status_json();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        return String::new();
     } else {
         if key.starts_with("download-data-") {
             let id = key.replace("download-data-", "");

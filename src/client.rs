@@ -4070,6 +4070,11 @@ pub trait Interface: Send + Clone + 'static + Sized {
     /// `impl<T: InvokeUiSession> Interface for Session<T>`。
     fn report_punch_status(&self, _status: &str, _info: &str) {}
 
+    /// 上报链路类型给 UI（端口转发窗口用来显示「直连 / 中继」）。
+    /// 与 `set_connection_type` 起名区分，原因同 `report_punch_status`：
+    /// `Session<T>` 同时实现 `Interface` 和 `InvokeUiSession`，同名会产生 E0034 歧义。
+    fn report_connection_type(&self, _secure: bool, _direct: bool) {}
+
     fn get_lch(&self) -> Arc<RwLock<LoginConfigHandler>>;
 
     fn get_id(&self) -> String {

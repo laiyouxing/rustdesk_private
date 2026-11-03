@@ -31,7 +31,7 @@ use hbb_common::{
     config::decode_permanent_password_h1_from_storage,
     config::{self, keys, Config, TrustedDevice},
     fs::{self, can_enable_overwrite_detection, JobType},
-    futures::{SinkExt, StreamExt},
+    futures::{FutureExt, SinkExt, StreamExt},
     get_time, get_version_number,
     message_proto::{option_message::BoolOption, permission_info::Permission},
     password_security::{self as password, ApproveMode},
@@ -408,6 +408,9 @@ const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
+/// 端口转发攒批上限：单次合并最多这么大的数据，避免大流量占内存。
+/// (port_forward 模块在 android/ios 上不编译，所以这里单独定义一份。)
+const FORWARD_BATCH_MAX: usize = 64 * 1024;
 // 最近会话免认证窗口：10 分钟内同一发起端+ID 重连自动放行（手动断开除外）
 const SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -1473,7 +1476,20 @@ impl Connection {
                     res = forward.next() => {
                         if let Some(res) = res {
                             last_recv_time = Instant::now();
-                            self.stream.send_bytes(res?.into()).await?;
+                            let mut batch = res?;
+                            // 攒批：把已就绪的后续分片合并后再转发，减少小包。
+                            // 注意 port_forward 模块在 android/ios 上不编译，
+                            // 所以这里用本地常量，不能引用 crate::port_forward。
+                            loop {
+                                if batch.len() >= FORWARD_BATCH_MAX {
+                                    break;
+                                }
+                                match forward.next().now_or_never() {
+                                    Some(Some(Ok(more))) => batch.extend_from_slice(&more),
+                                    _ => break,
+                                }
+                            }
+                            self.stream.send_bytes(batch.freeze()).await?;
                         } else {
                             bail!("Forward reset by the peer");
                         }
@@ -1481,7 +1497,17 @@ impl Connection {
                     res = self.stream.next() => {
                         if let Some(res) = res {
                             last_recv_time = Instant::now();
-                            timeout(SEND_TIMEOUT_OTHER, forward.send(res?)).await??;
+                            let mut batch = res?;
+                            loop {
+                                if batch.len() >= FORWARD_BATCH_MAX {
+                                    break;
+                                }
+                                match self.stream.next().now_or_never() {
+                                    Some(Some(Ok(more))) => batch.extend_from_slice(&more),
+                                    _ => break,
+                                }
+                            }
+                            timeout(SEND_TIMEOUT_OTHER, forward.send(batch.freeze())).await??;
                         } else {
                             bail!("Stream reset by the peer");
                         }

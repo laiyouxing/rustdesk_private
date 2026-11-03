@@ -1761,6 +1761,10 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         self.ui_handler.set_punch_status(status, info);
     }
 
+    fn report_connection_type(&self, secure: bool, direct: bool) {
+        self.ui_handler.set_connection_type(secure, direct, "", "");
+    }
+
     fn send(&self, data: Data) {
         if let Some(sender) = self.sender.read().unwrap().as_ref() {
             sender.send(data).ok();
