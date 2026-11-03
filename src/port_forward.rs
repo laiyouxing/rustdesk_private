@@ -177,7 +177,7 @@ pub async fn listen(
                         status_set_connected(direct, secure, listen_port, &remote_host, remote_port);
                         tokio::spawn(async move {
                             let began = std::time::Instant::now();
-                            match run_forward(forward, stream).await {
+                            match run_forward(forward, stream, secure).await {
                                 Ok(nbytes) => {
                                     status_set_closed(nbytes);
                                     let elapsed = began.elapsed();
@@ -253,15 +253,13 @@ async fn connect_and_login(
     let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server, ..)) =
         Client::start(id, key, token, conn_type, interface.clone()).await?;
     interface.update_direct(Some(direct));
-    // 界面需要展示链路类型（直连 / 中继）和是否加密。
-    // 注意 set_raw() 会清掉应用层加密密钥，所以要在切裸流之前取。
-    let secure = stream.is_secured();
-    // 复用已有的 connection_ready 事件通道，让窗口能显示「直连/中继」。
-    interface.report_connection_type(secure, direct);
     let mut buffer = Vec::new();
     let mut received = false;
 
     let _keep_it = hc_connection(feedback, rendezvous_server, token).await;
+
+    // 被控端版本，登录成功后从 PeerInfo 里取；用它来决定隧道是否加密。
+    let mut peer_version = String::new();
 
     loop {
         tokio::select! {
@@ -286,6 +284,7 @@ async fn connect_and_login(
                                 }
                             }
                             Some(login_response::Union::PeerInfo(pi)) => {
+                                peer_version = pi.version.clone();
                                 interface.handle_peer_info(pi);
                                 break;
                             }
@@ -324,11 +323,25 @@ async fn connect_and_login(
             },
         }
     }
-    stream.set_raw();
-    if !buffer.is_empty() {
-        allow_err!(stream.send_bytes(buffer.into()).await);
+    // 两端都支持时保留会话密钥（加密帧传输）；否则退回裸流（兼容旧版）。
+    // 注意：set_raw() 会顺带清掉 secretbox 密钥，所以加密模式下不能调用它。
+    let encrypted = crate::is_support_tunnel_encryption(&peer_version);
+    if encrypted {
+        log::info!("port forward: 端到端加密已启用 (peer {peer_version})");
+    } else {
+        log::info!("port forward: 对端 {peer_version} 不支持加密，退回裸流");
+        stream.set_raw();
     }
-    Ok(Some((stream, direct, secure)))
+    // 让隧道窗口能显示「直连 / 中继」和是否加密。
+    interface.report_connection_type(encrypted, direct);
+    if !buffer.is_empty() {
+        if encrypted {
+            allow_err!(stream.send_raw(buffer).await);
+        } else {
+            allow_err!(stream.send_bytes(buffer.into()).await);
+        }
+    }
+    Ok(Some((stream, direct, encrypted)))
 }
 
 /// 攒批上限：单次转发最多合并这么大的数据，避免大流量时占用过多内存。
@@ -346,6 +359,7 @@ pub(crate) const FORWARD_BATCH_MAX: usize = 64 * 1024;
 async fn run_forward(
     forward: Framed<TcpStream, BytesCodec>,
     stream: Stream,
+    encrypted: bool,
 ) -> ResultType<u64> {
     log::info!("new port forwarding connection started");
     let mut forward = forward;
@@ -368,7 +382,13 @@ async fn run_forward(
                             }
                         }
                         nbytes += batch.len() as u64;
-                        if let Err(err) = stream.send_bytes(batch.freeze()).await {
+                        let sent = if encrypted {
+                            // 加密帧：走 send_raw（secretbox 加密后再发）
+                            stream.send_raw(batch.to_vec()).await
+                        } else {
+                            stream.send_bytes(batch.freeze()).await
+                        };
+                        if let Err(err) = sent {
                             log::debug!("forward -> stream failed: {err}");
                             break;
                         }

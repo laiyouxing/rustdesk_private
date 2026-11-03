@@ -1457,7 +1457,21 @@ impl Connection {
         let mut last_recv_time = Instant::now();
         if let Some(mut forward) = self.port_forward_socket.take() {
             log::info!("Running port forwarding loop");
-            self.stream.set_raw();
+            // 两端都支持时保留会话密钥、走加密帧；否则退回裸流（兼容旧版）。
+            // 旧实现无条件 set_raw()，会顺带清掉 secretbox 密钥 → 隧道明文。
+            let encrypted = crate::is_support_tunnel_encryption(&self.lr.version);
+            if encrypted {
+                log::info!(
+                    "port forward: 端到端加密已启用 (peer {})",
+                    self.lr.version
+                );
+            } else {
+                log::info!(
+                    "port forward: 对端 {} 不支持加密，退回裸流",
+                    self.lr.version
+                );
+                self.stream.set_raw();
+            }
             let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
             loop {
                 tokio::select! {
@@ -1489,7 +1503,13 @@ impl Connection {
                                     _ => break,
                                 }
                             }
-                            self.stream.send_bytes(batch.freeze()).await?;
+                            let sent = if encrypted {
+                                // 加密帧：secretbox 加密后再发
+                                self.stream.send_raw(batch.to_vec()).await
+                            } else {
+                                self.stream.send_bytes(batch.freeze()).await
+                            };
+                            sent?;
                         } else {
                             bail!("Forward reset by the peer");
                         }

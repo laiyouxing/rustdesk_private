@@ -78,3 +78,17 @@ pub mod virtual_display_manager;
 
 mod kcp_stream;
 pub mod upnp;
+
+/// 端口转发数据是否做**端到端加密**。
+///
+/// 历史背景：旧版本在登录成功后调用 `set_raw()`，会顺带清掉会话的
+/// secretbox 密钥，于是隧道转发阶段的数据是明文裸流（中转服务器能看到
+/// 数据库账号密码）。新版本改为：只要**两端都支持**，就保留会话密钥、
+/// 用加密帧传输；任一端是旧版本则自动退回裸流，保证兼容。
+///
+/// 判定方式两边对称、结果必然一致：
+/// - 控制端：用登录后拿到的 PeerInfo.version（被控端版本）
+/// - 被控端：用 LoginRequest.version（控制端版本）
+pub fn is_support_tunnel_encryption(version: &str) -> bool {
+    hbb_common::get_version_number(version) >= hbb_common::get_version_number("1.7.31")
+}

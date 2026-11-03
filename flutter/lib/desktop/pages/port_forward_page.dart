@@ -215,6 +215,7 @@ class _PortForwardPageState extends State<PortForwardPage>
     final s = tunnelStat.value;
     final active = (s['active'] as num?)?.toInt() ?? 0;
     final direct = s['direct'] == true;
+    final secure = s['secure'] == true;
     final bytes = (s['bytes'] as num?)?.toInt() ?? 0;
     final localPort = (s['local_port'] as num?)?.toInt() ?? 0;
     final remoteHost = (s['remote_host'] as String?) ?? '';
@@ -262,6 +263,28 @@ class _PortForwardPageState extends State<PortForwardPage>
               style: TextStyle(
                   fontSize: 12, color: Theme.of(context).hintColor),
             ),
+            if (!noConn) ...[
+              const SizedBox(width: 10),
+              // 加密状态：两端都支持时隧道数据端到端加密，否则退回裸流。
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                decoration: BoxDecoration(
+                  color: secure
+                      ? const Color(0xFFE6F4EA)
+                      : const Color(0xFFFCE8E6),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  secure ? '已加密' : '未加密',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: secure
+                          ? const Color(0xFF1B8A3A)
+                          : const Color(0xFFB3261E)),
+                ),
+              ),
+            ],
             const Spacer(),
             Text(
               '累计 $sizeText',
