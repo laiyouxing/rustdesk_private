@@ -1143,7 +1143,8 @@ class _KeysPanelState extends State<KeysPanel> {
       crossAxisCount: MediaQuery.of(context).size.width > 600 ? 6 : 4,
       mainAxisSpacing: 8,
       crossAxisSpacing: 8,
-      childAspectRatio: 2.1,
+      // 磁贴偏方一点，竖排文字不会被压扁；配合 GridView 自身滚动
+      childAspectRatio: 1.75,
       children: items,
     );
   }
@@ -1176,8 +1177,9 @@ class _KeysPanelState extends State<KeysPanel> {
     );
   }
 
-  Widget _kbRow(List<Widget> keys) =>
-      Expanded(child: Row(children: keys));
+  /// 一行键盘按键（固定高度，外层可滚动，横屏也不会溢出）
+  Widget _kbRow(List<Widget> keys, {double height = 34}) =>
+      SizedBox(height: height, child: Row(children: keys));
 
   Widget _buildKeyboard() {
     final winName = _isMac ? 'Cmd' : 'Win';
@@ -1186,7 +1188,8 @@ class _KeysPanelState extends State<KeysPanel> {
       ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'],
       ['Z', 'X', 'C', 'V', 'B', 'N', 'M'],
     ];
-    return Column(
+    return SingleChildScrollView(
+      child: Column(
       children: [
         // 组合键模式 + 修饰键
         Padding(
@@ -1237,7 +1240,7 @@ class _KeysPanelState extends State<KeysPanel> {
                   color: Colors.white, size: 18), onTap: () => _tapKey('VK_BACK')),
             ],
           ]),
-        // 空格 / 回车
+        // 空格 / 方向键 / 回车
         _kbRow([
           _kbKey('Space', flex: 6, onTap: () => _tapKey('VK_SPACE')),
           _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_left, color: Colors.white, size: 20), onTap: () => _tapKey('VK_LEFT')),
@@ -1246,57 +1249,40 @@ class _KeysPanelState extends State<KeysPanel> {
           _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_right, color: Colors.white, size: 20), onTap: () => _tapKey('VK_RIGHT')),
           _kbKey('Enter', flex: 2, onTap: () => _tapKey('VK_ENTER')),
         ]),
+        const SizedBox(height: 4),
       ],
-    );
-  }
-
-  Widget _buildIme() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('使用手机自带输入法输入',
-              style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w500)),
-          const SizedBox(height: 8),
-          const Text(
-            '中文候选词、拼音、语音、手写都由系统输入法提供，'
-            '输入的内容会作为文本直接发送到被控端（相当于在被控端粘贴）。',
-            style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
-          ),
-          const SizedBox(height: 16),
-          SizedBox(
-            width: double.infinity,
-            height: 46,
-            child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF4C8DFF),
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8)),
-              ),
-              icon: const Icon(Icons.keyboard, size: 20),
-              label: const Text('打开系统输入法', style: TextStyle(fontSize: 15)),
-              onPressed: widget.onOpenSoftKeyboard,
-            ),
-          ),
-          const Spacer(),
-          const Text(
-            '提示：需要连续输入英文或组合键时，用「电脑键盘」标签更直接。',
-            style: TextStyle(color: Colors.white38, fontSize: 12),
-          ),
-        ],
       ),
     );
   }
 
+
   @override
   Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final screenH = media.size.height;
+    final screenW = media.size.width;
+    final landscape = screenW > screenH;
+    // 系统键盘占掉的高度（面板在键盘之上，必须扣掉它再算能留多少给画面）
+    final keyboardInset = media.viewInsets.bottom;
+    final availH = (screenH - keyboardInset).clamp(120.0, screenH);
+
+    // 输入法标签：只保留标签栏，剩余空间全部让给系统键盘（与 UU 一致）
+    final imeOnly = _tab == _KeysTab.ime;
+
+    double panelH;
+    if (imeOnly) {
+      panelH = 52;
+    } else {
+      // 横屏屏幕矮，按比例压缩；竖屏最多 360
+      final ratio = landscape ? 0.5 : 0.42;
+      panelH = (screenH * ratio).clamp(landscape ? 150.0 : 240.0, 360.0);
+      // 键盘已经弹出来时，别把画面挤没：面板最多占可用高度的 45%
+      final cap = (availH * 0.45).clamp(120.0, 360.0);
+      if (panelH > cap) panelH = cap;
+    }
+
     return Container(
-      height: 360,
+      height: panelH,
       color: const Color(0xFF242424),
       child: Column(
         children: [
@@ -1314,14 +1300,14 @@ class _KeysPanelState extends State<KeysPanel> {
               ],
             ),
           ),
-          Container(height: 1, color: Colors.white12),
-          Expanded(
-            child: _tab == _KeysTab.ime
-                ? _buildIme()
-                : (_tab == _KeysTab.shortcuts
-                    ? _buildShortcuts()
-                    : _buildKeyboard()),
-          ),
+          if (!imeOnly) ...[
+            Container(height: 1, color: Colors.white12),
+            Expanded(
+              child: _tab == _KeysTab.shortcuts
+                  ? _buildShortcuts()
+                  : _buildKeyboard(),
+            ),
+          ],
         ],
       ),
     );
