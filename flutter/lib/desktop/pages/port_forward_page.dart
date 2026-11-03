@@ -63,7 +63,8 @@ class _PortForwardPageState extends State<PortForwardPage>
   RxList<_PortForward> pfs = RxList.empty(growable: true);
   /// 隧道运行状态：链路类型（直连/中继）、活跃连接数、累计流量等。
   /// 数据由 Rust 端经 main_get_common("port-forward-status") 下发。
-  final Rx<Map<String, dynamic>> tunnelStat = <String, dynamic>{}.obs;
+  /// 注意：必须声明成 RxMap，GetX 里 RxMap 无法赋给 Rx<Map<..>>。
+  final RxMap<String, dynamic> tunnelStat = <String, dynamic>{}.obs;
   Timer? _statTimer;
   late FFI _ffi;
 
