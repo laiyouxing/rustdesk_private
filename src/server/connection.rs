@@ -1647,6 +1647,11 @@ impl Connection {
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["conn_id"] = json!(self.inner.id);
         v["session_id"] = json!(self.lr.session_id);
+        // 客户端版本：后台「连接日志」直接展示，便于按版本排查兼容性问题。
+        // version = 本机（被控端）版本；from_version = 控制端版本（登录后才会有，
+        // 登录前发的那条 new 审计是空串，随后补全更新会把它填上）。
+        v["version"] = json!(VERSION);
+        v["from_version"] = json!(self.lr.version);
         allow_err!(self.tx_post_seq.send((url, v)));
     }
 
@@ -1695,6 +1700,9 @@ impl Connection {
             "path":path,
             "is_file":is_file,
             "info":json!(info).to_string(),
+            // 版本随文件日志一起上报，后台「文件传输日志」可按版本排查。
+            "version": json!(VERSION),
+            "from_version": json!(self.lr.version),
         });
         tokio::spawn(async move {
             allow_err!(Self::post_audit_async(url, v).await);
