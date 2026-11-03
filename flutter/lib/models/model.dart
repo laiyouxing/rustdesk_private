@@ -2201,6 +2201,18 @@ class CanvasModel with ChangeNotifier {
   // after showing the soft keyboard.
   bool isMobileCanvasChanged = false;
 
+  // 移动端画布的真实可用尺寸（由 mobile/remote_page.dart 的 LayoutBuilder 上报）。
+  // getSize() 原先只按 MediaQuery 推算，拿不到 bottomNavigationBar（按键面板）
+  // 占掉的高度，键盘弹起后面板与系统键盘叠在一起时算出的可用高度偏大，
+  // 结果是画面按旧比例绘制、下半部分被遮住。
+  Size? _widgetSize;
+
+  // 底部空间（软键盘 / 按键面板 / 手势提示）是否被占用。占用时把整幅远程
+  // 画面缩小到剩余区域内，保证上方始终能看到完整桌面。
+  bool _bottomSpaceOccupied = false;
+  double? _scaleBeforeBottomSpaceOccupied;
+  Offset? _offsetBeforeBottomSpaceOccupied;
+
   final ScrollController _horizontal = ScrollController();
   final ScrollController _vertical = ScrollController();
 
@@ -2286,7 +2298,78 @@ class CanvasModel with ChangeNotifier {
         h = h - mediaData.padding.top;
       }
     }
+    // 移动端：以实际布局尺寸为准（见 updateCanvasWidgetSize）
+    final widgetSize = _widgetSize;
+    if (isMobile &&
+        widgetSize != null &&
+        widgetSize.width > 0 &&
+        widgetSize.height > 0) {
+      return widgetSize;
+    }
     return Size(w < 0 ? 0 : w, h < 0 ? 0 : h);
+  }
+
+  /// 移动端：更新画布真实可用尺寸（LayoutBuilder 上报）。
+  /// - 底部被占用：立即按新尺寸做整幅适配；
+  /// - 否则重算视图样式（旋转、工具栏展开等尺寸变化仍走原有逻辑）。
+  void updateCanvasWidgetSize(Size size) {
+    if (!isMobile) return;
+    if (!size.width.isFinite || !size.height.isFinite) return;
+    if (size.width <= 0 || size.height <= 0) return;
+    if (_widgetSize == size) return;
+    _widgetSize = size;
+    if (_bottomSpaceOccupied) {
+      fitCanvasToVisibleArea();
+    } else {
+      updateViewStyle();
+    }
+  }
+
+  /// 移动端：底部空间（软键盘 / 按键面板 / 手势提示）占用的开关。
+  /// 占用时把整幅远程画面缩小到剩余区域并居中，收起后恢复原比例与位置。
+  void setBottomSpaceOccupied(bool occupied) {
+    if (!isMobile) return;
+    if (occupied == _bottomSpaceOccupied) return;
+    _bottomSpaceOccupied = occupied;
+    if (occupied) {
+      _scaleBeforeBottomSpaceOccupied ??= _scale;
+      _offsetBeforeBottomSpaceOccupied ??= Offset(_x, _y);
+      fitCanvasToVisibleArea();
+    } else {
+      final scale = _scaleBeforeBottomSpaceOccupied;
+      final offset = _offsetBeforeBottomSpaceOccupied;
+      _scaleBeforeBottomSpaceOccupied = null;
+      _offsetBeforeBottomSpaceOccupied = null;
+      updateSize();
+      if (scale != null) _scale = scale;
+      if (offset != null) {
+        _x = offset.dx;
+        _y = offset.dy;
+      }
+      notifyListeners();
+    }
+  }
+
+  /// 移动端：把整幅远程画面缩放到当前可用区域以内（保证完整可见）并居中。
+  /// 只缩小、不放大：原来 1:1 或用户自定义缩放的场景，空间足够时保持原样。
+  void fitCanvasToVisibleArea() {
+    if (!isMobile) return;
+    updateSize();
+    final displayWidth = getDisplayWidth();
+    final displayHeight = getDisplayHeight();
+    if (displayWidth <= 0 ||
+        displayHeight <= 0 ||
+        _size.width <= 0 ||
+        _size.height <= 0) {
+      notifyListeners();
+      return;
+    }
+    final fitScale = min(_size.width / displayWidth, _size.height / displayHeight);
+    final baseScale = _scaleBeforeBottomSpaceOccupied ?? _scale;
+    _scale = fitScale < baseScale ? fitScale : baseScale;
+    _x = (_size.width - displayWidth * _scale) / 2;
+    _y = (_size.height - displayHeight * _scale) / 2;
+    notifyListeners();
   }
 
   // mobile only

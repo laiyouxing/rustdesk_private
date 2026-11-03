@@ -81,6 +81,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// 右侧竖排工具条是否显示
   var _showRail = true;
 
+  /// 画布容器的真实尺寸（LayoutBuilder 上报给 CanvasModel）
+  Size? _lastCanvasSize;
+  bool _canvasSizeUpdateScheduled = false;
+
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
 
@@ -363,6 +367,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final keyboardIsVisible =
         keyboardVisibilityController.isVisible && _showEdit;
     final showActionButton = !_showBar || keyboardIsVisible || _showGestureHelp;
+
+    // 底部被软键盘/按键面板占住时，让画布把整幅远程桌面缩小到上方；
+    // 放在帧后执行，避免 build 期间 notifyListeners。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _syncBottomSpaceOccupancy();
+    });
 
     return WillPopScope(
       onWillPop: () async {
@@ -681,7 +691,46 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       !gFFI.canvasModel.cursorEmbedded &&
       !gFFI.inputModel.relativeMouseMode.value;
 
+  /// 底部是否被软键盘 / 按键面板 / 手势提示占住
+  bool get _bottomSpaceOccupied =>
+      keyboardVisibilityController.isVisible ||
+      _showKeysPanel ||
+      _showGestureHelp;
+
+  /// 把画布容器的真实尺寸上报给 CanvasModel（仅在尺寸变化时触发）。
+  /// 键盘/面板弹起时 Scaffold 会把 body 压矮，只有拿到这个真实尺寸，
+  /// CanvasModel 才能把整幅远程画面缩放到剩余区域里。
+  void _reportCanvasSize(BoxConstraints constraints) {
+    if (!constraints.maxWidth.isFinite || !constraints.maxHeight.isFinite) return;
+    final size = Size(constraints.maxWidth, constraints.maxHeight);
+    if (size.width <= 0 || size.height <= 0) return;
+    if (_lastCanvasSize == size) return;
+    _lastCanvasSize = size;
+    if (_canvasSizeUpdateScheduled) return;
+    _canvasSizeUpdateScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _canvasSizeUpdateScheduled = false;
+      if (!mounted) return;
+      final size = _lastCanvasSize;
+      if (size == null) return;
+      gFFI.canvasModel.updateCanvasWidgetSize(size);
+    });
+  }
+
+  /// 同步「底部是否被占」给画布：占用时整幅缩小到上方，收起时恢复原比例。
+  void _syncBottomSpaceOccupancy() {
+    if (!mounted) return;
+    gFFI.canvasModel.setBottomSpaceOccupied(_bottomSpaceOccupied);
+  }
+
   Widget getBodyForMobile() {
+    return LayoutBuilder(builder: (ctx, constraints) {
+      _reportCanvasSize(constraints);
+      return _buildMobileCanvas();
+    });
+  }
+
+  Widget _buildMobileCanvas() {
     return Container(
         color: MyTheme.canvasColor,
         child: Stack(children: () {
