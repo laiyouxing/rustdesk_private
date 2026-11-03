@@ -2086,6 +2086,9 @@ pub struct LoginConfigHandler {
     pub version: i64,
     features: Option<Features>,
     pub session_id: u64, // used for local <-> server communication
+    // 一次用户操作（点一次「连接」）内稳定的操作标识，随 LoginRequest 发给被控端，
+    // 供服务端把「同一次操作的重试」合并成一条审计记录。见 initialize() 里的生成逻辑。
+    pub op_id: u64,
     pub supported_encoding: SupportedEncoding,
     pub restarting_remote_device: bool,
     pub force_relay: bool,
@@ -2121,6 +2124,33 @@ impl Deref for LoginConfigHandler {
 }
 
 impl LoginConfigHandler {
+    /// 本次登录（LoginRequest）要带的 op_id。
+    ///
+    /// 普通连接用会话级的 [`Self::op_id`]：同一次点击引发的重连/重试都相同，
+    /// 服务端（api-server）据此把多条审计记录合并成一条。
+    ///
+    /// 隧道（PORT_FORWARD / RDP）例外：每个本地连接都是一条独立的转发，不存在
+    /// 「同一次操作的重试」；若共用会话级 op_id，服务端反而会把并发的隧道连接
+    /// 合并成一条。这里每次登录给一个新值，让它们各自成条。
+    fn login_op_id(&self) -> u64 {
+        let fresh = || {
+            let id: u64 = rand::random();
+            if id == 0 {
+                1
+            } else {
+                id
+            }
+        };
+        if matches!(self.conn_type, ConnType::PORT_FORWARD | ConnType::RDP) {
+            return fresh();
+        }
+        if self.op_id == 0 {
+            // 正常不会走到（initialize 里已生成），兜底避免上报 0。
+            return fresh();
+        }
+        self.op_id
+    }
+
     /// Initialize the login config handler.
     ///
     /// # Arguments
@@ -2197,6 +2227,19 @@ impl LoginConfigHandler {
             }
         }
         self.session_id = sid;
+        // op_id：一次用户操作（点一次「连接」）内保持稳定，跨自动重连/重试复用。
+        //
+        // LoginConfigHandler 由 Session 持有，跨 io_loop 的所有重连轮次是同一个对象，
+        // 而 initialize() 每轮都会调用，所以这里只在首次（0）生成，之后一直沿用；
+        // 用户点一次新连接 = 新 Session = 新 op_id。被控端把它写进审计上报，服务端按它
+        // 把「同一次操作的多条连接尝试」合并成一条记录。
+        //
+        // 不复用 session_id：session_id 有协议语义（被控端按 peer_id+name+session_id
+        // 匹配免密会话，见 server/connection.rs），改动会影响免密放行逻辑。
+        if self.op_id == 0 {
+            let op_id: u64 = rand::random();
+            self.op_id = if op_id == 0 { 1 } else { op_id };
+        }
         self.supported_encoding = Default::default();
         self.restarting_remote_device = false;
         // 是否强制走中继（不建立 P2P 直连）。
@@ -3080,6 +3123,7 @@ impl LoginConfigHandler {
             my_platform,
             option: self.get_option_message(true).into(),
             session_id: self.session_id,
+            op_id: self.login_op_id(),
             version: crate::VERSION.to_string(),
             os_login: Some(OSLogin {
                 username: os_username,

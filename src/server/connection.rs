@@ -1652,6 +1652,10 @@ impl Connection {
         // 登录前发的那条 new 审计是空串，随后补全更新会把它填上）。
         v["version"] = json!(VERSION);
         v["from_version"] = json!(self.lr.version);
+        // 控制端「一次操作」的操作标识（1.7.32+ 才带，老版本为 0）：登录前的 new 审计
+        // 还没收到 LoginRequest，op_id 为 0；鉴权成功后那条会带上，服务端据此把同一次
+        // 操作的重试合并成一条记录。
+        v["op_id"] = json!(self.lr.op_id);
         allow_err!(self.tx_post_seq.send((url, v)));
     }
 
