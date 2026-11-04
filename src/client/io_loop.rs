@@ -54,6 +54,19 @@ use std::{
     },
 };
 
+/// 控制端连接流的发送超时（毫秒）。
+///
+/// 中继/对端任一侧不再读取时，RustDesk 的收发会互相卡死：本端写不出去、
+/// 也不再读 socket（接收窗口缩到几百字节），表现为 GUI 一直转圈、
+/// 连接永远处于 ESTABLISHED，只有杀掉客户端才恢复
+/// （2026-11-04 故障 id=234485258 就是这个现象）。
+/// 加上发送超时后，写不进去会在 20 秒内报错、退出本轮 io_loop，
+/// 走正常的断开→自动重连流程，不会留下"连上了但一个字节都不动"的会话。
+///
+/// 取 20 秒：被控端的发送超时是 12 秒（`server/connection.rs` 的
+/// `SEND_TIMEOUT_VIDEO`），控制端上传量小（输入/剪贴板），20 秒足够宽松。
+const CLIENT_SEND_TIMEOUT_MS: u64 = 20_000;
+
 pub struct Remote<T: InvokeUiSession> {
     handler: Session<T>,
     audio_sender: MediaSender,
@@ -283,6 +296,8 @@ impl<T: InvokeUiSession> Remote<T> {
         .await
         {
             Ok(((mut peer, direct, pk, mut kcp, stream_type), (feedback, rendezvous_server, relay_server, peer_addr, peer_addrs, udp_nat_port, peer_nat_type))) => {
+                // 兜底：这条流一旦写不进去就不能永久挂起（见 CLIENT_SEND_TIMEOUT_MS 的说明）。
+                peer.set_send_timeout(CLIENT_SEND_TIMEOUT_MS);
                 self.handler
                     .connection_round_state
                     .lock()
