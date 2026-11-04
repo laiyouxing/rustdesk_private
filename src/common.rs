@@ -1534,6 +1534,20 @@ fn local_ipv4_addrs() -> Vec<std::net::Ipv4Addr> {
         .collect()
 }
 
+/// 供「LAN 直连测试」使用：候选地址是否与本机某张网卡同网段。
+///
+/// 不同网段说明要经网关 / VPN 转发，虽然 TCP 与安全握手可能都成功，但后续登录
+/// 会挂在死流上（2026-11-04 故障 id=234485258：切换后界面显示已连上、画面永远
+/// 不出来，而对端从未完成鉴权）。拿不到本机地址时保守返回 `false`——宁可留在
+/// 中继，也不要切到不可信的链路。
+pub fn is_lan_direct_candidate(addr: &str) -> bool {
+    let local = local_ipv4_addrs();
+    if local.is_empty() {
+        return false;
+    }
+    candidate_in_local_subnet(addr, &local)
+}
+
 /// 写入内网中继选择结果缓存（`None` = "决定不切"也算结论），顺手淘汰过期条目。
 fn cache_lan_pick(cache_key: &str, result: Option<String>) {
     if let Ok(mut g) = LAN_PICK_CACHE.lock() {

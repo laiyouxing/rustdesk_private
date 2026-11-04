@@ -782,12 +782,34 @@ impl Client {
 
         // Parallel LAN test after relay is stable: all LAN addresses simultaneous.
         // select_ok 取第一个成功的，其他自动取消（此时 relay 已稳定，cancel 无害）。
-        if !lan_addrs.is_empty() {
+        //
+        // 两个前置条件（2026-11-04 故障 id=234485258 之后补上）：
+        //   1) 用户/策略勾选了「强制走中继连接」时，不做任何直连切换；
+        //   2) 只测**与本机某张网卡同网段**的地址。跨网段（要走 VPN / 网关）时
+        //      TCP 与安全握手都可能成功，但后续登录会挂在死流上，表现为
+        //      「界面显示已连上、画面永远不出来」，且对端从未完成鉴权。
+        let lan_test_addrs: Vec<SocketAddr> = if interface.is_force_relay() {
+            Vec::new()
+        } else {
+            lan_addrs
+                .iter()
+                .copied()
+                .filter(|a| crate::common::is_lan_direct_candidate(&a.to_string()))
+                .collect()
+        };
+        if lan_test_addrs.len() != lan_addrs.len() {
+            log::info!(
+                "Parallel LAN test: {} of {} candidate(s) are in local subnets, testing those only",
+                lan_test_addrs.len(),
+                lan_addrs.len()
+            );
+        }
+        if !lan_test_addrs.is_empty() {
             let mut candidates: Vec<hbb_common::futures::future::BoxFuture<
                 '_, Result<(Stream, Option<Vec<u8>>), ()>,
             >> = Vec::new();
 
-            for &addr in &lan_addrs {
+            for &addr in &lan_test_addrs {
                 let p = peer.clone();
                 let k = key.clone();
                 let sk = signed_id_pk.clone();
@@ -804,7 +826,8 @@ impl Client {
             // Direct access port backup (only when is_local)
             let direct_port = (RENDEZVOUS_PORT + 2) as u16;
             let direct_addr = SocketAddr::new(peer_addr.ip(), direct_port);
-            {
+            // 同上：跨网段的「直连」不可信，只在本机同网段时才试这个备选端口。
+            if crate::common::is_lan_direct_candidate(&direct_addr.to_string()) {
                 let p = peer.clone();
                 let k = key.clone();
                 let sk = signed_id_pk.clone();
