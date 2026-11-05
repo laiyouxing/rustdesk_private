@@ -10,6 +10,7 @@ import 'package:flutter_hbb/common/widgets/overlay.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/pages/install_page.dart';
 import 'package:flutter_hbb/desktop/pages/server_page.dart';
+import 'package:flutter_hbb/desktop/pages/wall_page.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_file_transfer_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_view_camera_screen.dart';
 import 'package:flutter_hbb/desktop/screen/desktop_port_forward_screen.dart';
@@ -52,13 +53,14 @@ Future<void> main(List<String> args) async {
   if (args.isNotEmpty && args.first == 'multi_window') {
     kWindowId = int.parse(args[1]);
     stateGlobal.setWindowId(kWindowId!);
-    if (!isMacOS) {
-      WindowController.fromWindowId(kWindowId!).showTitleBar(false);
-    }
     final argument = args[2].isEmpty
         ? <String, dynamic>{}
         : jsonDecode(args[2]) as Map<String, dynamic>;
     int type = argument['type'] ?? -1;
+    // 画面墙是普通窗口：保留系统标题栏，用户才有地方点关闭。
+    if (!isMacOS && type != WindowType.Wall.index) {
+      WindowController.fromWindowId(kWindowId!).showTitleBar(false);
+    }
     // to-do: No need to parse window id ?
     // Because stateGlobal.windowId is a global value.
     argument['windowId'] = kWindowId;
@@ -97,6 +99,12 @@ Future<void> main(List<String> args) async {
         runMultiWindow(
           argument,
           kAppTypeDesktopTerminal,
+        );
+      case WindowType.Wall:
+        desktopType = DesktopType.main;
+        runMultiWindow(
+          argument,
+          kAppTypeDesktopWall,
         );
       default:
         break;
@@ -229,6 +237,9 @@ void runMultiWindow(
         params: argument,
       );
       break;
+    case kAppTypeDesktopWall:
+      widget = const WallPage();
+      break;
     default:
       // no such appType
       exit(0);
@@ -277,6 +288,9 @@ void runMultiWindow(
       break;
     case kAppTypeDesktopTerminal:
       await restoreWindowPosition(WindowType.Terminal, windowId: kWindowId!);
+      break;
+    case kAppTypeDesktopWall:
+      await restoreWindowPosition(WindowType.Wall, windowId: kWindowId!);
       break;
     default:
       // no such appType

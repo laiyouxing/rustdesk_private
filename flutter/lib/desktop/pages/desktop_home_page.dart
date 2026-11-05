@@ -1086,9 +1086,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         child: TextButton.icon(
           icon: const Icon(Icons.grid_view, size: 18),
           label: const Text('画面墙'),
-          onPressed: () => Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => const WallPage()),
-          ),
+          // 独立窗口打开：push 路由会把主窗口首页顶掉，返回时偶发全白。
+          onPressed: () => openWallWindow(),
         ),
       ),
     );

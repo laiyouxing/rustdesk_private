@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
@@ -7,6 +8,7 @@ import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/sync_controller.dart';
 import 'package:flutter_hbb/models/wall_store.dart';
+import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 
 /// 单个画面墙格子的连接超时：超过这个时间还没有第一帧就提示需要密码/可重试。
@@ -467,5 +469,23 @@ class _WallTileState extends State<_WallTile> {
     var index = ffi.ffiModel.pi.currentDisplay;
     if (index < 0 || index >= length) index = 0;
     return index;
+  }
+}
+
+/// 以独立窗口打开画面墙。
+///
+/// 不要用 `Navigator.push`：画面墙会顶掉主窗口的首页内容，返回时首页偶尔渲染成空白。
+Future<void> openWallWindow() async {
+  final argument = jsonEncode({'type': WindowType.Wall.index});
+  try {
+    await rustDeskWinManager.newSessionWindow(
+      WindowType.Wall,
+      '',
+      argument,
+      <int>[],
+      false,
+    );
+  } catch (e) {
+    debugPrint('open wall window failed: $e');
   }
 }

@@ -3008,6 +3008,8 @@ String getWindowName({WindowType? overrideType}) {
       return "Port Forward - $name";
     case WindowType.RemoteDesktop:
       return "Remote Desktop - $name";
+    case WindowType.Wall:
+      return "Screen Wall - $name";
     default:
       break;
   }
