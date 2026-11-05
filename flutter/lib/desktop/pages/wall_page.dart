@@ -37,6 +37,10 @@ class _WallPageState extends State<WallPage> {
   final List<_WallPeer> _peers = <_WallPeer>[];
   bool _loaded = false;
 
+  /// 批量删除模式：格子上出现勾选圈，点格子选中/取消。
+  bool _selectMode = false;
+  final Set<String> _selected = <String>{};
+
   @override
   void initState() {
     super.initState();
@@ -190,7 +194,77 @@ class _WallPageState extends State<WallPage> {
   }
 
   Future<void> _removePeer(String id) async {
-    setState(() => _peers.removeWhere((peer) => peer.id == id));
+    setState(() {
+      _peers.removeWhere((peer) => peer.id == id);
+      _selected.remove(id);
+      if (_peers.isEmpty) _selectMode = false;
+    });
+    await _savePeers();
+  }
+
+  bool get _allSelected =>
+      _peers.isNotEmpty && _selected.length == _peers.length;
+
+  void _enterSelectMode() {
+    setState(() {
+      _selectMode = true;
+      _selected.clear();
+    });
+  }
+
+  void _exitSelectMode() {
+    setState(() {
+      _selectMode = false;
+      _selected.clear();
+    });
+  }
+
+  void _toggleSelect(String id) {
+    setState(() {
+      if (!_selected.remove(id)) _selected.add(id);
+    });
+  }
+
+  void _toggleSelectAll() {
+    setState(() {
+      if (_allSelected) {
+        _selected.clear();
+      } else {
+        _selected
+          ..clear()
+          ..addAll(_peers.map((peer) => peer.id));
+      }
+    });
+  }
+
+  /// 批量从画面墙移除。只影响画面墙，不会去动设备本身。
+  Future<void> _deleteSelected() async {
+    if (_selected.isEmpty) return;
+    final count = _selected.length;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('批量删除'),
+        content: Text('从画面墙移除 $count 台设备？\n只影响画面墙，设备本身不受影响。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final removed = Set<String>.of(_selected);
+    setState(() {
+      _peers.removeWhere((peer) => removed.contains(peer.id));
+      _selected.clear();
+      if (_peers.isEmpty) _selectMode = false;
+    });
     await _savePeers();
   }
 
@@ -260,28 +334,49 @@ class _WallPageState extends State<WallPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('画面墙'),
-        actions: [
-          AnimatedBuilder(
-            animation: _sync,
-            builder: (context, _) {
-              final enabled = _sync.enabled;
-              return TextButton.icon(
-                onPressed: () => _sync.toggle(),
-                icon: Icon(
-                  enabled ? Icons.sync : Icons.sync_disabled,
-                  size: 18,
-                  color: enabled ? Colors.blueAccent : null,
+        actions: _selectMode
+            ? [
+                TextButton(
+                  onPressed: _toggleSelectAll,
+                  child: Text(_allSelected ? '取消全选' : '全选'),
                 ),
-                label: Text(enabled ? '同步：开' : '同步：关'),
-              );
-            },
-          ),
-          IconButton(
-            tooltip: '添加设备',
-            onPressed: _addPeer,
-            icon: const Icon(Icons.add),
-          ),
-        ],
+                TextButton(
+                  onPressed: _selected.isEmpty ? null : _deleteSelected,
+                  child: Text('删除 ${_selected.length}'),
+                ),
+                IconButton(
+                  tooltip: '退出多选',
+                  onPressed: _exitSelectMode,
+                  icon: const Icon(Icons.close),
+                ),
+              ]
+            : [
+                AnimatedBuilder(
+                  animation: _sync,
+                  builder: (context, _) {
+                    final enabled = _sync.enabled;
+                    return TextButton.icon(
+                      onPressed: () => _sync.toggle(),
+                      icon: Icon(
+                        enabled ? Icons.sync : Icons.sync_disabled,
+                        size: 18,
+                        color: enabled ? Colors.blueAccent : null,
+                      ),
+                      label: Text(enabled ? '同步：开' : '同步：关'),
+                    );
+                  },
+                ),
+                IconButton(
+                  tooltip: '批量删除',
+                  onPressed: _enterSelectMode,
+                  icon: const Icon(Icons.checklist),
+                ),
+                IconButton(
+                  tooltip: '添加设备',
+                  onPressed: _addPeer,
+                  icon: const Icon(Icons.add),
+                ),
+              ],
       ),
       body: !_loaded
           ? const Center(child: CircularProgressIndicator())
@@ -330,6 +425,9 @@ class _WallPageState extends State<WallPage> {
               peer: peer,
               onRemove: () => _removePeer(peer.id),
               onEditPassword: () => _editPassword(peer),
+              selectMode: _selectMode,
+              selected: _selected.contains(peer.id),
+              onToggleSelect: () => _toggleSelect(peer.id),
             );
           },
         );
@@ -342,12 +440,18 @@ class _WallTile extends StatefulWidget {
   final _WallPeer peer;
   final VoidCallback onRemove;
   final VoidCallback onEditPassword;
+  final bool selectMode;
+  final bool selected;
+  final VoidCallback onToggleSelect;
 
   const _WallTile({
     super.key,
     required this.peer,
     required this.onRemove,
     required this.onEditPassword,
+    this.selectMode = false,
+    this.selected = false,
+    required this.onToggleSelect,
   });
 
   @override
@@ -364,6 +468,9 @@ class _WallTileState extends State<_WallTile> {
 
   /// 这一格预览的是对端的哪块屏幕（多屏设备可以切换）。
   int _display = 0;
+
+  /// 当前画面质量（low / balanced / best），用于菜单打勾。
+  String _quality = '';
 
   @override
   void initState() {
@@ -406,12 +513,25 @@ class _WallTileState extends State<_WallTile> {
       password: widget.peer.password.isEmpty ? null : widget.peer.password,
     );
     ffi.ffiModel.updateEventListener(ffi.sessionId, peerId);
+    unawaited(_loadQuality());
     _timeoutTimer = Timer(_kConnectTimeout, () {
       if (!mounted || _gotFirstImage) return;
       _failWith(widget.peer.password.isEmpty
           ? '连接超时：对方可能设了密码，或当前不可达'
           : '连接超时：密码可能不对，或当前不可达');
     });
+  }
+
+  /// 读取当前画面质量，供「⋮ → 画面质量」打勾。
+  Future<void> _loadQuality() async {
+    final ffi = _ffi;
+    if (ffi == null) return;
+    try {
+      final value = await bind.sessionGetImageQuality(sessionId: ffi.sessionId);
+      if (!mounted || _ffi != ffi) return;
+      final quality = value ?? '';
+      if (quality != _quality) setState(() => _quality = quality);
+    } catch (_) {}
   }
 
   Future<void> _disposeSession() async {
@@ -491,7 +611,7 @@ class _WallTileState extends State<_WallTile> {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    final card = Card(
       clipBehavior: Clip.antiAlias,
       child: Stack(
         fit: StackFit.expand,
@@ -506,31 +626,56 @@ class _WallTileState extends State<_WallTile> {
                 color: Colors.black54,
                 borderRadius: BorderRadius.circular(4),
               ),
-              child: Text(
-                widget.peer.id,
-                style: const TextStyle(color: Colors.white, fontSize: 11),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (widget.selectMode)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 4),
+                      child: Icon(
+                        widget.selected
+                            ? Icons.check_circle
+                            : Icons.radio_button_unchecked,
+                        size: 14,
+                        color: widget.selected
+                            ? Colors.lightBlueAccent
+                            : Colors.white70,
+                      ),
+                    ),
+                  Text(
+                    widget.peer.id,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                  ),
+                ],
               ),
             ),
           ),
-          Positioned(
-            right: 0,
-            top: 0,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _buildMenu(),
-                IconButton(
-                  tooltip: '从画面墙移除',
-                  iconSize: 16,
-                  color: Colors.white70,
-                  onPressed: widget.onRemove,
-                  icon: const Icon(Icons.close),
-                ),
-              ],
+          if (!widget.selectMode)
+            Positioned(
+              right: 0,
+              top: 0,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildMenu(),
+                  IconButton(
+                    tooltip: '从画面墙移除',
+                    iconSize: 16,
+                    color: Colors.white70,
+                    onPressed: widget.onRemove,
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
             ),
-          ),
         ],
       ),
+    );
+    if (!widget.selectMode) return card;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onToggleSelect,
+      child: card,
     );
   }
 
@@ -586,8 +731,28 @@ class _WallTileState extends State<_WallTile> {
     }
     items.add(const PopupMenuDivider());
     items.add(const PopupMenuItem<String>(
+      enabled: false,
+      child: Text('画面质量', style: TextStyle(fontSize: 12)),
+    ));
+    for (final entry in const <String, String>{
+      kRemoteImageQualityLow: '流畅',
+      kRemoteImageQualityBalanced: '平衡',
+      kRemoteImageQualityBest: '高清',
+    }.entries) {
+      items.add(PopupMenuItem<String>(
+        value: 'quality:${entry.key}',
+        child: Text(_quality == entry.key ? '${entry.value} ✓' : entry.value),
+      ));
+    }
+    items.add(const PopupMenuDivider());
+    items.add(const PopupMenuItem<String>(
       value: 'retry',
       child: Text('重新连接'),
+    ));
+    items.add(const PopupMenuDivider());
+    items.add(const PopupMenuItem<String>(
+      value: 'remove',
+      child: Text('从画面墙移除'),
     ));
 
     return PopupMenuButton<String>(
@@ -610,7 +775,22 @@ class _WallTileState extends State<_WallTile> {
       await _retry();
       return;
     }
+    if (value == 'remove') {
+      widget.onRemove();
+      return;
+    }
     if (ffi == null) return;
+    if (value.startsWith('quality:')) {
+      final quality = value.substring('quality:'.length);
+      try {
+        await bind.sessionSetImageQuality(
+          sessionId: ffi.sessionId,
+          value: quality,
+        );
+        if (mounted) setState(() => _quality = quality);
+      } catch (_) {}
+      return;
+    }
     if (value.startsWith('display:')) {
       final index = int.tryParse(value.substring('display:'.length)) ?? 0;
       setState(() => _display = index);
