@@ -100,6 +100,7 @@ Future<void> main(List<String> args) async {
           argument,
           kAppTypeDesktopTerminal,
         );
+        break;
       case WindowType.Wall:
         desktopType = DesktopType.main;
         runMultiWindow(

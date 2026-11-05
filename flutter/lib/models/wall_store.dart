@@ -39,7 +39,7 @@ class WallStore {
     final entries = <WallPeerEntry>[];
     String raw = '';
     try {
-      raw = await SyncStore().readString(_key);
+      raw = (await SyncStore().readString(_key)) ?? '';
     } catch (_) {}
     if (raw.isEmpty) return entries;
     var parsed = false;
