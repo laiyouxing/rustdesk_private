@@ -107,4 +107,16 @@ class WallStore {
     peers.removeWhere((peer) => peer.id == id);
     await save(peers);
   }
+
+  /// 修改某台设备的固定密码（传空串表示清除密码）。
+  ///
+  /// 返回 false 表示这台设备已经不在墙上了。
+  static Future<bool> updatePassword(String id, String password) async {
+    final peers = await load();
+    final index = peers.indexWhere((peer) => peer.id == id);
+    if (index < 0) return false;
+    peers[index] = WallPeerEntry(peers[index].id, password);
+    await save(peers);
+    return true;
+  }
 }

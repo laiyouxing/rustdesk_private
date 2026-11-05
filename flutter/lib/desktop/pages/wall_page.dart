@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
+import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/sync_controller.dart';
 import 'package:flutter_hbb/models/wall_store.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
@@ -88,8 +91,8 @@ class _WallPageState extends State<WallPage> {
                     icon: Icon(obscurePassword
                         ? Icons.visibility_off_outlined
                         : Icons.visibility_outlined),
-                    onPressed: () =>
-                        setDialogState(() => obscurePassword = !obscurePassword),
+                    onPressed: () => setDialogState(
+                        () => obscurePassword = !obscurePassword),
                   ),
                 ),
               ),
@@ -143,8 +146,8 @@ class _WallPageState extends State<WallPage> {
     } catch (_) {}
     if (!mounted) return;
     if (peers.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('地址簿是空的，先手动填设备 ID')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('地址簿是空的，先手动填设备 ID')));
       return;
     }
     final selected = await showDialog<String>(
@@ -160,8 +163,8 @@ class _WallPageState extends State<WallPage> {
                 for (final peer in peers)
                   ListTile(
                     dense: true,
-                    leading: const Icon(Icons.desktop_windows_outlined,
-                        size: 20),
+                    leading:
+                        const Icon(Icons.desktop_windows_outlined, size: 20),
                     title: Text(
                       peer.alias.isNotEmpty ? peer.alias : peer.id,
                       maxLines: 1,
@@ -189,6 +192,67 @@ class _WallPageState extends State<WallPage> {
   Future<void> _removePeer(String id) async {
     setState(() => _peers.removeWhere((peer) => peer.id == id));
     await _savePeers();
+  }
+
+  /// 修改/清除某台设备的固定密码。保存后会重建该格子并重新连接。
+  Future<void> _editPassword(WallPeerEntry peer) async {
+    final controller = TextEditingController(text: peer.password);
+    var obscure = true;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: Text('设置密码：${peer.id}'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: controller,
+                obscureText: obscure,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: '密码',
+                  hintText: '留空表示这台设备不需要密码',
+                  suffixIcon: IconButton(
+                    tooltip: obscure ? '显示密码' : '隐藏密码',
+                    icon: Icon(obscure
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined),
+                    onPressed: () => setDialogState(() => obscure = !obscure),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '保存后会重新连接这一格',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(null),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(''),
+              child: const Text('清除密码'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(controller.text),
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+    final saved = await WallStore.updatePassword(peer.id, result.trim());
+    if (!saved) return;
+    await _loadPeers();
   }
 
   @override
@@ -261,9 +325,11 @@ class _WallPageState extends State<WallPage> {
           itemBuilder: (context, index) {
             final peer = _peers[index];
             return _WallTile(
-              key: ValueKey(peer.id),
+              // 密码变了也要重建（新 key 会重新建连接）。
+              key: ValueKey('${peer.id}|${peer.password}'),
               peer: peer,
               onRemove: () => _removePeer(peer.id),
+              onEditPassword: () => _editPassword(peer),
             );
           },
         );
@@ -275,11 +341,13 @@ class _WallPageState extends State<WallPage> {
 class _WallTile extends StatefulWidget {
   final _WallPeer peer;
   final VoidCallback onRemove;
+  final VoidCallback onEditPassword;
 
   const _WallTile({
     super.key,
     required this.peer,
     required this.onRemove,
+    required this.onEditPassword,
   });
 
   @override
@@ -294,6 +362,9 @@ class _WallTileState extends State<_WallTile> {
   String? _error;
   bool _gotFirstImage = false;
 
+  /// 这一格预览的是对端的哪块屏幕（多屏设备可以切换）。
+  int _display = 0;
+
   @override
   void initState() {
     super.initState();
@@ -304,6 +375,7 @@ class _WallTileState extends State<_WallTile> {
     _timeoutTimer?.cancel();
     _pendingFailTimer?.cancel();
     _pendingError = null;
+    _display = 0;
     setState(() {
       _error = null;
       _gotFirstImage = false;
@@ -443,17 +515,133 @@ class _WallTileState extends State<_WallTile> {
           Positioned(
             right: 0,
             top: 0,
-            child: IconButton(
-              tooltip: '从画面墙移除',
-              iconSize: 16,
-              color: Colors.white70,
-              onPressed: widget.onRemove,
-              icon: const Icon(Icons.close),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildMenu(),
+                IconButton(
+                  tooltip: '从画面墙移除',
+                  iconSize: 16,
+                  color: Colors.white70,
+                  onPressed: widget.onRemove,
+                  icon: const Icon(Icons.close),
+                ),
+              ],
             ),
           ),
         ],
       ),
     );
+  }
+
+  /// 每格右上角的「⋮」菜单：密码、分辨率、预览屏幕、重连。
+  Widget _buildMenu() {
+    final ffi = _ffi;
+    PeerInfo? pi;
+    if (ffi != null && _error == null) {
+      try {
+        pi = ffi.ffiModel.pi;
+      } catch (_) {}
+    }
+    final resolutions = <Resolution>[];
+    if (pi != null) {
+      try {
+        resolutions.addAll(pi.resolutions.take(8));
+      } catch (_) {}
+    }
+    final displayCount = pi == null ? 1 : _displayCount(ffi!);
+
+    final items = <PopupMenuEntry<String>>[
+      const PopupMenuItem<String>(
+        value: 'password',
+        child: Text('设置密码'),
+      ),
+    ];
+    if (resolutions.isNotEmpty) {
+      items.add(const PopupMenuDivider());
+      items.add(const PopupMenuItem<String>(
+        enabled: false,
+        child: Text('分辨率', style: TextStyle(fontSize: 12)),
+      ));
+      for (final r in resolutions) {
+        items.add(PopupMenuItem<String>(
+          value: 'res:${r.width}x${r.height}',
+          child: Text('${r.width}x${r.height}'),
+        ));
+      }
+    }
+    if (displayCount > 1) {
+      items.add(const PopupMenuDivider());
+      items.add(const PopupMenuItem<String>(
+        enabled: false,
+        child: Text('预览屏幕', style: TextStyle(fontSize: 12)),
+      ));
+      for (var i = 0; i < displayCount; i++) {
+        final current = i == _displayIndex(ffi!, displayCount);
+        items.add(PopupMenuItem<String>(
+          value: 'display:$i',
+          child: Text(current ? '屏幕 ${i + 1} ✓' : '屏幕 ${i + 1}'),
+        ));
+      }
+    }
+    items.add(const PopupMenuDivider());
+    items.add(const PopupMenuItem<String>(
+      value: 'retry',
+      child: Text('重新连接'),
+    ));
+
+    return PopupMenuButton<String>(
+      tooltip: '更多操作',
+      padding: EdgeInsets.zero,
+      iconSize: 16,
+      icon: const Icon(Icons.more_vert, color: Colors.white70),
+      onSelected: _onMenuSelected,
+      itemBuilder: (context) => items,
+    );
+  }
+
+  Future<void> _onMenuSelected(String value) async {
+    final ffi = _ffi;
+    if (value == 'password') {
+      widget.onEditPassword();
+      return;
+    }
+    if (value == 'retry') {
+      await _retry();
+      return;
+    }
+    if (ffi == null) return;
+    if (value.startsWith('display:')) {
+      final index = int.tryParse(value.substring('display:'.length)) ?? 0;
+      setState(() => _display = index);
+      try {
+        await bind.sessionSwitchDisplay(
+          isDesktop: true,
+          sessionId: ffi.sessionId,
+          value: Int32List.fromList([index]),
+        );
+      } catch (_) {}
+      return;
+    }
+    if (value.startsWith('res:')) {
+      final parts = value.substring('res:'.length).split('x');
+      if (parts.length != 2) return;
+      final width = int.tryParse(parts[0]);
+      final height = int.tryParse(parts[1]);
+      if (width == null || height == null) return;
+      final pi = ffi.ffiModel.pi;
+      var display = pi.currentDisplay;
+      if (display == kAllDisplayValue || display < 0) display = 0;
+      try {
+        await bind.sessionChangeResolution(
+          sessionId: ffi.sessionId,
+          display: display,
+          width: width,
+          height: height,
+        );
+      } catch (_) {}
+      return;
+    }
   }
 
   Widget _buildContent() {
@@ -491,7 +679,9 @@ class _WallTileState extends State<_WallTile> {
           width: _displayWidth(ffi).toDouble(),
           height: _displayHeight(ffi).toDouble(),
           child: Obx(() {
-            final textureId = ffi.textureModel.getTextureId(0).value;
+            final textureId = ffi.textureModel
+                .getTextureId(_displayIndex(ffi, _displayCount(ffi)))
+                .value;
             if (textureId == 0) {
               return const Center(
                 child: SizedBox(
@@ -533,9 +723,21 @@ class _WallTileState extends State<_WallTile> {
   }
 
   int _displayIndex(FFI ffi, int length) {
-    var index = ffi.ffiModel.pi.currentDisplay;
+    var index = _display;
+    if (index < 0 || index >= length) {
+      index = ffi.ffiModel.pi.currentDisplay;
+    }
     if (index < 0 || index >= length) index = 0;
     return index;
+  }
+
+  int _displayCount(FFI ffi) {
+    try {
+      final count = ffi.ffiModel.pi.displays.length;
+      return count > 0 ? count : 1;
+    } catch (_) {
+      return 1;
+    }
   }
 }
 
