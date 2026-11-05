@@ -904,6 +904,7 @@ class FfiModel with ChangeNotifier {
   handleMultipleWindowsSession(
       Map<String, dynamic> evt, SessionID sessionId, String peerId) {
     if (parent.target == null) return;
+    if (parent.target!.wallMode) return;
     final dialogManager = parent.target!.dialogManager;
     final sessions = evt['windows_sessions'];
     final title = translate('Multiple Windows sessions found');
@@ -917,6 +918,29 @@ class FfiModel with ChangeNotifier {
   /// Handle the message box event based on [evt] and [id].
   handleMsgBox(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
     if (parent.target == null) return;
+    final wallFfi = parent.target!;
+    if (wallFfi.wallMode) {
+      // 画面墙：不弹窗，错误文本交给格子自己渲染。
+      final type = evt['type'];
+      final title = evt['title'];
+      final rawText = evt['text'];
+      final isError = type == 'error' ||
+          type == 'restarting' ||
+          title == 'Connection Error' ||
+          (type is String &&
+              (type.contains('error') ||
+                  type == 're-input-password' ||
+                  type == 'input-password' ||
+                  type == 'input-2fa' ||
+                  type == 'on-uac' ||
+                  type == 'wait-uac' ||
+                  type == 'elevation-error'));
+      if (isError) {
+        wallFfi.onWallMsgBox
+            ?.call((title ?? '').toString(), (rawText ?? '').toString());
+      }
+      return;
+    }
     final dialogManager = parent.target!.dialogManager;
     final type = evt['type'];
     final title = evt['title'];
@@ -3716,6 +3740,13 @@ class FFI {
 
   /// dialogManager use late to ensure init after main page binding [globalKey]
   late final dialogManager = OverlayDialogManager();
+
+  /// 画面墙格子模式：错误只在自己的格子里显示，不弹全局对话框
+  /// （画面墙是整窗网格，弹窗会盖住整个窗口而不是那一台设备）。
+  bool wallMode = false;
+
+  /// 画面墙格子模式下的错误回调（标题, 正文）。
+  void Function(String title, String text)? onWallMsgBox;
 
   late final SessionID sessionId;
   late final ImageModel imageModel; // session

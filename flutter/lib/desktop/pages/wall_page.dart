@@ -295,6 +295,11 @@ class _WallTileState extends State<_WallTile> {
     initSharedStates(peerId);
     final ffi = FFI(null);
     _ffi = ffi;
+    // 画面墙格子：连接错误只在这一格里显示，不弹全局对话框。
+    ffi.wallMode = true;
+    ffi.onWallMsgBox = (title, text) {
+      _failWith(_describeErrorMessage(title, text));
+    };
     ffi.imageModel.addCallbackOnFirstImage((_) {
       if (!mounted) return;
       _timeoutTimer?.cancel();
@@ -307,11 +312,9 @@ class _WallTileState extends State<_WallTile> {
     ffi.ffiModel.updateEventListener(ffi.sessionId, peerId);
     _timeoutTimer = Timer(_kConnectTimeout, () {
       if (!mounted || _gotFirstImage) return;
-      setState(() {
-        _error = widget.peer.password.isEmpty
-            ? '连接超时：对方可能设了密码，或当前不可达'
-            : '连接超时：密码可能不对，或当前不可达';
-      });
+      _failWith(widget.peer.password.isEmpty
+          ? '连接超时：对方可能设了密码，或当前不可达'
+          : '连接超时：密码可能不对，或当前不可达');
     });
   }
 
@@ -332,6 +335,27 @@ class _WallTileState extends State<_WallTile> {
     await _disposeSession();
     if (!mounted) return;
     _connect();
+  }
+
+  /// 这一格连接失败/超时：只在本格显示错误，并停掉会话避免后台反复重连。
+  void _failWith(String message) {
+    if (!mounted || _error != null) return;
+    _timeoutTimer?.cancel();
+    setState(() => _error = message);
+    Future<void>.delayed(const Duration(seconds: 1), () {
+      if (mounted && _error != null) _disposeSession();
+    });
+  }
+
+  /// 把 Rust 侧的错误整理成格子里能显示的一句话。
+  String _describeErrorMessage(String title, String text) {
+    final msg = text.trim().isNotEmpty ? text.trim() : title.trim();
+    if (msg.isEmpty) {
+      return widget.peer.password.isEmpty
+          ? '连接失败：对方可能设了密码，或当前不可达'
+          : '连接失败：密码可能不对，或当前不可达';
+    }
+    return msg.length > 160 ? '${msg.substring(0, 160)}…' : msg;
   }
 
   @override
