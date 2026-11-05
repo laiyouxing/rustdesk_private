@@ -1046,6 +1046,20 @@ class InputModel {
       shift: shift,
       command: command,
     );
+    _maybeBroadcastPaste(name, down ?? false);
+  }
+
+  /// 剪贴板同步：Ctrl/Cmd+V 时把本地剪贴板文本直接推到同组其它会话。
+  ///
+  /// 只转发按键是不够的——对端会粘贴它们自己的剪贴板，所以这里推的是内容。
+  void _maybeBroadcastPaste(String name, bool down) {
+    if (!down) return;
+    if (!(ctrl || command) || alt) return;
+    final upper = name.toUpperCase();
+    if (upper != 'VK_V' && upper != 'V' && upper != 'KEYV') return;
+    final sync = SyncController.instance;
+    if (!sync.enabled) return;
+    sync.broadcastClipboardPaste(sessionId);
   }
 
   static Map<String, dynamic> getMouseEventMove() => {

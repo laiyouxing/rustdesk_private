@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show Clipboard;
 import 'package:flutter/widgets.dart' show Size;
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:uuid/uuid.dart';
@@ -39,25 +40,48 @@ class SyncMember {
   final int height;
   final List<int> terminalIds;
 
+  /// 该会话文件传输窗口当前所在的远程目录（空的表示它没有打开文件传输）。
+  final String fileDir;
+
   const SyncMember(
     this.sessionId, {
     this.width = 0,
     this.height = 0,
     this.terminalIds = const <int>[],
+    this.fileDir = '',
   });
 }
 
 class _LocalSession {
   final String peerId;
   final Size? Function()? remoteSize;
+  final String fileDir;
 
-  const _LocalSession(this.peerId, this.remoteSize);
+  const _LocalSession(this.peerId, this.remoteSize, {this.fileDir = ''});
 
-  _LocalSession merge({String? peerId, Size? Function()? remoteSize}) =>
+  _LocalSession merge({
+    String? peerId,
+    Size? Function()? remoteSize,
+    String? fileDir,
+  }) =>
       _LocalSession(
         (peerId != null && peerId.isNotEmpty) ? peerId : this.peerId,
         remoteSize ?? this.remoteSize,
+        fileDir: (fileDir != null && fileDir.isNotEmpty) ? fileDir : this.fileDir,
       );
+}
+
+/// 一个待同步的文件/目录（文件传输同步用）。
+class SyncFileItem {
+  final String path;
+  final String name;
+  final bool isDirectory;
+
+  const SyncFileItem({
+    required this.path,
+    required this.name,
+    required this.isDirectory,
+  });
 }
 
 /// 同步操作（批量操控）控制器。
@@ -162,12 +186,27 @@ class SyncController extends ChangeNotifier {
     UuidValue sessionId, {
     String peerId = '',
     Size? Function()? remoteSize,
+    String fileDir = '',
   }) async {
     await ensureInitialized();
     final existing = _local[sessionId];
     _local[sessionId] = existing == null
-        ? _LocalSession(peerId, remoteSize)
-        : existing.merge(peerId: peerId, remoteSize: remoteSize);
+        ? _LocalSession(peerId, remoteSize, fileDir: fileDir)
+        : existing.merge(
+            peerId: peerId, remoteSize: remoteSize, fileDir: fileDir);
+    await _writeSelf();
+    await _refreshMembers();
+  }
+
+  /// 文件传输：登记某个会话当前所在的远程目录（切换目录时调用）。
+  Future<void> updateFileTransferDir(UuidValue sessionId, String path) async {
+    final existing = _local[sessionId];
+    if (existing == null) {
+      await registerSession(sessionId, fileDir: path);
+      return;
+    }
+    if (existing.fileDir == path) return;
+    _local[sessionId] = existing.merge(fileDir: path);
     await _writeSelf();
     await _refreshMembers();
   }
@@ -196,6 +235,7 @@ class SyncController extends ChangeNotifier {
           'w': size?.width.round() ?? 0,
           'h': size?.height.round() ?? 0,
           'terminals': terminalIds,
+          'file_dir': entry.value.fileDir,
         });
       } catch (_) {}
     }
@@ -232,6 +272,7 @@ class SyncController extends ChangeNotifier {
           width: w is int ? w : 0,
           height: h is int ? h : 0,
           terminalIds: terminalIds,
+          fileDir: item['file_dir'] is String ? item['file_dir'] as String : '',
         );
       }
     } catch (_) {}
@@ -374,5 +415,73 @@ class SyncController extends ChangeNotifier {
         } catch (_) {}
       }
     }
+  }
+
+  /// 剪贴板同步：把本地剪贴板文本直接推给同组的其它会话。
+  ///
+  /// 语义是「粘贴到所有机器」：走 `sessionInputString`（等价于把这段文字敲进去），
+  /// 因为 Dart 侧没有设置对端剪贴板的 FFI，而各会话自己的剪贴板通道只同步
+  /// 本地剪贴板、不会把文本搬到别的会话。
+  Future<void> broadcastClipboardPaste(UuidValue sourceSessionId) async {
+    if (!_enabled) return;
+    String? text;
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      text = data?.text;
+    } catch (_) {
+      return;
+    }
+    if (text == null || text.isEmpty) return;
+    for (final member in _membersCache) {
+      if (member.sessionId == sourceSessionId) continue;
+      try {
+        bind.sessionInputString(sessionId: member.sessionId, value: text);
+      } catch (_) {}
+    }
+  }
+
+  /// 文件传输同步：把同一批本地文件/目录推到其它已打开文件传输的会话。
+  ///
+  /// 每台机器都落到它自己当前所在的远程目录（同一个文件名），所以源端和目标端
+  /// 的目录结构不必相同。
+  void broadcastFileTransfer({
+    required UuidValue sourceSessionId,
+    required List<SyncFileItem> items,
+    required bool includeHidden,
+  }) {
+    if (!_enabled) return;
+    if (items.isEmpty) return;
+    for (final member in _membersCache) {
+      if (member.sessionId == sourceSessionId) continue;
+      final dir = member.fileDir;
+      if (dir.isEmpty) continue;
+      final windows = dir.contains('\\') || RegExp(r'^[A-Za-z]:').hasMatch(dir);
+      for (final item in items) {
+        int actId;
+        try {
+          actId = int.parse(
+              bind.mainGetCommonSync(key: 'transfer-job-id').toString());
+        } catch (_) {
+          actId = DateTime.now().millisecondsSinceEpoch & 0x7fffffff;
+        }
+        try {
+          bind.sessionSendFiles(
+            sessionId: member.sessionId,
+            actId: actId,
+            path: item.path,
+            to: _joinPath(dir, item.name, windows),
+            fileNum: 0,
+            includeHidden: includeHidden,
+            isRemote: false,
+            isDir: item.isDirectory,
+          );
+        } catch (_) {}
+      }
+    }
+  }
+
+  static String _joinPath(String dir, String name, bool windows) {
+    if (dir.endsWith('\\') || dir.endsWith('/')) return '$dir$name';
+    return '$dir${windows ? '\\' : '/'}$name';
   }
 }

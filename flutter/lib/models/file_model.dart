@@ -13,6 +13,7 @@ import 'package:flutter_hbb/web/dummy.dart'
 import '../consts.dart';
 import 'model.dart';
 import 'platform_model.dart';
+import 'sync_controller.dart';
 
 enum SortBy {
   name,
@@ -458,6 +459,10 @@ class FileController {
       final fd = await fileFetcher.fetchDirectory(path, isLocal, showHidden);
       fd.format(isWindows, sort: sortBy.value);
       directory.value = fd;
+      if (!isLocal) {
+        // 同步操作：记住本会话当前所在的远程目录，文件同步时按它落盘。
+        SyncController.instance.updateFileTransferDir(sessionId, fd.path);
+      }
     } catch (e) {
       debugPrint("Failed to openDirectory $path: $e");
     }
@@ -564,6 +569,23 @@ class FileController {
         (!isLocal &&
             versionCmp(rootState.target!.ffiModel.pi.version, '1.3.3') < 0)) {
       return;
+    }
+
+    // 同步操作：上传时把同一批文件也推到其它已打开文件传输的会话，
+    // 各自落到自己当前所在的远程目录（同名文件）。
+    if (isLocal) {
+      SyncController.instance.broadcastFileTransfer(
+        sourceSessionId: sessionId,
+        items: [
+          for (final from in items.items)
+            SyncFileItem(
+              path: from.path,
+              name: from.name,
+              isDirectory: from.isDirectory,
+            )
+        ],
+        includeHidden: showHidden,
+      );
     }
 
     final List<Entry> entrys = items.items.toList();
