@@ -1181,6 +1181,30 @@ class InputModel {
     await bind.sessionSendMouse(
         sessionId: sessionId,
         msg: json.encode(modify({'x': '$x2', 'y': '$y2'})));
+    _broadcastAbsoluteMove(x2, y2);
+  }
+
+  /// 同步操作：绝对鼠标移动按比例广播。
+  ///
+  /// 只在选中单个显示器时广播（多屏拼接的虚拟桌面坐标系不同，没法简单按比例换算）。
+  void _broadcastAbsoluteMove(int x, int y) {
+    final sync = SyncController.instance;
+    if (!sync.enabled) return;
+    try {
+      final pi = parent.target?.ffiModel.pi;
+      if (pi == null) return;
+      final index = pi.currentDisplay;
+      if (index < 0 || index >= pi.displays.length) return;
+      final display = pi.displays[index];
+      if (display.width <= 0 || display.height <= 0) return;
+      sync.broadcastAbsoluteMove(
+        sourceSessionId: sessionId,
+        srcWidth: display.width,
+        srcHeight: display.height,
+        x: x,
+        y: y,
+      );
+    } catch (_) {}
   }
 
   /// Send relative mouse movement for mobile clients (virtual joystick).

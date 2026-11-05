@@ -17,11 +17,11 @@ import '../../common/widgets/toolbar.dart';
 import '../../models/model.dart';
 import '../../models/input_model.dart';
 import '../../models/platform_model.dart';
+import '../../models/sync_controller.dart';
 import '../../common/shared_state.dart';
 import '../../utils/image.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/kb_layout_type_chooser.dart';
-import '../widgets/sync_toggle_chip.dart';
 import '../widgets/tabbar_widget.dart';
 
 import 'package:flutter_hbb/native/custom_cursor.dart'
@@ -147,6 +147,12 @@ class _RemotePageState extends State<RemotePage>
     WakelockManager.enable(_uniqueKey);
 
     _ffi.ffiModel.updateEventListener(sessionId, widget.id);
+    // 同步操作：登记本会话，附带远程分辨率（绝对鼠标坐标按比例换算要用）。
+    SyncController.instance.registerSession(
+      _ffi.sessionId,
+      peerId: widget.id,
+      remoteSize: _currentRemoteSize,
+    );
     if (!isWeb) bind.pluginSyncUi(syncTo: kAppTypeDesktopRemote);
     _ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     _ffi.dialogManager.loadMobileActionsOverlayVisible();
@@ -305,6 +311,20 @@ class _RemotePageState extends State<RemotePage>
     }
   }
 
+  /// 当前远程显示器的像素尺寸，供同步操作把鼠标坐标按比例换算到别的机器。
+  Size? _currentRemoteSize() {
+    try {
+      final pi = _ffi.ffiModel.pi;
+      final index = pi.currentDisplay;
+      if (index < 0 || index >= pi.displays.length) return null;
+      final display = pi.displays[index];
+      if (display.width <= 0 || display.height <= 0) return null;
+      return Size(display.width.toDouble(), display.height.toDouble());
+    } catch (_) {
+      return null;
+    }
+  }
+
   @override
   Future<void> dispose() async {
     final closeSession = closeSessionOnDispose.remove(widget.id) ?? true;
@@ -332,6 +352,7 @@ class _RemotePageState extends State<RemotePage>
     _ffi.imageModel.disposeImage();
     _ffi.cursorModel.disposeImages();
     _rawKeyFocusNode.dispose();
+    await SyncController.instance.unregisterSession(_ffi.sessionId);
     await _ffi.close(closeSession: closeSession);
     _timer?.cancel();
     _ffi.dialogManager.dismissAll();
@@ -623,14 +644,6 @@ class _RemotePageState extends State<RemotePage>
         right: 10,
         child: _buildRawTouchAndPointerRegion(
             QualityMonitor(_ffi.qualityMonitorModel), null, null),
-      ),
-    );
-    // 同步操作开关：加入同步组后，本会话的键盘/鼠标按键等输入会复制给同组会话。
-    paints.add(
-      Positioned(
-        left: 10,
-        bottom: 10,
-        child: SyncToggleChip(sessionId: _ffi.sessionId, peerId: widget.id),
       ),
     );
     return Stack(

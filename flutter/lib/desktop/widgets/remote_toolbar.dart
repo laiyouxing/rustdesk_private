@@ -22,6 +22,7 @@ import 'package:window_size/window_size.dart' as window_size;
 import '../../common.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
+import '../../models/sync_controller.dart';
 import '../../common/shared_state.dart';
 import './popup_menu.dart';
 import './kb_layout_type_chooser.dart';
@@ -404,6 +405,9 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       toolbarItems.add(_VoiceCallMenu(id: widget.id, ffi: widget.ffi));
     }
     if (!isWeb) toolbarItems.add(_RecordMenu());
+    if (widget.ffi.connType == ConnType.defaultConn) {
+      toolbarItems.add(_SyncMenu());
+    }
     toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));
     final toolbarBorderRadius = BorderRadius.all(Radius.circular(4.0));
     return Column(
@@ -2207,6 +2211,34 @@ class _RecordMenu extends StatelessWidget {
       hoverColor: recordingModel.start
           ? _ToolbarTheme.hoverRedColor
           : _ToolbarTheme.hoverBlueColor,
+    );
+  }
+}
+
+class _SyncMenu extends StatelessWidget {
+  const _SyncMenu({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = SyncController.instance;
+    return AnimatedBuilder(
+      animation: sync,
+      builder: (context, _) {
+        final enabled = sync.enabled;
+        return _IconMenuButton(
+          icon: Icon(
+            enabled ? Icons.sync : Icons.sync_disabled,
+            color: enabled ? _ToolbarTheme.blueColor : Colors.white,
+            size: _ToolbarTheme.buttonSize,
+          ),
+          tooltip: enabled
+              ? 'Disable input sync'
+              : 'Sync input to grouped sessions',
+          onPressed: () => sync.toggle(),
+          color: enabled ? _ToolbarTheme.blueColor : Colors.white,
+          hoverColor: _ToolbarTheme.hoverBlueColor,
+        );
+      },
     );
   }
 }

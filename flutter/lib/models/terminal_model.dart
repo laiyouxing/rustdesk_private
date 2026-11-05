@@ -80,7 +80,9 @@ class TerminalModel with ChangeNotifier {
   TerminalModel(this.parent, [this.terminalId = 0]) : id = parent.id {
     terminal = Terminal(maxLines: 10000);
     terminalController = TerminalController();
-    // 同步操作：登记本终端，同窗口内的其它终端才能把输入广播过来。
+    // 同步操作：登记本终端，同组的其它终端才能把输入广播过来。
+    // 终端窗口没有远程画面，这里不带分辨率；远程画面页会补上。
+    SyncController.instance.registerSession(parent.sessionId, peerId: id);
     SyncController.instance.registerTerminal(parent.sessionId, terminalId);
 
     // Setup terminal callbacks

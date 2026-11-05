@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart' show Size;
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:uuid/uuid.dart';
 
@@ -27,14 +29,47 @@ class SyncTerminalRef {
   String toString() => 'SyncTerminalRef($sessionId, $terminalId)';
 }
 
+/// 同步组里的一个成员（另一个窗口里的远程会话）。
+///
+/// [width]/[height] 是该会话当前远程桌面的像素尺寸，用来把绝对坐标
+/// 按比例换算到不同分辨率的机器上；终端会话没有画面，尺寸为 0。
+class SyncMember {
+  final UuidValue sessionId;
+  final int width;
+  final int height;
+  final List<int> terminalIds;
+
+  const SyncMember(
+    this.sessionId, {
+    this.width = 0,
+    this.height = 0,
+    this.terminalIds = const <int>[],
+  });
+}
+
+class _LocalSession {
+  final String peerId;
+  final Size? Function()? remoteSize;
+
+  const _LocalSession(this.peerId, this.remoteSize);
+
+  _LocalSession merge({String? peerId, Size? Function()? remoteSize}) =>
+      _LocalSession(
+        (peerId != null && peerId.isNotEmpty) ? peerId : this.peerId,
+        remoteSize ?? this.remoteSize,
+      );
+}
+
 /// 同步操作（批量操控）控制器。
 ///
-/// 语义：打开「同步」后，在一个远程会话上产生的键盘、鼠标按键/滚轮、相对鼠标位移，
-/// 会原样复制到其它已加入同步组的会话；终端输入同理，会复制到本窗口内其它终端。
+/// 语义：打开「同步」后，在一个远程会话上产生的键盘、鼠标按键/滚轮、相对鼠标位移
+/// 以及绝对鼠标移动（按比例归一化）会复制到其它已加入同步组的会话；终端输入会
+/// 复制给同组的其它终端。
 ///
-/// 跨窗口的做法见 [SyncStore]：每个窗口注册自己的 sessionId 并定期刷新心跳，
-/// 广播时按 sessionId 直接调用 Rust 侧的 `sessionInputKey` / `sessionSendMouse`，
-/// 不依赖目标窗口的 Dart 对象。
+/// 跨窗口的做法见 [SyncStore]：每个窗口把本窗口的会话（含心跳、远程分辨率、终端
+/// 列表）写进临时目录，成员列表每 4 秒刷新一次并缓存在内存里；广播时直接用
+/// sessionId 调用 Rust 侧的 `sessionInputKey` / `sessionSendMouse` /
+/// `sessionSendTerminalInput`，不依赖目标窗口的 Dart 对象。
 class SyncController extends ChangeNotifier {
   SyncController._();
 
@@ -46,6 +81,9 @@ class SyncController extends ChangeNotifier {
   /// 超过这个时长没有心跳的成员视为已退出。
   static const Duration staleAfter = Duration(seconds: 15);
 
+  /// 绝对鼠标移动的最小广播间隔（约 60Hz），避免一次拖动把目标端打爆。
+  static const int absMoveMinGapMs = 16;
+
   static const String _kEnabledFlag = 'enabled';
 
   final SyncStore _store = SyncStore();
@@ -53,27 +91,41 @@ class SyncController extends ChangeNotifier {
   final String _instanceKey =
       'i${DateTime.now().microsecondsSinceEpoch}_${Random().nextInt(1 << 31)}';
 
+  /// 本窗口登记过的会话（一个窗口里可以有多个远程标签页）。
+  final Map<UuidValue, _LocalSession> _local = <UuidValue, _LocalSession>{};
+
+  /// 终端登记（本窗口 + 其它窗口读回来的都在这里去重）。
   final Set<SyncTerminalRef> _terminals = <SyncTerminalRef>{};
+
+  /// 成员缓存：来自各窗口的成员文件，每 [heartbeatInterval] 刷新一次。
+  List<SyncMember> _membersCache = const <SyncMember>[];
 
   bool _initialized = false;
   bool _enabled = false;
   bool get enabled => _enabled;
 
-  /// 本窗口已登记的会话（一个窗口里可以有多个远程标签页）。
-  final Map<UuidValue, String> _registered = <UuidValue, String>{};
   Timer? _heartbeat;
   Timer? _flagPoller;
+  int _lastAbsMoveMs = 0;
+
+  /// 当前同步组成员（不含本会话，调用方自行按 sourceSessionId 过滤）。
+  List<SyncMember> get members => _membersCache;
 
   Set<SyncTerminalRef> get terminals =>
       Set<SyncTerminalRef>.unmodifiable(_terminals);
 
-  /// 首次使用时读取全局开关并开始轮询（其它窗口切换后能跟上）。
+  /// 首次使用时读取全局开关、清理过期成员并开始轮询。
   Future<void> ensureInitialized() async {
     if (_initialized) return;
     _initialized = true;
     try {
       _enabled = await _store.readFlag(_kEnabledFlag) ?? false;
     } catch (_) {}
+    try {
+      // 客户端异常退出会留下成员文件，这里顺手清掉过期条目。
+      await _store.sweepMembers(staleAfter * 4);
+    } catch (_) {}
+    await _refreshMembers();
     _flagPoller ??= Timer.periodic(heartbeatInterval, (_) async {
       try {
         final value = await _store.readFlag(_kEnabledFlag);
@@ -82,6 +134,10 @@ class SyncController extends ChangeNotifier {
           notifyListeners();
         }
       } catch (_) {}
+    });
+    _heartbeat ??= Timer.periodic(heartbeatInterval, (_) {
+      _writeSelf();
+      _refreshMembers();
     });
     notifyListeners();
   }
@@ -98,16 +154,22 @@ class SyncController extends ChangeNotifier {
 
   Future<void> toggle() => setEnabled(!_enabled);
 
-  /// 把本窗口的某个远程会话登记进同步组（进入远程会话时调用）。
+  /// 把本窗口的某个远程会话登记进同步组（进入远程会话 / 打开终端时调用）。
   ///
-  /// 一个窗口里通常有多个远程标签页，每个标签页的 sessionId 不同，所以按会话
-  /// 逐个登记；否则同时开着的标签页只有最后打开的那个能收发同步输入。
-  Future<void> registerSession(UuidValue sessionId,
-      {String peerId = ''}) async {
+  /// 同一会话可能被登记两次（远程画面页给分辨率，终端页不带分辨率），
+  /// 这里做合并：已有分辨率回调时保留，peerId 为空时用新值补上。
+  Future<void> registerSession(
+    UuidValue sessionId, {
+    String peerId = '',
+    Size? Function()? remoteSize,
+  }) async {
     await ensureInitialized();
-    _registered[sessionId] = peerId;
+    final existing = _local[sessionId];
+    _local[sessionId] = existing == null
+        ? _LocalSession(peerId, remoteSize)
+        : existing.merge(peerId: peerId, remoteSize: remoteSize);
     await _writeSelf();
-    _heartbeat ??= Timer.periodic(heartbeatInterval, (_) => _writeSelf());
+    await _refreshMembers();
   }
 
   /// 成员文件的 key：窗口实例 + 会话 id，保证同窗口的多个会话互不覆盖。
@@ -115,41 +177,34 @@ class SyncController extends ChangeNotifier {
       '${_instanceKey}_${sessionId.toString()}';
 
   Future<void> _writeSelf() async {
-    if (_registered.isEmpty) return;
+    if (_local.isEmpty) return;
     final ts = DateTime.now().millisecondsSinceEpoch;
-    for (final entry in _registered.entries) {
+    for (final entry in _local.entries) {
+      Size? size;
+      try {
+        size = entry.value.remoteSize?.call();
+      } catch (_) {}
+      final terminalIds = _terminals
+          .where((t) => t.sessionId == entry.key)
+          .map((t) => t.terminalId)
+          .toList(growable: false);
       try {
         await _store.writeMember(_memberKey(entry.key), <String, dynamic>{
           'session_id': entry.key.toString(),
-          'peer_id': entry.value,
+          'peer_id': entry.value.peerId,
           'ts': ts,
+          'w': size?.width.round() ?? 0,
+          'h': size?.height.round() ?? 0,
+          'terminals': terminalIds,
         });
       } catch (_) {}
     }
   }
 
-  /// 会话结束时注销（离开远程会话时调用）。
-  ///
-  /// 不传 [sessionId] 表示把本窗口登记过的所有会话一起注销。
-  Future<void> unregisterSession([UuidValue? sessionId]) async {
-    final targets =
-        sessionId == null ? _registered.keys.toList() : <UuidValue>[sessionId];
-    for (final id in targets) {
-      _registered.remove(id);
-      try {
-        await _store.removeMember(_memberKey(id));
-      } catch (_) {}
-    }
-    if (_registered.isEmpty) {
-      _heartbeat?.cancel();
-      _heartbeat = null;
-    }
-  }
-
-  /// 当前仍在线的同步组成员（不含 [excludeSessionId]）。
-  Future<List<UuidValue>> members({UuidValue? excludeSessionId}) async {
-    final result = <UuidValue>[];
+  /// 从各窗口的成员文件重建成员缓存（过滤过期条目）。
+  Future<void> _refreshMembers() async {
     final now = DateTime.now().millisecondsSinceEpoch;
+    final byId = <String, SyncMember>{};
     try {
       for (final item in await _store.readMembers()) {
         final raw = item['session_id'];
@@ -163,15 +218,43 @@ class SyncController extends ChangeNotifier {
         } catch (_) {
           continue;
         }
-        if (excludeSessionId != null && sessionId == excludeSessionId) continue;
-        if (!result.contains(sessionId)) result.add(sessionId);
+        final w = item['w'];
+        final h = item['h'];
+        final rawTerminals = item['terminals'];
+        final terminalIds = <int>[];
+        if (rawTerminals is List) {
+          for (final t in rawTerminals) {
+            if (t is int) terminalIds.add(t);
+          }
+        }
+        byId[sessionId.toString()] = SyncMember(
+          sessionId,
+          width: w is int ? w : 0,
+          height: h is int ? h : 0,
+          terminalIds: terminalIds,
+        );
       }
     } catch (_) {}
-    return result;
+    _membersCache = List<SyncMember>.unmodifiable(byId.values);
+  }
+
+  /// 会话结束时注销（离开远程会话 / 关闭终端时调用）。
+  ///
+  /// 不传 [sessionId] 表示把本窗口登记过的所有会话一起注销。
+  Future<void> unregisterSession([UuidValue? sessionId]) async {
+    final targets =
+        sessionId == null ? _local.keys.toList() : <UuidValue>[sessionId];
+    for (final id in targets) {
+      _local.remove(id);
+      try {
+        await _store.removeMember(_memberKey(id));
+      } catch (_) {}
+    }
+    await _refreshMembers();
   }
 
   /// 键盘：把一次按键复制给同组的其它会话。
-  Future<void> broadcastInputKey({
+  void broadcastInputKey({
     required UuidValue sourceSessionId,
     required String name,
     required bool down,
@@ -180,12 +263,13 @@ class SyncController extends ChangeNotifier {
     required bool ctrl,
     required bool shift,
     required bool command,
-  }) async {
+  }) {
     if (!_enabled) return;
-    for (final sessionId in await members(excludeSessionId: sourceSessionId)) {
+    for (final member in _membersCache) {
+      if (member.sessionId == sourceSessionId) continue;
       try {
-        await bind.sessionInputKey(
-          sessionId: sessionId,
+        bind.sessionInputKey(
+          sessionId: member.sessionId,
           name: name,
           down: down,
           press: press,
@@ -201,15 +285,45 @@ class SyncController extends ChangeNotifier {
   /// 鼠标：把已经编码好的消息原样复制给同组的其它会话。
   ///
   /// 相对鼠标位移（`move_relative`）与分辨率无关，按键/滚轮与坐标无关，都可以直接复用。
-  /// 绝对坐标（`x`/`y` 且无 `type`）无法跨分辨率复制，调用方不要传入。
-  Future<void> broadcastMousePayload(
-      UuidValue sourceSessionId, String payload) async {
+  /// 绝对坐标（`x`/`y` 且无 `type`）走 [broadcastAbsoluteMove]，不要传到这里。
+  void broadcastMousePayload(UuidValue sourceSessionId, String payload) {
     if (!_enabled) return;
     // 相对鼠标模式的开关标记只对本地有效，不要转发。
     if (payload.contains('relative_mouse_mode')) return;
-    for (final sessionId in await members(excludeSessionId: sourceSessionId)) {
+    if (payload.contains('"x"') || payload.contains('"y"')) return;
+    for (final member in _membersCache) {
+      if (member.sessionId == sourceSessionId) continue;
       try {
-        await bind.sessionSendMouse(sessionId: sessionId, msg: payload);
+        bind.sessionSendMouse(sessionId: member.sessionId, msg: payload);
+      } catch (_) {}
+    }
+  }
+
+  /// 绝对鼠标移动：按比例归一化后广播，不同分辨率的机器也能落在同一相对位置。
+  ///
+  /// [x]/[y] 是源会话远程桌面的像素坐标，[srcWidth]/[srcHeight] 是它的分辨率。
+  void broadcastAbsoluteMove({
+    required UuidValue sourceSessionId,
+    required int srcWidth,
+    required int srcHeight,
+    required int x,
+    required int y,
+  }) {
+    if (!_enabled) return;
+    if (srcWidth <= 0 || srcHeight <= 0) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastAbsMoveMs < absMoveMinGapMs) return;
+    _lastAbsMoveMs = now;
+    for (final member in _membersCache) {
+      if (member.sessionId == sourceSessionId) continue;
+      if (member.width <= 0 || member.height <= 0) continue;
+      final targetX = (x * member.width / srcWidth).round();
+      final targetY = (y * member.height / srcHeight).round();
+      try {
+        bind.sessionSendMouse(
+          sessionId: member.sessionId,
+          msg: json.encode({'x': '$targetX', 'y': '$targetY'}),
+        );
       } catch (_) {}
     }
   }
@@ -217,34 +331,48 @@ class SyncController extends ChangeNotifier {
   /// 登记一个终端会话（同一个窗口内的多个终端之间互相同步）。
   void registerTerminal(UuidValue sessionId, int terminalId) {
     _terminals.add(SyncTerminalRef(sessionId, terminalId));
+    _writeSelf();
+    _refreshMembers();
     notifyListeners();
   }
 
   void unregisterTerminal(UuidValue sessionId, int terminalId) {
     _terminals.remove(SyncTerminalRef(sessionId, terminalId));
+    final stillHasTerminal = _terminals.any((t) => t.sessionId == sessionId);
+    final local = _local[sessionId];
+    // 只登记过终端的会话（没有远程画面 → 没有分辨率回调）在最后一个终端关闭后注销；
+    // 远程画面页登记过的会话保留，画面还在用。
+    if (!stillHasTerminal && local != null && local.remoteSize == null) {
+      unregisterSession(sessionId);
+    } else {
+      _writeSelf();
+      _refreshMembers();
+    }
     notifyListeners();
   }
 
   /// 终端：把一次输入（含粘贴的多行内容）复制给同组的其它终端。
-  Future<void> broadcastTerminalInput({
+  void broadcastTerminalInput({
     required UuidValue sourceSessionId,
     required int sourceTerminalId,
     required String data,
-  }) async {
+  }) {
     if (!_enabled) return;
     if (data.isEmpty) return;
-    final targets = _terminals
-        .where((t) => !(t.sessionId == sourceSessionId &&
-            t.terminalId == sourceTerminalId))
-        .toList(growable: false);
-    for (final t in targets) {
-      try {
-        await bind.sessionSendTerminalInput(
-          sessionId: t.sessionId,
-          terminalId: t.terminalId,
-          data: data,
-        );
-      } catch (_) {}
+    for (final member in _membersCache) {
+      for (final terminalId in member.terminalIds) {
+        if (member.sessionId == sourceSessionId &&
+            terminalId == sourceTerminalId) {
+          continue;
+        }
+        try {
+          bind.sessionSendTerminalInput(
+            sessionId: member.sessionId,
+            terminalId: terminalId,
+            data: data,
+          );
+        } catch (_) {}
+      }
     }
   }
 }

@@ -7,6 +7,8 @@ class SyncStore {
   Future<List<Map<String, dynamic>>> readMembers() async =>
       <Map<String, dynamic>>[];
 
+  Future<void> sweepMembers(Duration maxAge) async {}
+
   Future<void> writeFlag(String name, bool value) async {}
 
   Future<bool?> readFlag(String name) async => null;

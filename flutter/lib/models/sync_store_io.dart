@@ -65,6 +65,27 @@ class SyncStore {
     return items;
   }
 
+  /// 清理超过 [maxAge] 没有心跳的成员文件（客户端异常退出会留下它们）。
+  ///
+  /// 解析失败的文件不删：可能是别的窗口正在写，删掉会丢成员。
+  Future<void> sweepMembers(Duration maxAge) async {
+    try {
+      if (!await _members.exists()) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await for (final entity in _members.list(followLinks: false)) {
+        if (entity is! File) continue;
+        if (!entity.path.endsWith('.json')) continue;
+        try {
+          final decoded = jsonDecode(await entity.readAsString());
+          final ts = decoded is Map ? decoded['ts'] : null;
+          if (ts is int && now - ts > maxAge.inMilliseconds) {
+            await entity.delete();
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
   Future<void> writeFlag(String name, bool value) async {
     await _ensure();
     try {
