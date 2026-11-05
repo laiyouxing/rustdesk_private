@@ -12,6 +12,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/connection_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
+import 'package:flutter_hbb/desktop/pages/wall_page.dart';
 import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
@@ -121,6 +122,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 },
               ),
               buildPluginEntry(),
+              buildWallEntry(context),
             ],
           ),
         ),
@@ -1071,6 +1073,23 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             return entry.value;
           })
         ],
+      ),
+    );
+  }
+
+  /// 左侧导航的「画面墙」入口：一个页面同时预览多台设备的实时画面。
+  Widget buildWallEntry(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: TextButton.icon(
+          icon: const Icon(Icons.grid_view, size: 18),
+          label: const Text('画面墙'),
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const WallPage()),
+          ),
+        ),
       ),
     );
   }

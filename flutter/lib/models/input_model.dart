@@ -18,6 +18,7 @@ import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import 'input_modifier_utils.dart';
 import 'relative_mouse_model.dart';
+import 'sync_controller.dart';
 import '../common.dart';
 import '../consts.dart';
 
@@ -1034,6 +1035,17 @@ class InputModel {
         ctrl: ctrl,
         shift: shift,
         command: command);
+    // 同步操作：把这次按键复制给其它已加入同步组的会话（未开启时为空操作）。
+    SyncController.instance.broadcastInputKey(
+      sourceSessionId: sessionId,
+      name: name,
+      down: down ?? false,
+      press: press ?? true,
+      alt: alt,
+      ctrl: ctrl,
+      shift: shift,
+      command: command,
+    );
   }
 
   static Map<String, dynamic> getMouseEventMove() => {
@@ -1095,10 +1107,10 @@ class InputModel {
   /// Send scroll event with scroll distance [y].
   Future<void> scroll(int y) async {
     if (isViewCamera) return;
-    await bind.sessionSendMouse(
-        sessionId: sessionId,
-        msg: json
-            .encode(modify({'id': id, 'type': 'wheel', 'y': y.toString()})));
+    final payload =
+        json.encode(modify({'id': id, 'type': 'wheel', 'y': y.toString()}));
+    await bind.sessionSendMouse(sessionId: sessionId, msg: payload);
+    SyncController.instance.broadcastMousePayload(sessionId, payload);
   }
 
   /// Reset key modifiers to false, including [shift], [ctrl], [alt] and [command].
@@ -1119,9 +1131,10 @@ class InputModel {
   /// Used for side button releases that must go through even if permissions
   /// changed after the matching down was sent.
   Future<void> _sendMouseUnchecked(String type, MouseButtons button) async {
-    await bind.sessionSendMouse(
-        sessionId: sessionId,
-        msg: json.encode(modify({'type': type, 'buttons': button.value})));
+    final payload = json.encode(modify({'type': type, 'buttons': button.value}));
+    await bind.sessionSendMouse(sessionId: sessionId, msg: payload);
+    // 同步操作：按键事件与坐标无关，可以直接复制给同组的其它会话。
+    SyncController.instance.broadcastMousePayload(sessionId, payload);
   }
 
   /// Send mouse press event.
@@ -1242,6 +1255,17 @@ class InputModel {
     for (final key in modifiersToRelease) {
       bind.sessionInputKey(
         sessionId: sessionId,
+        name: key,
+        down: false,
+        press: false,
+        alt: false,
+        ctrl: false,
+        shift: false,
+        command: false,
+      );
+      // 同步操作：同步组的其它会话也要松开修饰键，否则会残留按键状态。
+      SyncController.instance.broadcastInputKey(
+        sourceSessionId: sessionId,
         name: key,
         down: false,
         press: false,

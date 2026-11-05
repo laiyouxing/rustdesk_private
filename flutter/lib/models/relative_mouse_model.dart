@@ -13,6 +13,7 @@ import 'package:get/get.dart';
 import '../common.dart';
 import '../consts.dart';
 import 'platform_model.dart';
+import 'sync_controller.dart';
 
 class RelativeMouseModel {
   final SessionID sessionId;
@@ -700,10 +701,13 @@ class RelativeMouseModel {
     if (isViewCamera()) return false;
 
     try {
+      final payload = json.encode(modify(msg));
       await bind.sessionSendMouse(
         sessionId: sessionId,
-        msg: json.encode(modify(msg)),
+        msg: payload,
       );
+      // 同步操作：相对位移与分辨率无关，按键/滚轮与坐标无关，直接复用同一条消息。
+      SyncController.instance.broadcastMousePayload(sessionId, payload);
       return true;
     } catch (e) {
       debugPrint('[RelMouse] Error sending mouse message: $e');

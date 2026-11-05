@@ -10,6 +10,7 @@ import 'package:xterm/xterm.dart';
 
 import 'model.dart';
 import 'platform_model.dart';
+import 'sync_controller.dart';
 
 class TerminalModel with ChangeNotifier {
   final String id; // peer id
@@ -61,6 +62,12 @@ class TerminalModel with ChangeNotifier {
           terminalId: terminalId,
           data: data,
         );
+        // 同步操作：把一个终端的输入复制给同窗口内的其它终端。
+        SyncController.instance.broadcastTerminalInput(
+          sourceSessionId: parent.sessionId,
+          sourceTerminalId: terminalId,
+          data: data,
+        );
       } catch (e) {
         debugPrint('[TerminalModel] Error sending terminal input: $e');
       }
@@ -73,6 +80,8 @@ class TerminalModel with ChangeNotifier {
   TerminalModel(this.parent, [this.terminalId = 0]) : id = parent.id {
     terminal = Terminal(maxLines: 10000);
     terminalController = TerminalController();
+    // 同步操作：登记本终端，同窗口内的其它终端才能把输入广播过来。
+    SyncController.instance.registerTerminal(parent.sessionId, terminalId);
 
     // Setup terminal callbacks
     terminal.onOutput = (data) {
@@ -492,6 +501,7 @@ class TerminalModel with ChangeNotifier {
     _markViewReadyScheduled = false;
     _suppressNextTerminalDataOutput = false;
     // Terminal cleanup is handled server-side when service closes
+    SyncController.instance.unregisterTerminal(parent.sessionId, terminalId);
     super.dispose();
   }
 }

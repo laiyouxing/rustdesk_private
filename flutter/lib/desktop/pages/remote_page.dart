@@ -21,6 +21,7 @@ import '../../common/shared_state.dart';
 import '../../utils/image.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/kb_layout_type_chooser.dart';
+import '../widgets/sync_toggle_chip.dart';
 import '../widgets/tabbar_widget.dart';
 
 import 'package:flutter_hbb/native/custom_cursor.dart'
@@ -622,6 +623,14 @@ class _RemotePageState extends State<RemotePage>
         right: 10,
         child: _buildRawTouchAndPointerRegion(
             QualityMonitor(_ffi.qualityMonitorModel), null, null),
+      ),
+    );
+    // 同步操作开关：加入同步组后，本会话的键盘/鼠标按键等输入会复制给同组会话。
+    paints.add(
+      Positioned(
+        left: 10,
+        bottom: 10,
+        child: SyncToggleChip(sessionId: _ffi.sessionId, peerId: widget.id),
       ),
     );
     return Stack(
