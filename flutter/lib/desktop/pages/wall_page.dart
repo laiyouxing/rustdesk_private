@@ -14,6 +14,9 @@ import 'package:get/get.dart';
 /// 单个画面墙格子的连接超时：超过这个时间还没有第一帧就提示需要密码/可重试。
 const Duration _kConnectTimeout = Duration(seconds: 12);
 
+/// 收到错误的宽限期：这段时间内还没有第一帧，才把这一格标记为连接失败。
+const Duration kErrorGrace = Duration(seconds: 4);
+
 typedef _WallPeer = WallPeerEntry;
 
 /// 画面墙：一屏网格预览多台设备的实时画面（只读，不接收输入）。
@@ -286,6 +289,8 @@ class _WallTile extends StatefulWidget {
 class _WallTileState extends State<_WallTile> {
   FFI? _ffi;
   Timer? _timeoutTimer;
+  Timer? _pendingFailTimer;
+  String? _pendingError;
   String? _error;
   bool _gotFirstImage = false;
 
@@ -297,6 +302,8 @@ class _WallTileState extends State<_WallTile> {
 
   void _connect() {
     _timeoutTimer?.cancel();
+    _pendingFailTimer?.cancel();
+    _pendingError = null;
     setState(() {
       _error = null;
       _gotFirstImage = false;
@@ -308,12 +315,19 @@ class _WallTileState extends State<_WallTile> {
     // 画面墙格子：连接错误只在这一格里显示，不弹全局对话框。
     ffi.wallMode = true;
     ffi.onWallMsgBox = (title, text) {
-      _failWith(_describeErrorMessage(title, text));
+      // 首次尝试失败后 Rust 会自动重试并可能马上成功，所以先不急着判失败。
+      _noteErrorMessage(_describeErrorMessage(title, text));
     };
     ffi.imageModel.addCallbackOnFirstImage((_) {
       if (!mounted) return;
       _timeoutTimer?.cancel();
-      setState(() => _gotFirstImage = true);
+      _pendingFailTimer?.cancel();
+      _pendingError = null;
+      setState(() {
+        _gotFirstImage = true;
+        // 之前报的错（首次尝试失败等）现在已被自动重连救回来，清掉。
+        _error = null;
+      });
     });
     ffi.start(
       peerId,
@@ -331,6 +345,8 @@ class _WallTileState extends State<_WallTile> {
   Future<void> _disposeSession() async {
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
+    _pendingFailTimer?.cancel();
+    _pendingFailTimer = null;
     final ffi = _ffi;
     _ffi = null;
     if (ffi == null) return;
@@ -347,10 +363,25 @@ class _WallTileState extends State<_WallTile> {
     _connect();
   }
 
+  /// 收到错误先记下来，等 [kErrorGrace] 还没有第一帧才真正判失败。
+  ///
+  /// Rust 侧首次连接失败会自己重试（打洞/中继切换），经常一两秒后就通了；
+  /// 立刻判失败会让用户先看到「失败」再看到「连上了」。
+  void _noteErrorMessage(String message) {
+    if (!mounted || _error != null) return;
+    _pendingError = message;
+    _pendingFailTimer?.cancel();
+    _pendingFailTimer = Timer(kErrorGrace, () {
+      if (!mounted || _gotFirstImage) return;
+      _failWith(_pendingError ?? message);
+    });
+  }
+
   /// 这一格连接失败/超时：只在本格显示错误，并停掉会话避免后台反复重连。
   void _failWith(String message) {
     if (!mounted || _error != null) return;
     _timeoutTimer?.cancel();
+    _pendingFailTimer?.cancel();
     setState(() => _error = message);
     Future<void>.delayed(const Duration(seconds: 1), () {
       if (mounted && _error != null) _disposeSession();
@@ -372,6 +403,8 @@ class _WallTileState extends State<_WallTile> {
   void dispose() {
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
+    _pendingFailTimer?.cancel();
+    _pendingFailTimer = null;
     final ffi = _ffi;
     _ffi = null;
     if (ffi != null) {
