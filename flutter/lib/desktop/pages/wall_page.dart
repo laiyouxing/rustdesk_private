@@ -37,7 +37,7 @@ class _WallPageState extends State<WallPage> {
   final List<_WallPeer> _peers = <_WallPeer>[];
   bool _loaded = false;
 
-  /// 批量删除模式：格子上出现勾选圈，点格子选中/取消。
+  /// 多选（批量操作）模式：格子上出现勾选圈，点格子选中/取消。
   bool _selectMode = false;
   final Set<String> _selected = <String>{};
 
@@ -533,7 +533,7 @@ class _WallPageState extends State<WallPage> {
                   },
                 ),
                 IconButton(
-                  tooltip: '批量删除',
+                  tooltip: '批量操作',
                   onPressed: _enterSelectMode,
                   icon: const Icon(Icons.checklist),
                 ),
