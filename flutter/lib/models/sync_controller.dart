@@ -59,8 +59,8 @@ class SyncController extends ChangeNotifier {
   bool _enabled = false;
   bool get enabled => _enabled;
 
-  UuidValue? _selfSessionId;
-  String _selfPeerId = '';
+  /// 本窗口已登记的会话（一个窗口里可以有多个远程标签页）。
+  final Map<UuidValue, String> _registered = <UuidValue, String>{};
   Timer? _heartbeat;
   Timer? _flagPoller;
 
@@ -98,45 +98,52 @@ class SyncController extends ChangeNotifier {
 
   Future<void> toggle() => setEnabled(!_enabled);
 
-  /// 把当前窗口的会话登记进同步组（进入远程会话时调用）。
+  /// 把本窗口的某个远程会话登记进同步组（进入远程会话时调用）。
+  ///
+  /// 一个窗口里通常有多个远程标签页，每个标签页的 sessionId 不同，所以按会话
+  /// 逐个登记；否则同时开着的标签页只有最后打开的那个能收发同步输入。
   Future<void> registerSession(UuidValue sessionId,
       {String peerId = ''}) async {
     await ensureInitialized();
-    _selfSessionId = sessionId;
-    _selfPeerId = peerId;
+    _registered[sessionId] = peerId;
     await _writeSelf();
-    _heartbeat?.cancel();
-    _heartbeat = Timer.periodic(heartbeatInterval, (_) => _writeSelf());
+    _heartbeat ??= Timer.periodic(heartbeatInterval, (_) => _writeSelf());
   }
 
+  /// 成员文件的 key：窗口实例 + 会话 id，保证同窗口的多个会话互不覆盖。
+  String _memberKey(UuidValue sessionId) =>
+      '${_instanceKey}_${sessionId.toString()}';
+
   Future<void> _writeSelf() async {
-    final sessionId = _selfSessionId;
-    if (sessionId == null) return;
-    try {
-      await _store.writeMember(_instanceKey, <String, dynamic>{
-        'session_id': sessionId.toString(),
-        'peer_id': _selfPeerId,
-        'ts': DateTime.now().millisecondsSinceEpoch,
-      });
-    } catch (_) {}
+    if (_registered.isEmpty) return;
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    for (final entry in _registered.entries) {
+      try {
+        await _store.writeMember(_memberKey(entry.key), <String, dynamic>{
+          'session_id': entry.key.toString(),
+          'peer_id': entry.value,
+          'ts': ts,
+        });
+      } catch (_) {}
+    }
   }
 
   /// 会话结束时注销（离开远程会话时调用）。
   ///
-  /// 一个窗口里可能有多个远程标签页，只有当前登记的那个会话才允许注销，
-  /// 避免关闭一个标签把另一个标签的登记清掉。
+  /// 不传 [sessionId] 表示把本窗口登记过的所有会话一起注销。
   Future<void> unregisterSession([UuidValue? sessionId]) async {
-    final current = _selfSessionId;
-    if (sessionId != null && current != null && sessionId != current) return;
-    _heartbeat?.cancel();
-    _heartbeat = null;
-    if (current != null) {
+    final targets =
+        sessionId == null ? _registered.keys.toList() : <UuidValue>[sessionId];
+    for (final id in targets) {
+      _registered.remove(id);
       try {
-        await _store.removeMember(_instanceKey);
+        await _store.removeMember(_memberKey(id));
       } catch (_) {}
     }
-    _selfSessionId = null;
-    _selfPeerId = '';
+    if (_registered.isEmpty) {
+      _heartbeat?.cancel();
+      _heartbeat = null;
+    }
   }
 
   /// 当前仍在线的同步组成员（不含 [excludeSessionId]）。

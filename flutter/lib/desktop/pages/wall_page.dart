@@ -189,7 +189,8 @@ class _WallTileState extends State<_WallTile> {
   @override
   void initState() {
     super.initState();
-    _ffi = FFI();
+    // FFI 的构造参数是位置参数（`FFI(SessionID? sId)`），传 null 表示自动生成会话 id。
+    _ffi = FFI(null);
     try {
       initSharedStates(widget.peerId);
     } catch (_) {}
@@ -210,9 +211,10 @@ class _WallTileState extends State<_WallTile> {
     try {
       _ffi.close();
     } catch (_) {}
-    try {
-      removeSharedStates(widget.peerId);
-    } catch (_) {}
+    // 注意：这里不调用 removeSharedStates。共享状态按 peer id 全局登记，同一个设备
+    // 可能同时开在普通远程标签页里，关掉画面墙就把状态删掉会让那个标签页的
+    // 事件处理取不到 Rx 而抛异常。这些 Rx 很小，等所有视图都关掉时由
+    // RemotePage 自己的 dispose 清理。
     super.dispose();
   }
 
