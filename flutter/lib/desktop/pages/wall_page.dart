@@ -54,6 +54,8 @@ class _WallPageState extends State<WallPage> {
     final idController = TextEditingController();
     final passwordController = TextEditingController();
     String? error;
+    // 密码默认隐藏，旁边给一个眼睛按钮，方便核对刚输入的内容。
+    var obscurePassword = true;
     final added = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
@@ -74,10 +76,18 @@ class _WallPageState extends State<WallPage> {
               ),
               TextField(
                 controller: passwordController,
-                obscureText: true,
-                decoration: const InputDecoration(
+                obscureText: obscurePassword,
+                decoration: InputDecoration(
                   labelText: '密码（可选）',
                   hintText: '对方设了固定密码时填这里，免得一直转圈',
+                  suffixIcon: IconButton(
+                    tooltip: obscurePassword ? '显示密码' : '隐藏密码',
+                    icon: Icon(obscurePassword
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined),
+                    onPressed: () =>
+                        setDialogState(() => obscurePassword = !obscurePassword),
+                  ),
                 ),
               ),
               const SizedBox(height: 8),
