@@ -41,10 +41,20 @@ class _WallPageState extends State<WallPage> {
   bool _selectMode = false;
   final Set<String> _selected = <String>{};
 
+  /// 批量设置：页面写、格子读（监听后按需应用）。
+  final ValueNotifier<_BatchSettings?> _batchSettings =
+      ValueNotifier<_BatchSettings?>(null);
+
   @override
   void initState() {
     super.initState();
     _loadPeers();
+  }
+
+  @override
+  void dispose() {
+    _batchSettings.dispose();
+    super.dispose();
   }
 
   Future<void> _loadPeers() async {
@@ -268,7 +278,159 @@ class _WallPageState extends State<WallPage> {
     await _savePeers();
   }
 
-  /// 修改/清除某台设备的固定密码。保存后会重建该格子并重新连接。
+  /// 把「⋮」里的设置（画面质量/分辨率/预览屏幕/密码）批量应用到选中的格子。
+  Future<void> _openBatchSettings() async {
+    if (_selected.isEmpty) return;
+    final presetResolutions = const <String>[
+      '1920x1080',
+      '1600x900',
+      '1366x768',
+      '1280x720',
+      '1024x768',
+    ];
+    var quality = '';
+    var resolution = '';
+    var displayIndex = -1;
+    var setPassword = false;
+    final passwordController = TextEditingController();
+    final result = await showDialog<_BatchSettings>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: Text('批量设置 ${_selected.length} 台'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('画面质量',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    for (final entry in const <String, String>{
+                      '': '不修改',
+                      kRemoteImageQualityLow: '流畅',
+                      kRemoteImageQualityBalanced: '平衡',
+                      kRemoteImageQualityBest: '高清',
+                    }.entries)
+                      ChoiceChip(
+                        label: Text(entry.value),
+                        selected: quality == entry.key,
+                        onSelected: (_) =>
+                            setDialogState(() => quality = entry.key),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                const Text('分辨率',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const SizedBox(height: 4),
+                DropdownButton<String>(
+                  isExpanded: true,
+                  value: resolution,
+                  items: [
+                    const DropdownMenuItem<String>(
+                        value: '', child: Text('不修改')),
+                    for (final preset in presetResolutions)
+                      DropdownMenuItem<String>(
+                          value: preset, child: Text(preset)),
+                  ],
+                  onChanged: (value) =>
+                      setDialogState(() => resolution = value ?? ''),
+                ),
+                const SizedBox(height: 12),
+                const Text('预览屏幕',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const SizedBox(height: 4),
+                DropdownButton<int>(
+                  isExpanded: true,
+                  value: displayIndex,
+                  items: [
+                    const DropdownMenuItem<int>(value: -1, child: Text('不修改')),
+                    for (var i = 0; i < 4; i++)
+                      DropdownMenuItem<int>(
+                          value: i, child: Text('屏幕 ${i + 1}')),
+                  ],
+                  onChanged: (value) =>
+                      setDialogState(() => displayIndex = value ?? -1),
+                ),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: setPassword,
+                  onChanged: (value) =>
+                      setDialogState(() => setPassword = value ?? false),
+                  title: const Text('统一设置密码'),
+                  subtitle: const Text('留空表示不需要密码；保存后这些格子会重连',
+                      style: TextStyle(fontSize: 11)),
+                  controlAffinity: ListTileControlAffinity.leading,
+                ),
+                if (setPassword)
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: '密码',
+                      hintText: '留空表示清除密码',
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(null),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () {
+                int? width;
+                int? height;
+                if (resolution.isNotEmpty) {
+                  final parts = resolution.split('x');
+                  if (parts.length == 2) {
+                    width = int.tryParse(parts[0]);
+                    height = int.tryParse(parts[1]);
+                  }
+                }
+                Navigator.of(dialogContext).pop(
+                  _BatchSettings(
+                    quality: quality.isEmpty ? null : quality,
+                    display: displayIndex < 0 ? null : displayIndex,
+                    width: width,
+                    height: height,
+                    password:
+                        setPassword ? passwordController.text.trim() : null,
+                  ),
+                );
+              },
+              child: const Text('应用'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result == null || result.isEmpty || !mounted) return;
+    final targets = Set<String>.of(_selected);
+    // 改密码要落盘并重建格子（新密码对新连接才有效）。
+    if (result.password != null) {
+      for (final id in targets) {
+        await WallStore.updatePassword(id, result.password!);
+      }
+      await _loadPeers();
+      if (!mounted) return;
+      // 密码变了的格子已经换新会话，等它们连上后再下发其余设置。
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (!mounted) return;
+    }
+    _batchSettings.value = result;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已下发设置到 ${targets.length} 台')),
+    );
+  }
+
   Future<void> _editPassword(WallPeerEntry peer) async {
     final controller = TextEditingController(text: peer.password);
     var obscure = true;
@@ -339,6 +501,10 @@ class _WallPageState extends State<WallPage> {
                 TextButton(
                   onPressed: _toggleSelectAll,
                   child: Text(_allSelected ? '取消全选' : '全选'),
+                ),
+                TextButton(
+                  onPressed: _selected.isEmpty ? null : _openBatchSettings,
+                  child: Text('设置 ${_selected.length}'),
                 ),
                 TextButton(
                   onPressed: _selected.isEmpty ? null : _deleteSelected,
@@ -428,12 +594,35 @@ class _WallPageState extends State<WallPage> {
               selectMode: _selectMode,
               selected: _selected.contains(peer.id),
               onToggleSelect: () => _toggleSelect(peer.id),
+              batchSettings: _batchSettings,
             );
           },
         );
       },
     );
   }
+}
+
+/// 批量设置：一次把「⋮」里的设置应用到多个选中格子。
+///
+/// 每个字段为 null 表示该项不动。
+class _BatchSettings {
+  final String? quality;
+  final int? display;
+  final int? width;
+  final int? height;
+  final String? password;
+
+  const _BatchSettings({
+    this.quality,
+    this.display,
+    this.width,
+    this.height,
+    this.password,
+  });
+
+  bool get isEmpty =>
+      quality == null && display == null && width == null && password == null;
 }
 
 class _WallTile extends StatefulWidget {
@@ -443,6 +632,7 @@ class _WallTile extends StatefulWidget {
   final bool selectMode;
   final bool selected;
   final VoidCallback onToggleSelect;
+  final ValueNotifier<_BatchSettings?> batchSettings;
 
   const _WallTile({
     super.key,
@@ -452,6 +642,7 @@ class _WallTile extends StatefulWidget {
     this.selectMode = false,
     this.selected = false,
     required this.onToggleSelect,
+    required this.batchSettings,
   });
 
   @override
@@ -475,7 +666,50 @@ class _WallTileState extends State<_WallTile> {
   @override
   void initState() {
     super.initState();
+    widget.batchSettings.addListener(_onBatchSettings);
     _connect();
+  }
+
+  /// 页面下发了批量设置：只有被选中的格子执行。
+  void _onBatchSettings() {
+    final settings = widget.batchSettings.value;
+    if (settings == null || !widget.selected) return;
+    unawaited(_applyBatchSettings(settings));
+  }
+
+  Future<void> _applyBatchSettings(_BatchSettings settings) async {
+    final ffi = _ffi;
+    if (ffi == null || _error != null) return;
+    try {
+      if (settings.quality != null) {
+        await bind.sessionSetImageQuality(
+          sessionId: ffi.sessionId,
+          value: settings.quality!,
+        );
+        if (mounted) setState(() => _quality = settings.quality!);
+      }
+      final display = settings.display;
+      if (display != null && display < _displayCount(ffi)) {
+        setState(() => _display = display);
+        await bind.sessionSwitchDisplay(
+          isDesktop: true,
+          sessionId: ffi.sessionId,
+          value: Int32List.fromList([display]),
+        );
+      }
+      final width = settings.width;
+      final height = settings.height;
+      if (width != null && height != null) {
+        var target = ffi.ffiModel.pi.currentDisplay;
+        if (target == kAllDisplayValue || target < 0) target = 0;
+        await bind.sessionChangeResolution(
+          sessionId: ffi.sessionId,
+          display: target,
+          width: width,
+          height: height,
+        );
+      }
+    } catch (_) {}
   }
 
   void _connect() {
@@ -593,6 +827,7 @@ class _WallTileState extends State<_WallTile> {
 
   @override
   void dispose() {
+    widget.batchSettings.removeListener(_onBatchSettings);
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
     _pendingFailTimer?.cancel();
