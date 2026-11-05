@@ -67,7 +67,8 @@ class _LocalSession {
       _LocalSession(
         (peerId != null && peerId.isNotEmpty) ? peerId : this.peerId,
         remoteSize ?? this.remoteSize,
-        fileDir: (fileDir != null && fileDir.isNotEmpty) ? fileDir : this.fileDir,
+        fileDir:
+            (fileDir != null && fileDir.isNotEmpty) ? fileDir : this.fileDir,
       );
 }
 
@@ -451,23 +452,21 @@ class SyncController extends ChangeNotifier {
   }) {
     if (!_enabled) return;
     if (items.isEmpty) return;
+    // 每台目标各建一个独立的传输任务 id：不能复用本地 job id，也不能多个文件共用一个，
+    // 否则对端的传输任务会互相覆盖。取一个远离本地小计数器的区间。
+    final baseActId =
+        0x40000000 + (DateTime.now().millisecondsSinceEpoch & 0x3fffffff);
     for (final member in _membersCache) {
       if (member.sessionId == sourceSessionId) continue;
       final dir = member.fileDir;
       if (dir.isEmpty) continue;
       final windows = dir.contains('\\') || RegExp(r'^[A-Za-z]:').hasMatch(dir);
-      for (final item in items) {
-        int actId;
-        try {
-          actId = int.parse(
-              bind.mainGetCommonSync(key: 'transfer-job-id').toString());
-        } catch (_) {
-          actId = DateTime.now().millisecondsSinceEpoch & 0x7fffffff;
-        }
+      for (var i = 0; i < items.length; i++) {
+        final item = items[i];
         try {
           bind.sessionSendFiles(
             sessionId: member.sessionId,
-            actId: actId,
+            actId: (baseActId + i) & 0x7fffffff,
             path: item.path,
             to: _joinPath(dir, item.name, windows),
             fileNum: 0,

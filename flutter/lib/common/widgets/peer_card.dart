@@ -7,7 +7,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/formatter/id_formatter.dart';
 import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/consts.dart';
-import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
+import 'package:flutter_hbb/desktop/widgets/material_mod_popup_menu.dart'
+    as mod_menu;
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
@@ -547,15 +548,15 @@ abstract class BasePeerCard extends StatelessWidget {
       proc: () => _addToWall(context),
       padding: menuPadding,
       dismissOnClicked: true,
-    ).build(context, config).expand((i) => i));
+    ).build(context, config));
     return entries;
   }
 
   Future<void> _addToWall(BuildContext context) async {
     final messenger = ScaffoldMessenger.maybeOf(context);
     final err = await WallStore.add(peer.id);
-    messenger?.showSnackBar(
-        SnackBar(content: Text(err ?? '已添加到画面墙：${peer.id}')));
+    messenger
+        ?.showSnackBar(SnackBar(content: Text(err ?? '已添加到画面墙：${peer.id}')));
   }
 
   @protected
@@ -1618,7 +1619,8 @@ Future<bool> checkSubscriptionExpired(BuildContext context) async {
     final api = '${await bind.mainGetApiServer()}/api/subscribe/mine';
     final headers = getHttpHeaders();
     // 使用忽略自签名证书的请求（api-server 为自签名证书，dart:io 默认校验会失败）
-    final resp = await ignore_cert_http.getHttpIgnoreCert(Uri.parse(api), headers,
+    final resp = await ignore_cert_http.getHttpIgnoreCert(
+        Uri.parse(api), headers,
         timeout: const Duration(seconds: 5));
     if (resp.statusCode == 200) {
       final body = jsonDecode(resp.body);
@@ -1645,7 +1647,8 @@ void _showRenewDialog(BuildContext context) {
     context: context,
     builder: (ctx) => AlertDialog(
       title: Text(translate('Subscription Expired')),
-      content: Text(translate('Service unavailable. Please check your subscription status and renew if needed.')),
+      content: Text(translate(
+          'Service unavailable. Please check your subscription status and renew if needed.')),
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(ctx),

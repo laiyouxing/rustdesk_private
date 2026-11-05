@@ -352,7 +352,11 @@ class _RemotePageState extends State<RemotePage>
     _ffi.imageModel.disposeImage();
     _ffi.cursorModel.disposeImages();
     _rawKeyFocusNode.dispose();
-    await SyncController.instance.unregisterSession(_ffi.sessionId);
+    // 只有真正关闭会话时才退出同步组；把标签页拖到新窗口（closeSession=false）
+    // 时新页面会重新登记，这里注销会打断同步。
+    if (closeSession) {
+      await SyncController.instance.unregisterSession(_ffi.sessionId);
+    }
     await _ffi.close(closeSession: closeSession);
     _timer?.cancel();
     _ffi.dialogManager.dismissAll();

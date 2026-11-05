@@ -2229,11 +2229,9 @@ class _SyncMenu extends StatelessWidget {
           icon: Icon(
             enabled ? Icons.sync : Icons.sync_disabled,
             color: enabled ? _ToolbarTheme.blueColor : Colors.white,
-            size: _ToolbarTheme.buttonSize,
           ),
-          tooltip: enabled
-              ? 'Disable input sync'
-              : 'Sync input to grouped sessions',
+          tooltip:
+              enabled ? 'Disable input sync' : 'Sync input to grouped sessions',
           onPressed: () => sync.toggle(),
           color: enabled ? _ToolbarTheme.blueColor : Colors.white,
           hoverColor: _ToolbarTheme.hoverBlueColor,

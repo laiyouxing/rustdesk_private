@@ -412,6 +412,7 @@ class _WallPageState extends State<WallPage> {
         ),
       ),
     );
+    passwordController.dispose();
     if (result == null || result.isEmpty || !mounted) return;
     final targets = Set<String>.of(_selected);
     // 改密码要落盘并重建格子（新密码对新连接才有效）。
@@ -427,7 +428,10 @@ class _WallPageState extends State<WallPage> {
     }
     _batchSettings.value = result;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已下发设置到 ${targets.length} 台')),
+      SnackBar(
+        content: Text('已下发设置到 ${targets.length} 台'
+            '（还没连上的格子会在连上后自动应用）'),
+      ),
     );
   }
 
@@ -485,6 +489,7 @@ class _WallPageState extends State<WallPage> {
         ),
       ),
     );
+    controller.dispose();
     if (result == null || !mounted) return;
     final saved = await WallStore.updatePassword(peer.id, result.trim());
     if (!saved) return;
@@ -663,10 +668,15 @@ class _WallTileState extends State<_WallTile> {
   /// 当前画面质量（low / balanced / best），用于菜单打勾。
   String _quality = '';
 
+  /// 还没连上时收到的批量设置，等这一格出画面后再下发。
+  _BatchSettings? _pendingBatch;
+
   @override
   void initState() {
     super.initState();
     widget.batchSettings.addListener(_onBatchSettings);
+    final pending = widget.batchSettings.value;
+    if (pending != null && widget.selected) _pendingBatch = pending;
     _connect();
   }
 
@@ -674,12 +684,17 @@ class _WallTileState extends State<_WallTile> {
   void _onBatchSettings() {
     final settings = widget.batchSettings.value;
     if (settings == null || !widget.selected) return;
-    unawaited(_applyBatchSettings(settings));
+    if (_gotFirstImage) {
+      unawaited(_applyBatchSettings(settings));
+    } else {
+      // 还没出画面：会话可能还没建好，先记下来，等第一帧到了再下发。
+      _pendingBatch = settings;
+    }
   }
 
   Future<void> _applyBatchSettings(_BatchSettings settings) async {
     final ffi = _ffi;
-    if (ffi == null || _error != null) return;
+    if (ffi == null || _error != null || !mounted) return;
     try {
       if (settings.quality != null) {
         await bind.sessionSetImageQuality(
@@ -690,6 +705,7 @@ class _WallTileState extends State<_WallTile> {
       }
       final display = settings.display;
       if (display != null && display < _displayCount(ffi)) {
+        if (!mounted) return;
         setState(() => _display = display);
         await bind.sessionSwitchDisplay(
           isDesktop: true,
@@ -741,6 +757,11 @@ class _WallTileState extends State<_WallTile> {
         // 之前报的错（首次尝试失败等）现在已被自动重连救回来，清掉。
         _error = null;
       });
+      // 会话真正连上后再读质量、下发还没应用的批量设置。
+      unawaited(_loadQuality());
+      final pending = _pendingBatch;
+      _pendingBatch = null;
+      if (pending != null) unawaited(_applyBatchSettings(pending));
     });
     ffi.start(
       peerId,

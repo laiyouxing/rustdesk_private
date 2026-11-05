@@ -367,8 +367,10 @@ class InputModel {
               !model.isViewCamera) {
             _sideButtonDownModels[mb] = model;
             // Fire-and-forget to avoid blocking the platform channel handler.
-            unawaited(model._sendMouseUnchecked(type, mb).catchError((Object e) {
-              debugPrint('[InputModel] failed to send side button $type for $mb: $e');
+            unawaited(
+                model._sendMouseUnchecked(type, mb).catchError((Object e) {
+              debugPrint(
+                  '[InputModel] failed to send side button $type for $mb: $e');
             }));
           }
         } else {
@@ -378,8 +380,10 @@ class InputModel {
           // release always goes through even if permissions changed.
           final model = _sideButtonDownModels.remove(mb);
           if (model != null) {
-            unawaited(model._sendMouseUnchecked(type, mb).catchError((Object e) {
-              debugPrint('[InputModel] failed to send side button $type for $mb: $e');
+            unawaited(
+                model._sendMouseUnchecked(type, mb).catchError((Object e) {
+              debugPrint(
+                  '[InputModel] failed to send side button $type for $mb: $e');
             }));
           }
         }
@@ -1036,30 +1040,32 @@ class InputModel {
         shift: shift,
         command: command);
     // 同步操作：把这次按键复制给其它已加入同步组的会话（未开启时为空操作）。
-    SyncController.instance.broadcastInputKey(
-      sourceSessionId: sessionId,
-      name: name,
-      down: down ?? false,
-      press: press ?? true,
-      alt: alt,
-      ctrl: ctrl,
-      shift: shift,
-      command: command,
-    );
-    _maybeBroadcastPaste(name, down ?? false);
+    //
+    // Ctrl/Cmd+V 特殊处理：只推本地剪贴板**内容**，不转发 V 键本身。
+    // 否则对端会先用它自己的剪贴板粘贴一次，再收到我们推过去的文字，出现两份。
+    if (_isPasteCombo(name, down ?? false)) {
+      SyncController.instance.broadcastClipboardPaste(sessionId);
+    } else {
+      SyncController.instance.broadcastInputKey(
+        sourceSessionId: sessionId,
+        name: name,
+        down: down ?? false,
+        press: press ?? true,
+        alt: alt,
+        ctrl: ctrl,
+        shift: shift,
+        command: command,
+      );
+    }
   }
 
-  /// 剪贴板同步：Ctrl/Cmd+V 时把本地剪贴板文本直接推到同组其它会话。
-  ///
-  /// 只转发按键是不够的——对端会粘贴它们自己的剪贴板，所以这里推的是内容。
-  void _maybeBroadcastPaste(String name, bool down) {
-    if (!down) return;
-    if (!(ctrl || command) || alt) return;
+  /// 是否是「带 Ctrl/Cmd 的 V」且同步已开启（这种按键不转发，改为推剪贴板内容）。
+  bool _isPasteCombo(String name, bool down) {
+    if (!down) return false;
+    if (!(ctrl || command) || alt) return false;
+    if (!SyncController.instance.enabled) return false;
     final upper = name.toUpperCase();
-    if (upper != 'VK_V' && upper != 'V' && upper != 'KEYV') return;
-    final sync = SyncController.instance;
-    if (!sync.enabled) return;
-    sync.broadcastClipboardPaste(sessionId);
+    return upper == 'VK_V' || upper == 'V' || upper == 'KEYV';
   }
 
   static Map<String, dynamic> getMouseEventMove() => {
@@ -1145,7 +1151,8 @@ class InputModel {
   /// Used for side button releases that must go through even if permissions
   /// changed after the matching down was sent.
   Future<void> _sendMouseUnchecked(String type, MouseButtons button) async {
-    final payload = json.encode(modify({'type': type, 'buttons': button.value}));
+    final payload =
+        json.encode(modify({'type': type, 'buttons': button.value}));
     await bind.sessionSendMouse(sessionId: sessionId, msg: payload);
     // 同步操作：按键事件与坐标无关，可以直接复制给同组的其它会话。
     SyncController.instance.broadcastMousePayload(sessionId, payload);
@@ -1687,7 +1694,8 @@ class InputModel {
     if (e is PointerScrollEvent) {
       final rawDx = e.scrollDelta.dx;
       final rawDy = e.scrollDelta.dy;
-      final dominantDelta = rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
+      final dominantDelta =
+          rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
       final isSmooth = dominantDelta < 1;
       final nowUs = DateTime.now().microsecondsSinceEpoch;
       final dtUs = _lastWheelTsUs == 0 ? 0 : nowUs - _lastWheelTsUs;
