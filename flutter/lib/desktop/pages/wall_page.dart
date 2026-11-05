@@ -1,25 +1,18 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/models/model.dart';
+import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/sync_controller.dart';
-import 'package:flutter_hbb/models/sync_store.dart';
+import 'package:flutter_hbb/models/wall_store.dart';
 import 'package:get/get.dart';
-
-/// 设备列表的存储键（JSON 数组：[{"id": "...", "password": "..."}]）。
-const String _kWallPeersKey = 'wall_peers';
 
 /// 单个画面墙格子的连接超时：超过这个时间还没有第一帧就提示需要密码/可重试。
 const Duration _kConnectTimeout = Duration(seconds: 12);
 
-class _WallPeer {
-  final String id;
-  final String password;
-
-  const _WallPeer(this.id, this.password);
-}
+typedef _WallPeer = WallPeerEntry;
 
 /// 画面墙：一屏网格预览多台设备的实时画面（只读，不接收输入）。
 ///
@@ -43,33 +36,7 @@ class _WallPageState extends State<WallPage> {
   }
 
   Future<void> _loadPeers() async {
-    final raw = await SyncStore().readString(_kWallPeersKey);
-    final peers = <_WallPeer>[];
-    if (raw != null && raw.trim().isNotEmpty) {
-      var parsed = false;
-      try {
-        final decoded = jsonDecode(raw);
-        if (decoded is List) {
-          parsed = true;
-          for (final item in decoded) {
-            if (item is! Map) continue;
-            final id = item['id'];
-            final password = item['password'];
-            if (id is String && id.trim().isNotEmpty) {
-              peers.add(_WallPeer(
-                  id.trim(), password is String ? password : ''));
-            }
-          }
-        }
-      } catch (_) {}
-      if (!parsed) {
-        // 兼容早期用逗号分隔的格式。
-        for (final part in raw.split(',')) {
-          final id = part.trim();
-          if (id.isNotEmpty) peers.add(_WallPeer(id, ''));
-        }
-      }
-    }
+    final peers = await WallStore.load();
     if (!mounted) return;
     setState(() {
       _peers
@@ -79,66 +46,129 @@ class _WallPageState extends State<WallPage> {
     });
   }
 
-  Future<void> _savePeers() async {
-    final data = <Map<String, dynamic>>[
-      for (final peer in _peers) {'id': peer.id, 'password': peer.password}
-    ];
-    await SyncStore().writeString(_kWallPeersKey, jsonEncode(data));
-  }
+  Future<void> _savePeers() => WallStore.save(_peers);
 
   Future<void> _addPeer() async {
     final idController = TextEditingController();
     final passwordController = TextEditingController();
+    String? error;
     final added = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('添加设备'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: idController,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: '设备 ID',
-                hintText: '对方主界面显示的 9 位 ID',
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('添加设备'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: idController,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: '设备 ID',
+                  hintText: '234 485 258（复制出来带空格也可以）',
+                  errorText: error,
+                  errorMaxLines: 2,
+                ),
               ),
+              TextField(
+                controller: passwordController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: '密码（可选）',
+                  hintText: '对方设了固定密码时填这里，免得一直转圈',
+                ),
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () {
+                    Navigator.of(dialogContext).pop(false);
+                    _pickFromAddressBook();
+                  },
+                  icon: const Icon(Icons.menu_book_outlined, size: 18),
+                  label: const Text('从地址簿选择'),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('取消'),
             ),
-            TextField(
-              controller: passwordController,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: '密码（可选）',
-                hintText: '对方设了固定密码时填这里，免得一直转圈',
-              ),
+            TextButton(
+              onPressed: () async {
+                final err = await WallStore.add(idController.text,
+                    password: passwordController.text);
+                if (!mounted) return;
+                if (err != null) {
+                  setDialogState(() => error = err);
+                  return;
+                }
+                Navigator.of(context).pop(true);
+              },
+              child: const Text('添加'),
             ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('添加'),
+      ),
+    );
+    idController.dispose();
+    passwordController.dispose();
+    if (added != true || !mounted) return;
+    await _loadPeers();
+  }
+
+  /// 从地址簿挑一台已有设备，省得手抄 ID。
+  Future<void> _pickFromAddressBook() async {
+    final peers = <Peer>[];
+    try {
+      peers.addAll(gFFI.abModel.currentAbPeers);
+    } catch (_) {}
+    if (!mounted) return;
+    if (peers.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('地址簿是空的，先手动填设备 ID')));
+      return;
+    }
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('从地址簿选择'),
+        children: [
+          SizedBox(
+            width: 420,
+            height: 380,
+            child: ListView(
+              children: [
+                for (final peer in peers)
+                  ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.desktop_windows_outlined,
+                        size: 20),
+                    title: Text(
+                      peer.alias.isNotEmpty ? peer.alias : peer.id,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(peer.id),
+                    onTap: () => Navigator.of(dialogContext).pop(peer.id),
+                  ),
+              ],
+            ),
           ),
         ],
       ),
     );
-    final id = idController.text.trim();
-    final password = passwordController.text;
-    idController.dispose();
-    passwordController.dispose();
-    if (added != true || id.isEmpty) return;
-    if (_peers.any((peer) => peer.id == id)) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('这台设备已经在墙上了')));
+    if (selected == null || !mounted) return;
+    final err = await WallStore.add(selected);
+    if (!mounted) return;
+    if (err != null) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
       return;
     }
-    setState(() => _peers.add(_WallPeer(id, password)));
-    await _savePeers();
+    await _loadPeers();
   }
 
   Future<void> _removePeer(String id) async {

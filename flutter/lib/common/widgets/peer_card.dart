@@ -13,6 +13,7 @@ import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
+import 'package:flutter_hbb/models/wall_store.dart';
 import 'package:get/get.dart';
 import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
@@ -530,16 +531,32 @@ abstract class BasePeerCard extends StatelessWidget {
   }
 
   Future<List<mod_menu.PopupMenuEntry<String>>> _buildPopupMenuEntry(
-          BuildContext context) async =>
-      (await _buildMenuItems(context))
-          .map((e) => e.build(
-              context,
-              const MenuConfig(
-                  commonColor: CustomPopupMenuTheme.commonColor,
-                  height: CustomPopupMenuTheme.height,
-                  dividerHeight: CustomPopupMenuTheme.dividerHeight)))
-          .expand((i) => i)
-          .toList();
+      BuildContext context) async {
+    const config = MenuConfig(
+        commonColor: CustomPopupMenuTheme.commonColor,
+        height: CustomPopupMenuTheme.height,
+        dividerHeight: CustomPopupMenuTheme.dividerHeight);
+    final entries = (await _buildMenuItems(context))
+        .map((e) => e.build(context, config))
+        .expand((i) => i)
+        .toList();
+    // 所有设备卡片统一提供「添加到画面墙」：地址簿/最近会话/分组里都能直接加，
+    // 不用先打开画面墙再手抄设备 ID。
+    entries.addAll(MenuEntryButton<String>(
+      childBuilder: (TextStyle? style) => Text('添加到画面墙', style: style),
+      proc: () => _addToWall(context),
+      padding: menuPadding,
+      dismissOnClicked: true,
+    ).build(context, config).expand((i) => i));
+    return entries;
+  }
+
+  Future<void> _addToWall(BuildContext context) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final err = await WallStore.add(peer.id);
+    messenger?.showSnackBar(
+        SnackBar(content: Text(err ?? '已添加到画面墙：${peer.id}')));
+  }
 
   @protected
   Future<List<MenuEntryBase<String>>> _buildMenuItems(BuildContext context);
