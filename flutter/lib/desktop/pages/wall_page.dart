@@ -239,8 +239,14 @@ class _WallPageState extends State<WallPage>
         }
       }
     } catch (_) {}
-    // 别名在前，其次按 ID，方便在长列表里找。
+    // 画面墙在独立进程里，在线状态不会被周期刷新，这里主动查一次再弹框。
+    try {
+      await bind.queryOnlines(ids: items.map((e) => e.peer.id).toList());
+      await Future.delayed(const Duration(milliseconds: 700));
+    } catch (_) {}
+    // 别名在前，其次按 ID，方便在长列表里找；在线的排前面。
     items.sort((a, b) {
+      if (a.peer.online != b.peer.online) return a.peer.online ? -1 : 1;
       final byAlias =
           a.peer.alias.toLowerCase().compareTo(b.peer.alias.toLowerCase());
       return byAlias != 0 ? byAlias : a.peer.id.compareTo(b.peer.id);
@@ -254,7 +260,8 @@ class _WallPageState extends State<WallPage>
     final selected = await showDialog<String>(
       context: context,
       builder: (dialogContext) => SimpleDialog(
-        title: const Text('从地址簿选择'),
+        title: Text(
+            '从地址簿选择（在线 ${items.where((i) => i.peer.online).length}/${items.length}）'),
         children: [
           SizedBox(
             width: 420,
@@ -278,10 +285,24 @@ class _WallPageState extends State<WallPage>
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    trailing: item.shared
-                        ? const Text('共享',
-                            style: TextStyle(fontSize: 11, color: Colors.grey))
-                        : null,
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (item.shared)
+                          const Text('共享',
+                              style:
+                                  TextStyle(fontSize: 11, color: Colors.grey)),
+                        const SizedBox(width: 8),
+                        Tooltip(
+                          message: item.peer.online ? '在线' : '离线',
+                          child: CircleAvatar(
+                            radius: 4,
+                            backgroundColor:
+                                item.peer.online ? Colors.green : Colors.grey,
+                          ),
+                        ),
+                      ],
+                    ),
                     onTap: () =>
                         Navigator.of(dialogContext).pop(item.peer.id),
                   ),
