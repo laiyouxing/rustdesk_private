@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -12,6 +13,7 @@ import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/sync_controller.dart';
 import 'package:flutter_hbb/models/wall_store.dart';
+import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 
@@ -33,7 +35,7 @@ class WallPage extends StatefulWidget {
   State<WallPage> createState() => _WallPageState();
 }
 
-class _WallPageState extends State<WallPage> {
+class _WallPageState extends State<WallPage> with MultiWindowListener {
   final SyncController _sync = SyncController.instance;
   final List<_WallPeer> _peers = <_WallPeer>[];
   bool _loaded = false;
@@ -49,11 +51,31 @@ class _WallPageState extends State<WallPage> {
   @override
   void initState() {
     super.initState();
+    // 多窗口的标题栏 × 会被 preventClose 拦住，必须自己监听 close 事件再关窗，
+    // 否则点 × 没有任何反应（主窗口 / 远程桌面窗口都是这么处理的）。
+    DesktopMultiWindow.addListener(this);
     _loadPeers();
   }
 
   @override
+  void onWindowClose() {
+    _sync.clearWallGroup();
+    unawaited(_closeWindow());
+  }
+
+  Future<void> _closeWindow() async {
+    try {
+      final controller = WindowController.fromWindowId(kWindowId!);
+      await controller.setPreventClose(false);
+      await controller.close();
+    } catch (e) {
+      debugPrint('close wall window failed: $e');
+    }
+  }
+
+  @override
   void dispose() {
+    DesktopMultiWindow.removeListener(this);
     _sync.clearWallGroup();
     _batchSettings.dispose();
     super.dispose();
