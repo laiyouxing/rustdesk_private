@@ -1548,16 +1548,21 @@ class _WallTileState extends State<_WallTile> {
   /// 输入层必须放在按远程分辨率撑开的 `SizedBox` 内部，指针坐标才等于远程像素坐标。
   Widget _buildInputRegion(FFI ffi, Widget child) {
     if (!widget.groupControl || !widget.isMaster) return child;
-    return RawKeyFocusScope(
-      focusNode: _keyFocusNode,
-      onFocusChange: (focused) => ffi.inputModel.enterOrLeave(focused),
-      inputModel: ffi.inputModel,
-      child: RawTouchGestureDetectorRegion(
-        ffi: ffi,
-        isCamera: false,
-        child: RawPointerMouseRegion(
-          inputModel: ffi.inputModel,
-          child: child,
+    // 点主控格就把键盘焦点要回来：窗口刚激活、或用户先点了别的格子时，
+    // 没有这一步按键会一直进不到主控会话。
+    return Listener(
+      onPointerDown: (_) => _keyFocusNode.requestFocus(),
+      child: RawKeyFocusScope(
+        focusNode: _keyFocusNode,
+        onFocusChange: (focused) => ffi.inputModel.enterOrLeave(focused),
+        inputModel: ffi.inputModel,
+        child: RawTouchGestureDetectorRegion(
+          ffi: ffi,
+          isCamera: false,
+          child: RawPointerMouseRegion(
+            inputModel: ffi.inputModel,
+            child: child,
+          ),
         ),
       ),
     );
