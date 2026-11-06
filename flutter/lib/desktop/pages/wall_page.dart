@@ -738,12 +738,6 @@ class _WallPageState extends State<WallPage>
                   onPressed: _addPeer,
                   icon: const Icon(Icons.add),
                 ),
-                // 就近的关闭入口：即使系统标题栏的 × 被拦截/不可用，也能关掉画面墙。
-                IconButton(
-                  tooltip: '关闭画面墙',
-                  onPressed: () => _shutdownAndClose(),
-                  icon: const Icon(Icons.highlight_off),
-                ),
               ],
       ),
       body: !_loaded
