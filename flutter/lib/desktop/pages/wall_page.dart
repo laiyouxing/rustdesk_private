@@ -72,7 +72,10 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     // 才会把 onEvent 分发给 MultiWindowListener（其他子窗口的标签页里都会设）。
     DesktopMultiWindow.addListener(this);
     rustDeskWinManager.setMethodHandler((call, fromWindowId) async {});
-    unawaited(_ensureAddressBookLoaded());
+    // 地址簿里带着设备别名，加载完再刷一次列表，格子上才是「别名：ID」。
+    unawaited(_ensureAddressBookLoaded().then((_) {
+      if (mounted) unawaited(_loadPeers());
+    }));
     _loadPeers();
   }
 
@@ -148,7 +151,14 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   }
 
   Future<void> _loadPeers() async {
-    final peers = await WallStore.load();
+    var peers = await WallStore.load();
+    // 地址簿是最新的别名来源：墙上存的别名可能过期，进来时顺手刷新。
+    final aliases = _aliasesFromAddressBook();
+    if (aliases.isNotEmpty) {
+      if (await WallStore.syncAliases(aliases)) {
+        peers = await WallStore.load();
+      }
+    }
     if (!mounted) return;
     setState(() {
       _peers
@@ -156,6 +166,20 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
         ..addAll(peers);
       _loaded = true;
     });
+  }
+
+  /// 从所有地址簿（含别人共享的）收集「设备 ID → 别名」。
+  Map<String, String> _aliasesFromAddressBook() {
+    final aliases = <String, String>{};
+    try {
+      for (final ab in gFFI.abModel.addressbooks.values) {
+        for (final peer in ab.peers) {
+          if (peer.id.isEmpty || peer.alias.isEmpty) continue;
+          aliases[peer.id] = peer.alias;
+        }
+      }
+    } catch (_) {}
+    return aliases;
   }
 
   Future<void> _savePeers() => WallStore.save(_peers);
@@ -337,7 +361,11 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
       ),
     );
     if (selected == null || !mounted) return;
-    final err = await WallStore.add(selected);
+    // 从地址簿选的时候顺便把别名记下来，格子上就能显示「别名：ID」。
+    final err = await WallStore.add(
+      selected,
+      alias: _aliasesFromAddressBook()[selected] ?? '',
+    );
     if (!mounted) return;
     if (err != null) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
@@ -1044,6 +1072,12 @@ class _WallTileState extends State<_WallTile> {
   /// 主控格用它接管键盘焦点。
   final FocusNode _keyFocusNode = FocusNode(debugLabel: 'wall-master');
 
+  /// 格子左上角的标题：有别名就显示「别名：ID」，没有就只显示 ID。
+  String get _tileTitle {
+    final alias = widget.peer.alias;
+    return alias.isEmpty ? widget.peer.id : '$alias：${widget.peer.id}';
+  }
+
   /// 把会话 id 与当前预览屏的分辨率回报给墙，群控换算鼠标坐标要用。
   ///
   /// 显示器信息还没到时不要回报：`_displayWidth/_displayHeight` 的 16×10 只是
@@ -1346,7 +1380,7 @@ class _WallTileState extends State<_WallTile> {
                       ),
                     ),
                   Text(
-                    widget.peer.id,
+                    _tileTitle,
                     style: const TextStyle(color: Colors.white, fontSize: 11),
                   ),
                 ],

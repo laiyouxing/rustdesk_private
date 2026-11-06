@@ -554,7 +554,7 @@ abstract class BasePeerCard extends StatelessWidget {
 
   Future<void> _addToWall(BuildContext context) async {
     final messenger = ScaffoldMessenger.maybeOf(context);
-    final err = await WallStore.add(peer.id);
+    final err = await WallStore.add(peer.id, alias: peer.alias);
     messenger
         ?.showSnackBar(SnackBar(content: Text(err ?? '已添加到画面墙：${peer.id}')));
   }
