@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -17,6 +18,7 @@ import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 import 'package:uuid/uuid.dart';
+import 'package:window_manager/window_manager.dart';
 
 /// 单个画面墙格子的连接超时：超过这个时间还没有第一帧就提示需要密码/可重试。
 const Duration _kConnectTimeout = Duration(seconds: 12);
@@ -36,7 +38,8 @@ class WallPage extends StatefulWidget {
   State<WallPage> createState() => _WallPageState();
 }
 
-class _WallPageState extends State<WallPage> with MultiWindowListener {
+class _WallPageState extends State<WallPage>
+    with MultiWindowListener, WindowListener {
   final SyncController _sync = SyncController.instance;
   final List<_WallPeer> _peers = <_WallPeer>[];
   bool _loaded = false;
@@ -52,19 +55,32 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   @override
   void initState() {
     super.initState();
-    // 多窗口的标题栏 × 会被 preventClose 拦住，必须自己监听 close 事件再关窗，
-    // 否则点 × 没有任何反应（主窗口 / 远程桌面窗口都是这么处理的）。
+    // 多窗口的标题栏 × 会被 preventClose 拦住，必须自己监听 close 事件再关窗。
+    // 其他窗口（带标签栏的）同时注册 desktop_multi_window 和 window_manager 两个监听，
+    // 真正收到系统 × 的是 window_manager 的那个，所以这里两个都注册。
     DesktopMultiWindow.addListener(this);
+    windowManager.addListener(this);
     _loadPeers();
   }
 
   @override
   void onWindowClose() {
-    _sync.clearWallGroup();
-    unawaited(_closeWindow());
+    unawaited(_shutdownAndClose());
   }
 
-  Future<void> _closeWindow() async {
+  /// 关窗：先清群控状态，再关掉多窗口；实在关不掉就退出进程。
+  ///
+  /// 画面墙开在一个独立进程里，进程退出会释放全部会话，不会在后台继续拉流。
+  Future<void> _shutdownAndClose() async {
+    try {
+      _sync.clearWallGroup();
+    } catch (_) {}
+    try {
+      if (kWindowId != null) {
+        await rustDeskWinManager
+            .call(WindowType.Main, kWindowEventHide, {'id': kWindowId!});
+      }
+    } catch (_) {}
     try {
       final controller = WindowController.fromWindowId(kWindowId!);
       await controller.setPreventClose(false);
@@ -72,11 +88,15 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     } catch (e) {
       debugPrint('close wall window failed: $e');
     }
+    // 兜底：窗口没被关掉就直接退出，避免画面墙在后台继续占用带宽。
+    await Future.delayed(const Duration(milliseconds: 400));
+    exit(0);
   }
 
   @override
   void dispose() {
     DesktopMultiWindow.removeListener(this);
+    windowManager.removeListener(this);
     _sync.clearWallGroup();
     _batchSettings.dispose();
     super.dispose();
@@ -692,6 +712,12 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
                   tooltip: '添加设备',
                   onPressed: _addPeer,
                   icon: const Icon(Icons.add),
+                ),
+                // 就近的关闭入口：即使系统标题栏的 × 被拦截/不可用，也能关掉画面墙。
+                IconButton(
+                  tooltip: '关闭画面墙',
+                  onPressed: () => _shutdownAndClose(),
+                  icon: const Icon(Icons.highlight_off),
                 ),
               ],
       ),
