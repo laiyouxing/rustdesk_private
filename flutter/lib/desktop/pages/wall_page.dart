@@ -16,6 +16,7 @@ import 'package:flutter_hbb/models/wall_store.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
+import 'package:uuid/uuid.dart';
 
 /// 单个画面墙格子的连接超时：超过这个时间还没有第一帧就提示需要密码/可重试。
 const Duration _kConnectTimeout = Duration(seconds: 12);
