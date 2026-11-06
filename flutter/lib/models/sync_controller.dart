@@ -295,6 +295,48 @@ class SyncController extends ChangeNotifier {
     await _refreshMembers();
   }
 
+  // ---- 画面墙群控 ----
+  //
+  // 画面墙的格子是只读预览，不参与全局同步成员（不写成员文件）。群控由墙自己
+  // 指定「主控格 + 被控格」，目标集合放在这里，与全局同步开关互相独立。
+
+  final List<SyncMember> _wallTargets = <SyncMember>[];
+  bool _wallGroupEnabled = false;
+
+  bool get wallGroupEnabled => _wallGroupEnabled;
+
+  /// 设置画面墙群控的目标；[enabled] 为 false 或目标为空时等于关闭。
+  void setWallGroup({
+    required bool enabled,
+    required List<SyncMember> targets,
+  }) {
+    _wallGroupEnabled = enabled && targets.isNotEmpty;
+    _wallTargets
+      ..clear()
+      ..addAll(targets);
+    notifyListeners();
+  }
+
+  void clearWallGroup() =>
+      setWallGroup(enabled: false, targets: const <SyncMember>[]);
+
+  /// 本次广播的目标：全局同步成员 + 画面墙群控目标，去重并排除源会话。
+  List<SyncMember> _resolveTargets(UuidValue sourceSessionId) {
+    final byId = <String, SyncMember>{};
+    if (_enabled) {
+      for (final member in _membersCache) {
+        byId[member.sessionId.toString()] = member;
+      }
+    }
+    if (_wallGroupEnabled) {
+      for (final member in _wallTargets) {
+        byId[member.sessionId.toString()] = member;
+      }
+    }
+    byId.remove(sourceSessionId.toString());
+    return byId.values.toList(growable: false);
+  }
+
   /// 键盘：把一次按键复制给同组的其它会话。
   void broadcastInputKey({
     required UuidValue sourceSessionId,
@@ -306,9 +348,9 @@ class SyncController extends ChangeNotifier {
     required bool shift,
     required bool command,
   }) {
-    if (!_enabled) return;
-    for (final member in _membersCache) {
-      if (member.sessionId == sourceSessionId) continue;
+    final targets = _resolveTargets(sourceSessionId);
+    if (targets.isEmpty) return;
+    for (final member in targets) {
       try {
         bind.sessionInputKey(
           sessionId: member.sessionId,
@@ -329,12 +371,11 @@ class SyncController extends ChangeNotifier {
   /// 相对鼠标位移（`move_relative`）与分辨率无关，按键/滚轮与坐标无关，都可以直接复用。
   /// 绝对坐标（`x`/`y` 且无 `type`）走 [broadcastAbsoluteMove]，不要传到这里。
   void broadcastMousePayload(UuidValue sourceSessionId, String payload) {
-    if (!_enabled) return;
     // 相对鼠标模式的开关标记只对本地有效，不要转发。
     if (payload.contains('relative_mouse_mode')) return;
     if (payload.contains('"x"') || payload.contains('"y"')) return;
-    for (final member in _membersCache) {
-      if (member.sessionId == sourceSessionId) continue;
+    final targets = _resolveTargets(sourceSessionId);
+    for (final member in targets) {
       try {
         bind.sessionSendMouse(sessionId: member.sessionId, msg: payload);
       } catch (_) {}
@@ -351,13 +392,12 @@ class SyncController extends ChangeNotifier {
     required int x,
     required int y,
   }) {
-    if (!_enabled) return;
+    if (!_enabled && !_wallGroupEnabled) return;
     if (srcWidth <= 0 || srcHeight <= 0) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastAbsMoveMs < absMoveMinGapMs) return;
     _lastAbsMoveMs = now;
-    for (final member in _membersCache) {
-      if (member.sessionId == sourceSessionId) continue;
+    for (final member in _resolveTargets(sourceSessionId)) {
       if (member.width <= 0 || member.height <= 0) continue;
       final targetX = (x * member.width / srcWidth).round();
       final targetY = (y * member.height / srcHeight).round();
@@ -399,9 +439,9 @@ class SyncController extends ChangeNotifier {
     required int sourceTerminalId,
     required String data,
   }) {
-    if (!_enabled) return;
+    if (!_enabled && !_wallGroupEnabled) return;
     if (data.isEmpty) return;
-    for (final member in _membersCache) {
+    for (final member in _resolveTargets(sourceSessionId)) {
       for (final terminalId in member.terminalIds) {
         if (member.sessionId == sourceSessionId &&
             terminalId == sourceTerminalId) {
@@ -424,7 +464,7 @@ class SyncController extends ChangeNotifier {
   /// 因为 Dart 侧没有设置对端剪贴板的 FFI，而各会话自己的剪贴板通道只同步
   /// 本地剪贴板、不会把文本搬到别的会话。
   Future<void> broadcastClipboardPaste(UuidValue sourceSessionId) async {
-    if (!_enabled) return;
+    if (!_enabled && !_wallGroupEnabled) return;
     String? text;
     try {
       final data = await Clipboard.getData(Clipboard.kTextPlain);
@@ -433,8 +473,7 @@ class SyncController extends ChangeNotifier {
       return;
     }
     if (text == null || text.isEmpty) return;
-    for (final member in _membersCache) {
-      if (member.sessionId == sourceSessionId) continue;
+    for (final member in _resolveTargets(sourceSessionId)) {
       try {
         bind.sessionInputString(sessionId: member.sessionId, value: text);
       } catch (_) {}
@@ -450,14 +489,13 @@ class SyncController extends ChangeNotifier {
     required List<SyncFileItem> items,
     required bool includeHidden,
   }) {
-    if (!_enabled) return;
+    if (!_enabled && !_wallGroupEnabled) return;
     if (items.isEmpty) return;
     // 每台目标各建一个独立的传输任务 id：不能复用本地 job id，也不能多个文件共用一个，
     // 否则对端的传输任务会互相覆盖。取一个远离本地小计数器的区间。
     final baseActId =
         0x40000000 + (DateTime.now().millisecondsSinceEpoch & 0x3fffffff);
-    for (final member in _membersCache) {
-      if (member.sessionId == sourceSessionId) continue;
+    for (final member in _resolveTargets(sourceSessionId)) {
       final dir = member.fileDir;
       if (dir.isEmpty) continue;
       final windows = dir.contains('\\') || RegExp(r'^[A-Za-z]:').hasMatch(dir);

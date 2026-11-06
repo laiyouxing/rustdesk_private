@@ -1063,7 +1063,10 @@ class InputModel {
   bool _isPasteCombo(String name, bool down) {
     if (!down) return false;
     if (!(ctrl || command) || alt) return false;
-    if (!SyncController.instance.enabled) return false;
+    if (!SyncController.instance.enabled &&
+        !SyncController.instance.wallGroupEnabled) {
+      return false;
+    }
     final upper = name.toUpperCase();
     return upper == 'VK_V' || upper == 'V' || upper == 'KEYV';
   }
@@ -1210,7 +1213,7 @@ class InputModel {
   /// 只在选中单个显示器时广播（多屏拼接的虚拟桌面坐标系不同，没法简单按比例换算）。
   void _broadcastAbsoluteMove(int x, int y) {
     final sync = SyncController.instance;
-    if (!sync.enabled) return;
+    if (!sync.enabled && !sync.wallGroupEnabled) return;
     try {
       final pi = parent.target?.ffiModel.pi;
       if (pi == null) return;

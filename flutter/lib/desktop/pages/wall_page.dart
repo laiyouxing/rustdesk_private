@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
+import 'package:flutter_hbb/common/widgets/remote_input.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -53,6 +54,7 @@ class _WallPageState extends State<WallPage> {
 
   @override
   void dispose() {
+    _sync.clearWallGroup();
     _batchSettings.dispose();
     super.dispose();
   }
@@ -215,6 +217,63 @@ class _WallPageState extends State<WallPage> {
   bool get _allSelected =>
       _peers.isNotEmpty && _selected.length == _peers.length;
 
+  // ---- 画面墙群控 ----
+  //
+  // 墙上先勾选若干格作为「被控」，再把其中一格点成「主控」；主控格接管键鼠，
+  // 输入会复制给其它被控格。目标集合交给 SyncController，与全局同步开关无关。
+
+  bool _groupControl = false;
+  String? _masterId;
+  final Map<String, SyncMember> _tileSessions = <String, SyncMember>{};
+
+  void _enterGroupControl() {
+    setState(() {
+      _groupControl = true;
+      _selectMode = true;
+      _masterId = null;
+      _selected.clear();
+    });
+    _syncWallTargets();
+  }
+
+  void _exitGroupControl() {
+    _sync.clearWallGroup();
+    setState(() {
+      _groupControl = false;
+      _masterId = null;
+      _selectMode = false;
+      _selected.clear();
+    });
+  }
+
+  void _setMaster(String peerId) {
+    setState(() {
+      _masterId = peerId;
+      _selected.add(peerId);
+    });
+    _syncWallTargets();
+  }
+
+  /// 某一格连上后回报会话 id 与远程分辨率，群控要用它做坐标换算。
+  void _onTileSession(String peerId, UuidValue sessionId, int width, int height) {
+    _tileSessions[peerId] = SyncMember(sessionId, width: width, height: height);
+    _syncWallTargets();
+  }
+
+  /// 把当前勾选的格子（排除主控）同步给 SyncController。
+  void _syncWallTargets() {
+    final targets = <SyncMember>[];
+    for (final id in _selected) {
+      if (id == _masterId) continue;
+      final member = _tileSessions[id];
+      if (member != null) targets.add(member);
+    }
+    _sync.setWallGroup(
+      enabled: _groupControl && _masterId != null,
+      targets: targets,
+    );
+  }
+
   void _enterSelectMode() {
     setState(() {
       _selectMode = true;
@@ -223,8 +282,11 @@ class _WallPageState extends State<WallPage> {
   }
 
   void _exitSelectMode() {
+    _sync.clearWallGroup();
     setState(() {
       _selectMode = false;
+      _groupControl = false;
+      _masterId = null;
       _selected.clear();
     });
   }
@@ -232,19 +294,25 @@ class _WallPageState extends State<WallPage> {
   void _toggleSelect(String id) {
     setState(() {
       if (!_selected.remove(id)) _selected.add(id);
+      if (_masterId != null && !_selected.contains(_masterId)) {
+        _masterId = null;
+      }
     });
+    _syncWallTargets();
   }
 
   void _toggleSelectAll() {
     setState(() {
       if (_allSelected) {
         _selected.clear();
+        _masterId = null;
       } else {
         _selected
           ..clear()
           ..addAll(_peers.map((peer) => peer.id));
       }
     });
+    _syncWallTargets();
   }
 
   /// 批量从画面墙移除。只影响画面墙，不会去动设备本身。
@@ -507,6 +575,21 @@ class _WallPageState extends State<WallPage> {
                   onPressed: _toggleSelectAll,
                   child: Text(_allSelected ? '取消全选' : '全选'),
                 ),
+                if (_groupControl)
+                  TextButton(
+                    onPressed: _exitGroupControl,
+                    child: Text(
+                      _masterId == null
+                          ? '群控：点格子选被控，长按设主控'
+                          : '结束群控（主控 ${_masterId!}）',
+                      style: const TextStyle(color: Colors.orange),
+                    ),
+                  )
+                else
+                  TextButton(
+                    onPressed: _enterGroupControl,
+                    child: const Text('群控'),
+                  ),
                 TextButton(
                   onPressed: _selected.isEmpty ? null : _openBatchSettings,
                   child: Text('设置 ${_selected.length}'),
@@ -516,7 +599,7 @@ class _WallPageState extends State<WallPage> {
                   child: Text('删除 ${_selected.length}'),
                 ),
                 IconButton(
-                  tooltip: '退出多选',
+                  tooltip: '退出',
                   onPressed: _exitSelectMode,
                   icon: const Icon(Icons.close),
                 ),
@@ -600,6 +683,10 @@ class _WallPageState extends State<WallPage> {
               selected: _selected.contains(peer.id),
               onToggleSelect: () => _toggleSelect(peer.id),
               batchSettings: _batchSettings,
+              groupControl: _groupControl,
+              isMaster: _masterId == peer.id,
+              onMakeMaster: () => _setMaster(peer.id),
+              onSession: _onTileSession,
             );
           },
         );
@@ -639,6 +726,15 @@ class _WallTile extends StatefulWidget {
   final VoidCallback onToggleSelect;
   final ValueNotifier<_BatchSettings?> batchSettings;
 
+  /// 群控模式：非主控格是「被控」（收输入），主控格接管键鼠。
+  final bool groupControl;
+  final bool isMaster;
+  final VoidCallback onMakeMaster;
+
+  /// 这一格连上后把 sessionId 与远程分辨率回报给墙（群控换算坐标要用）。
+  final void Function(String peerId, UuidValue sessionId, int width, int height)
+      onSession;
+
   const _WallTile({
     super.key,
     required this.peer,
@@ -648,6 +744,10 @@ class _WallTile extends StatefulWidget {
     this.selected = false,
     required this.onToggleSelect,
     required this.batchSettings,
+    this.groupControl = false,
+    this.isMaster = false,
+    required this.onMakeMaster,
+    required this.onSession,
   });
 
   @override
@@ -671,6 +771,21 @@ class _WallTileState extends State<_WallTile> {
   /// 还没连上时收到的批量设置，等这一格出画面后再下发。
   _BatchSettings? _pendingBatch;
 
+  /// 主控格用它接管键盘焦点。
+  final FocusNode _keyFocusNode = FocusNode(debugLabel: 'wall-master');
+
+  /// 把会话 id 与当前预览屏的分辨率回报给墙，群控换算鼠标坐标要用。
+  void _reportSession() {
+    final ffi = _ffi;
+    if (ffi == null) return;
+    widget.onSession(
+      widget.peer.id,
+      ffi.sessionId,
+      _displayWidth(ffi),
+      _displayHeight(ffi),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -678,6 +793,17 @@ class _WallTileState extends State<_WallTile> {
     final pending = widget.batchSettings.value;
     if (pending != null && widget.selected) _pendingBatch = pending;
     _connect();
+  }
+
+  @override
+  void didUpdateWidget(covariant _WallTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 刚被设成主控：把键盘焦点拿过来，否则按键进不了远程会话。
+    if (widget.groupControl && widget.isMaster && !oldWidget.isMaster) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _keyFocusNode.requestFocus();
+      });
+    }
   }
 
   /// 页面下发了批量设置：只有被选中的格子执行。
@@ -758,6 +884,7 @@ class _WallTileState extends State<_WallTile> {
         _error = null;
       });
       // 会话真正连上后再读质量、下发还没应用的批量设置。
+      _reportSession();
       unawaited(_loadQuality());
       final pending = _pendingBatch;
       _pendingBatch = null;
@@ -849,6 +976,7 @@ class _WallTileState extends State<_WallTile> {
   @override
   void dispose() {
     widget.batchSettings.removeListener(_onBatchSettings);
+    _keyFocusNode.dispose();
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
     _pendingFailTimer?.cancel();
@@ -906,6 +1034,23 @@ class _WallTileState extends State<_WallTile> {
               ),
             ),
           ),
+          if (widget.groupControl)
+            Positioned(
+              left: 6,
+              bottom: 6,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: widget.isMaster ? Colors.orange : Colors.black54,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  widget.isMaster ? '主控' : '被控',
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                ),
+              ),
+            ),
           if (!widget.selectMode)
             Positioned(
               right: 0,
@@ -928,6 +1073,16 @@ class _WallTileState extends State<_WallTile> {
       ),
     );
     if (!widget.selectMode) return card;
+    if (widget.groupControl) {
+      // 群控：点一下选中/取消被控；长按把这格设成主控。
+      if (widget.isMaster) return card;
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onToggleSelect,
+        onLongPress: widget.onMakeMaster,
+        child: card,
+      );
+    }
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: widget.onToggleSelect,
@@ -1050,6 +1205,7 @@ class _WallTileState extends State<_WallTile> {
     if (value.startsWith('display:')) {
       final index = int.tryParse(value.substring('display:'.length)) ?? 0;
       setState(() => _display = index);
+      _reportSession();
       try {
         await bind.sessionSwitchDisplay(
           isDesktop: true,
@@ -1078,6 +1234,28 @@ class _WallTileState extends State<_WallTile> {
       } catch (_) {}
       return;
     }
+  }
+
+  /// 主控格：给画面套上输入层，键鼠事件走本格会话的 `InputModel`。
+  ///
+  /// `InputModel` 在发按键/鼠标时会把事件复制给同步组成员，而画面墙群控已经把
+  /// 被控格登记成成员，所以这里不需要再单独写一遍广播逻辑。
+  /// 输入层必须放在按远程分辨率撑开的 `SizedBox` 内部，指针坐标才等于远程像素坐标。
+  Widget _buildInputRegion(FFI ffi, Widget child) {
+    if (!widget.groupControl || !widget.isMaster) return child;
+    return RawKeyFocusScope(
+      focusNode: _keyFocusNode,
+      onFocusChange: (focused) => ffi.inputModel.enterOrLeave(focused),
+      inputModel: ffi.inputModel,
+      child: RawTouchGestureDetectorRegion(
+        ffi: ffi,
+        isCamera: false,
+        child: RawPointerMouseRegion(
+          inputModel: ffi.inputModel,
+          child: child,
+        ),
+      ),
+    );
   }
 
   Widget _buildContent() {
@@ -1114,21 +1292,24 @@ class _WallTileState extends State<_WallTile> {
         child: SizedBox(
           width: _displayWidth(ffi).toDouble(),
           height: _displayHeight(ffi).toDouble(),
-          child: Obx(() {
-            final textureId = ffi.textureModel
-                .getTextureId(_displayIndex(ffi, _displayCount(ffi)))
-                .value;
-            if (textureId == 0) {
-              return const Center(
-                child: SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              );
-            }
-            return Texture(textureId: textureId);
-          }),
+          child: _buildInputRegion(
+            ffi,
+            Obx(() {
+              final textureId = ffi.textureModel
+                  .getTextureId(_displayIndex(ffi, _displayCount(ffi)))
+                  .value;
+              if (textureId == 0) {
+                return const Center(
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                );
+              }
+              return Texture(textureId: textureId);
+            }),
+          ),
         ),
       ),
     );
