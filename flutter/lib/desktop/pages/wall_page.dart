@@ -9,6 +9,7 @@ import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/remote_input.dart';
+import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -60,7 +61,28 @@ class _WallPageState extends State<WallPage>
     // 真正收到系统 × 的是 window_manager 的那个，所以这里两个都注册。
     DesktopMultiWindow.addListener(this);
     windowManager.addListener(this);
+    unawaited(_ensureAddressBookLoaded());
     _loadPeers();
+  }
+
+  /// 画面墙跑在独立进程里，地址簿本来只在主窗口初始化，这里补一次。
+  ///
+  /// 先读本地缓存（主窗口同步过的地址簿都在里面）；缓存也没有、且已登录时再拉一次服务端。
+  Future<void> _ensureAddressBookLoaded() async {
+    try {
+      if (gFFI.abModel.addressbooks.isEmpty) {
+        await gFFI.abModel.loadCache();
+      }
+      if (gFFI.abModel.addressbooks.isEmpty) {
+        gFFI.userModel.refreshCurrentUser();
+        if (gFFI.userModel.isLogin) {
+          await gFFI.abModel
+              .pullAb(force: ForcePullAb.listAndCurrent, quiet: true);
+        }
+      }
+    } catch (e) {
+      debugPrint('wall: load address book failed: $e');
+    }
   }
 
   @override
@@ -202,6 +224,9 @@ class _WallPageState extends State<WallPage>
   /// 不能只看 `currentAbPeers`：那只是当前选中的那一本地址簿。
   /// 「别人共享给我的设备」在另外的共享地址簿里，所以这里遍历全部地址簿并去重。
   Future<void> _pickFromAddressBook() async {
+    // 画面墙是独立进程，地址簿可能还没加载过，点之前再补一次。
+    await _ensureAddressBookLoaded();
+    if (!mounted) return;
     // 记录每台设备来自哪本地址簿，「共享」单独标一下，方便确认选的是别人分享的那台。
     final items = <({Peer peer, String book, bool shared})>[];
     try {
