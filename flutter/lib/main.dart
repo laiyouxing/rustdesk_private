@@ -103,9 +103,9 @@ Future<void> main(List<String> args) async {
         break;
       case WindowType.Wall:
         desktopType = DesktopType.main;
-        // 画面墙保留系统标题栏，关闭要靠 window_manager 的 onWindowClose 事件。
-        // 子窗口进程默认没初始化 window_manager，不初始化就收不到事件（× 会被 preventClose 吞掉）。
-        await windowManager.ensureInitialized();
+        // 画面墙保留系统标题栏。这里**不要**调 windowManager.ensureInitialized()：
+        // 子引擎里它可能长期不返回，runMultiWindow 就跑不到末尾的 show()，
+        // 窗口会一直隐藏（表现为"点了没反应"）。关闭改用 desktop_multi_window 的通道。
         runMultiWindow(
           argument,
           kAppTypeDesktopWall,

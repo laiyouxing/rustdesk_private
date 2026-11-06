@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -19,7 +18,6 @@ import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:get/get.dart';
 import 'package:uuid/uuid.dart';
-import 'package:window_manager/window_manager.dart';
 
 /// 单个画面墙格子的连接超时。
 ///
@@ -50,8 +48,7 @@ class WallPage extends StatefulWidget {
   State<WallPage> createState() => _WallPageState();
 }
 
-class _WallPageState extends State<WallPage>
-    with MultiWindowListener, WindowListener {
+class _WallPageState extends State<WallPage> with MultiWindowListener {
   final SyncController _sync = SyncController.instance;
   final List<_WallPeer> _peers = <_WallPeer>[];
   bool _loaded = false;
@@ -71,10 +68,10 @@ class _WallPageState extends State<WallPage>
   void initState() {
     super.initState();
     // 多窗口的标题栏 × 会被 preventClose 拦住，必须自己监听 close 事件再关窗。
-    // 其他窗口（带标签栏的）同时注册 desktop_multi_window 和 window_manager 两个监听，
-    // 真正收到系统 × 的是 window_manager 的那个，所以这里两个都注册。
+    // 事件走 desktop_multi_window 的 windowEventChannel，只有设置过 method handler
+    // 才会把 onEvent 分发给 MultiWindowListener（其他子窗口的标签页里都会设）。
     DesktopMultiWindow.addListener(this);
-    windowManager.addListener(this);
+    rustDeskWinManager.setMethodHandler((call, fromWindowId) async {});
     unawaited(_ensureAddressBookLoaded());
     _loadPeers();
   }
@@ -106,46 +103,45 @@ class _WallPageState extends State<WallPage>
 
   /// 关窗。
   ///
-  /// 实测（window_manager fork 源码）：
-  ///   - `WindowManager::GetMainWindow()` 直接返回 `native_window`（`window_manager.cpp:159`）；
-  ///   - `native_window` 只在原生 `ensureInitialized` 里赋值（`window_manager_plugin.cpp:328`）；
-  ///   - 子窗口进程从来不调 `ensureInitialized`（只有主窗口和 --cm 调），
-  ///     所以 `postMessage(hWnd=NULL, WM_SYSCOMMAND, SC_CLOSE)` / `ShowWindow(NULL, …)` 全是空操作。
-  /// 而 `main.dart` 对每个子窗口都 `setPreventClose(true)`，点 × 只是把 WM_CLOSE 吞掉、通知 Dart。
-  /// 因此这里只做「先尝试优雅关闭，再硬退出」：计时器不依赖任何 await，到点直接退出进程——
-  /// 进程退出必然销毁窗口并断开全部远程会话，× 一定有效。
+  /// 关键事实（读 desktop_multi_window / window_manager fork 源码确认）：
+  ///   - 子窗口是**同一个进程**里的新 Flutter 引擎，`main.dart` 对每个子窗口都
+  ///     `setPreventClose(true)`，点 × 时原生只发一条 `close` 事件给 Dart；
+  ///   - 原生 WM_CLOSE 里先 `EmitEvent("close")`、再判断 preventClose，
+  ///     所以收到事件后把 preventClose 置 false 再 `close()`，窗口就会真的销毁；
+  ///   - `WindowController` 走 desktop_multi_window 自己的通道（子引擎一定注册了插件），
+  ///     不像 window_manager 那样要先用 `ensureInitialized()` 记录窗口句柄。
+  /// 注意：**不能**在这里 `exit(0)`——子窗口和主窗口是同一个进程，
+  /// 退出进程会把整个 RustDesk 一起结束。
   void _closeWallWindow() {
     if (_closing) return;
     _closing = true;
     try {
       _sync.clearWallGroup();
     } catch (_) {}
-    unawaited(_gracefulClose());
-    Timer(const Duration(milliseconds: 300), () => exit(0));
+    // 先把每格已建立的远程会话关掉，避免窗口销毁后连接还挂在服务器上。
+    for (final member in _tileSessions.values) {
+      try {
+        unawaited(bind.sessionClose(sessionId: member.sessionId));
+      } catch (_) {}
+    }
+    unawaited(_closeWindowController());
   }
 
-  /// 尽量优雅地关：通知主窗口注销本窗口，再自己关一次（已 ensureInitialized 时会生效）。
-  /// 每一步都带超时，避免主窗口无响应时把关闭流程挂住。
-  Future<void> _gracefulClose() async {
-    try {
-      if (kWindowId != null) {
-        await rustDeskWinManager.call(WindowType.Main, kWindowEventHide,
-            {'id': kWindowId!}).timeout(const Duration(milliseconds: 150));
-      }
-    } catch (_) {}
+  Future<void> _closeWindowController() async {
     try {
       final controller = WindowController.fromWindowId(kWindowId!);
-      await controller.setPreventClose(false).timeout(
-            const Duration(milliseconds: 150),
-          );
-      await controller.close().timeout(const Duration(milliseconds: 150));
-    } catch (_) {}
+      await controller
+          .setPreventClose(false)
+          .timeout(const Duration(milliseconds: 300));
+      await controller.close().timeout(const Duration(milliseconds: 300));
+    } catch (e) {
+      debugPrint('wall: close window failed: $e');
+    }
   }
 
   @override
   void dispose() {
     DesktopMultiWindow.removeListener(this);
-    windowManager.removeListener(this);
     _sync.clearWallGroup();
     _batchSettings.dispose();
     super.dispose();
