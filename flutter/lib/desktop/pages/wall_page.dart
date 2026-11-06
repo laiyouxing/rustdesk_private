@@ -21,11 +21,22 @@ import 'package:get/get.dart';
 import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
 
-/// 单个画面墙格子的连接超时：超过这个时间还没有第一帧就提示需要密码/可重试。
-const Duration _kConnectTimeout = Duration(seconds: 12);
+/// 单个画面墙格子的连接超时。
+///
+/// 不要设得太短：这套网络里中继协商 + LAN 测试 + api-server 打洞回退经常要
+/// 10~16 秒才拿到第一帧（日志里 relay 请求到 handle_peer_info 实测 ~16s）。
+/// 12 秒就判失败会把本来能连上的会话掐掉，表现成「密码不对/对方不可达」。
+const Duration _kConnectTimeout = Duration(seconds: 45);
+
+/// 连接偏慢时先给一个「还在连接」的提示，但不判失败、不断会话。
+const Duration _kSlowHintAfter = Duration(seconds: 8);
 
 /// 收到错误的宽限期：这段时间内还没有第一帧，才把这一格标记为连接失败。
-const Duration kErrorGrace = Duration(seconds: 4);
+///
+/// Rust 侧首连失败会自己重连（打洞/换中继），这条网络里常见要 10 秒以上才通，
+/// 4 秒的宽限期会把还在重试的会话提前判死，所以放宽到 15 秒。
+/// 密码类错误不适用宽限期——密码不对重试多少次也没用，直接提示去设置密码。
+const Duration kErrorGrace = Duration(seconds: 15);
 
 typedef _WallPeer = WallPeerEntry;
 
@@ -904,10 +915,14 @@ class _WallTile extends StatefulWidget {
 class _WallTileState extends State<_WallTile> {
   FFI? _ffi;
   Timer? _timeoutTimer;
+  Timer? _slowTimer;
   Timer? _pendingFailTimer;
   String? _pendingError;
   String? _error;
   bool _gotFirstImage = false;
+
+  /// 连接偏慢（超过 [_kSlowHintAfter] 还没出图）：只提示，不判失败。
+  bool _slow = false;
 
   /// 这一格预览的是对端的哪块屏幕（多屏设备可以切换）。
   int _display = 0;
@@ -1023,10 +1038,12 @@ class _WallTileState extends State<_WallTile> {
     ffi.imageModel.addCallbackOnFirstImage((_) {
       if (!mounted) return;
       _timeoutTimer?.cancel();
+      _slowTimer?.cancel();
       _pendingFailTimer?.cancel();
       _pendingError = null;
       setState(() {
         _gotFirstImage = true;
+        _slow = false;
         // 之前报的错（首次尝试失败等）现在已被自动重连救回来，清掉。
         _error = null;
       });
@@ -1043,11 +1060,17 @@ class _WallTileState extends State<_WallTile> {
     );
     ffi.ffiModel.updateEventListener(ffi.sessionId, peerId);
     unawaited(_loadQuality());
+    _slowTimer?.cancel();
+    _slow = false;
+    _slowTimer = Timer(_kSlowHintAfter, () {
+      if (!mounted || _gotFirstImage || _error != null) return;
+      setState(() => _slow = true);
+    });
     _timeoutTimer = Timer(_kConnectTimeout, () {
       if (!mounted || _gotFirstImage) return;
       _failWith(widget.peer.password.isEmpty
-          ? '连接超时：对方可能设了密码，或当前不可达'
-          : '连接超时：密码可能不对，或当前不可达');
+          ? '连接超时：设备可能不在线，或网络不通'
+          : '连接超时：设备可能不在线、网络不通，或密码不对');
     });
   }
 
@@ -1066,6 +1089,9 @@ class _WallTileState extends State<_WallTile> {
   Future<void> _disposeSession() async {
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
+    _slowTimer?.cancel();
+    _slowTimer = null;
+    _slow = false;
     _pendingFailTimer?.cancel();
     _pendingFailTimer = null;
     final ffi = _ffi;
@@ -1090,6 +1116,11 @@ class _WallTileState extends State<_WallTile> {
   /// 立刻判失败会让用户先看到「失败」再看到「连上了」。
   void _noteErrorMessage(String message) {
     if (!mounted || _error != null) return;
+    // 密码不对重试也没用：直接判失败，让用户去「⋮ → 设置密码」改。
+    if (_looksLikePasswordError(message)) {
+      _failWith(message);
+      return;
+    }
     _pendingError = message;
     _pendingFailTimer?.cancel();
     _pendingFailTimer = Timer(kErrorGrace, () {
@@ -1098,12 +1129,25 @@ class _WallTileState extends State<_WallTile> {
     });
   }
 
+  /// 消息里带 password/密码/2FA 之类字样时，视为需要人工处理，不进宽限期。
+  bool _looksLikePasswordError(String message) {
+    final lower = message.toLowerCase();
+    return lower.contains('password') ||
+        message.contains('密码') ||
+        lower.contains('2fa') ||
+        lower.contains('uac');
+  }
+
   /// 这一格连接失败/超时：只在本格显示错误，并停掉会话避免后台反复重连。
   void _failWith(String message) {
     if (!mounted || _error != null) return;
     _timeoutTimer?.cancel();
+    _slowTimer?.cancel();
     _pendingFailTimer?.cancel();
-    setState(() => _error = message);
+    setState(() {
+      _slow = false;
+      _error = message;
+    });
     Future<void>.delayed(const Duration(seconds: 1), () {
       if (mounted && _error != null) _disposeSession();
     });
@@ -1114,10 +1158,16 @@ class _WallTileState extends State<_WallTile> {
     final msg = text.trim().isNotEmpty ? text.trim() : title.trim();
     if (msg.isEmpty) {
       return widget.peer.password.isEmpty
-          ? '连接失败：对方可能设了密码，或当前不可达'
-          : '连接失败：密码可能不对，或当前不可达';
+          ? '连接失败：需要密码或设备不可达'
+          : '连接失败：密码不对或设备不可达';
     }
-    return msg.length > 160 ? '${msg.substring(0, 160)}…' : msg;
+    final short = msg.length > 160 ? '${msg.substring(0, 160)}…' : msg;
+    final lower = short.toLowerCase();
+    // Rust 侧弹的密码提示在这里被拦下来了（画面墙不弹全局对话框），补一句该去哪设。
+    if (lower.contains('password') || short.contains('密码')) {
+      return '$short（可点右上角 ⋮ → 设置密码）';
+    }
+    return short;
   }
 
   @override
@@ -1445,11 +1495,23 @@ class _WallTileState extends State<_WallTile> {
                   .getTextureId(_displayIndex(ffi, _displayCount(ffi)))
                   .value;
               if (textureId == 0) {
-                return const Center(
-                  child: SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
+                return Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      if (_slow) ...[
+                        const SizedBox(height: 8),
+                        const Text(
+                          '还在连接…（中继/打洞协商中）',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ],
                   ),
                 );
               }
