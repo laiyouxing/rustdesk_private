@@ -8,6 +8,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/mobile/widgets/floating_mouse.dart';
 import 'package:flutter_hbb/mobile/widgets/floating_mouse_widgets.dart';
 import 'package:flutter_hbb/mobile/widgets/gesture_help.dart';
+import 'package:flutter_hbb/mobile/widgets/wheel_scroll_bar.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:flutter_keyboard_visibility/flutter_keyboard_visibility.dart';
 import 'package:flutter_svg/svg.dart';
@@ -514,7 +515,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   onPressed: openKeyboard),
                               // 按键面板开关
                               IconButton(
-                                  color: _showKeysPanel ? MyTheme.accent : Colors.white,
+                                  color: _showKeysPanel
+                                      ? MyTheme.accent
+                                      : Colors.white,
                                   icon: Icon(_showKeysPanel
                                       ? Icons.keyboard_hide
                                       : Icons.grid_view),
@@ -534,7 +537,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   onPressed: openKeyboard),
                               // 按键面板开关
                               IconButton(
-                                  color: _showKeysPanel ? MyTheme.accent : Colors.white,
+                                  color: _showKeysPanel
+                                      ? MyTheme.accent
+                                      : Colors.white,
                                   icon: Icon(_showKeysPanel
                                       ? Icons.keyboard_hide
                                       : Icons.grid_view),
@@ -614,7 +619,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 size: 22,
                 color: active ? const Color(0xFF4C8DFF) : Colors.white),
             const SizedBox(height: 3),
-            Text(label, style: const TextStyle(color: Colors.white, fontSize: 11)),
+            Text(label,
+                style: const TextStyle(color: Colors.white, fontSize: 11)),
           ],
         ),
       ),
@@ -644,10 +650,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               _railItem(Icons.keyboard, '键盘',
                   () => setState(() => _showKeysPanel = !_showKeysPanel),
                   active: _showKeysPanel),
-              _railItem(Icons.desktop_windows, '显示桌面',
-                  () => _sendWinCombo('VK_D')),
-              _railItem(Icons.grid_view, '展示窗口',
-                  () => _sendWinCombo('VK_TAB')),
+              _railItem(
+                  Icons.desktop_windows, '显示桌面', () => _sendWinCombo('VK_D')),
+              _railItem(Icons.grid_view, '展示窗口', () => _sendWinCombo('VK_TAB')),
               _railItem(Icons.tv, '显示设置', () {
                 setState(() => _showEdit = false);
                 showOptions(context, widget.id, gFFI.dialogManager);
@@ -679,8 +684,26 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               color: Color(0xCC1B1B1B),
               borderRadius: BorderRadius.horizontal(left: Radius.circular(8)),
             ),
-            child: const Icon(Icons.chevron_left, color: Colors.white, size: 18),
+            child:
+                const Icon(Icons.chevron_left, color: Colors.white, size: 18),
           ),
+        ),
+      ),
+    );
+  }
+
+  /// 左侧竖向滚轮滑条：手机/平板没有鼠标滚轮，长网页、文档、列表靠它上下滚。
+  ///
+  /// 挂在画布 Stack 上，横屏竖屏共用一套；宽度只占屏幕左缘，尽量不挡操作。
+  Widget buildWheelBar() {
+    return Positioned(
+      left: 0,
+      top: 0,
+      bottom: 0,
+      child: Center(
+        child: FractionallySizedBox(
+          heightFactor: 0.5,
+          child: MobileWheelScrollBar(inputModel: gFFI.inputModel),
         ),
       ),
     );
@@ -701,7 +724,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// 键盘/面板弹起时 Scaffold 会把 body 压矮，只有拿到这个真实尺寸，
   /// CanvasModel 才能把整幅远程画面缩放到剩余区域里。
   void _reportCanvasSize(BoxConstraints constraints) {
-    if (!constraints.maxWidth.isFinite || !constraints.maxHeight.isFinite) return;
+    if (!constraints.maxWidth.isFinite || !constraints.maxHeight.isFinite)
+      return;
     final size = Size(constraints.maxWidth, constraints.maxHeight);
     if (size.width <= 0 || size.height <= 0) return;
     if (_lastCanvasSize == size) return;
@@ -742,6 +766,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               child: QualityMonitor(gFFI.qualityMonitorModel),
             ),
             if (_showRail) buildRightRail() else buildRailHandle(),
+            if (!gFFI.ffiModel.viewOnly) buildWheelBar(),
             SizedBox(
               width: 0,
               height: 0,
@@ -1218,7 +1243,8 @@ class _KeysPanelState extends State<KeysPanel> {
             child: Center(
               child: child ??
                   Text(label,
-                      style: TextStyle(color: Colors.white, fontSize: fontSize)),
+                      style:
+                          TextStyle(color: Colors.white, fontSize: fontSize)),
             ),
           ),
         ),
@@ -1239,71 +1265,90 @@ class _KeysPanelState extends State<KeysPanel> {
     ];
     return SingleChildScrollView(
       child: Column(
-      children: [
-        // 组合键模式 + 修饰键
-        Padding(
-          padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
-          child: Row(
-            children: [
-              SizedBox(
-                width: 132,
-                child: Row(children: [
-                  Checkbox(
-                    value: _comboMode,
-                    onChanged: (v) => setState(() => _comboMode = v ?? false),
-                    visualDensity: VisualDensity.compact,
-                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  ),
-                  const Expanded(
-                      child: Text('组合键模式',
-                          style:
-                              TextStyle(color: Colors.white, fontSize: 13))),
-                ]),
-              ),
-              _kbKey('Ctrl',
-                  onTap: () => _toggleModifier((v) => _ctrl = v, !_ctrl),
-                  active: _ctrl),
-              _kbKey('Shift',
-                  onTap: () => _toggleModifier((v) => _shift = v, !_shift),
-                  active: _shift),
-              _kbKey('Alt',
-                  onTap: () => _toggleModifier((v) => _alt = v, !_alt),
-                  active: _alt),
-              _kbKey(winName,
-                  onTap: () => _toggleModifier((v) => _win = v, !_win),
-                  active: _win),
-            ],
+        children: [
+          // 组合键模式 + 修饰键
+          Padding(
+            padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 132,
+                  child: Row(children: [
+                    Checkbox(
+                      value: _comboMode,
+                      onChanged: (v) => setState(() => _comboMode = v ?? false),
+                      visualDensity: VisualDensity.compact,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    const Expanded(
+                        child: Text('组合键模式',
+                            style:
+                                TextStyle(color: Colors.white, fontSize: 13))),
+                  ]),
+                ),
+                _kbKey('Ctrl',
+                    onTap: () => _toggleModifier((v) => _ctrl = v, !_ctrl),
+                    active: _ctrl),
+                _kbKey('Shift',
+                    onTap: () => _toggleModifier((v) => _shift = v, !_shift),
+                    active: _shift),
+                _kbKey('Alt',
+                    onTap: () => _toggleModifier((v) => _alt = v, !_alt),
+                    active: _alt),
+                _kbKey(winName,
+                    onTap: () => _toggleModifier((v) => _win = v, !_win),
+                    active: _win),
+              ],
+            ),
           ),
-        ),
-        // 数字行
-        _kbRow([
-          for (var d = 1; d <= 9; d++) _kbKey('$d', onTap: () => _tapKey('VK_$d')),
-          _kbKey('0', onTap: () => _tapKey('VK_0')),
-        ]),
-        // 字母行
-        for (final row in letters)
+          // 数字行
           _kbRow([
-            for (final ch in row) _kbKey(ch, onTap: () => _tapKey('VK_$ch')),
-            if (row == letters.last) ...[
-              _kbKey('', flex: 2, child: const Icon(Icons.backspace_outlined,
-                  color: Colors.white, size: 18), onTap: () => _tapKey('VK_BACK')),
-            ],
+            for (var d = 1; d <= 9; d++)
+              _kbKey('$d', onTap: () => _tapKey('VK_$d')),
+            _kbKey('0', onTap: () => _tapKey('VK_0')),
           ]),
-        // 空格 / 方向键 / 回车
-        _kbRow([
-          _kbKey('Space', flex: 6, onTap: () => _tapKey('VK_SPACE')),
-          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_left, color: Colors.white, size: 20), onTap: () => _tapKey('VK_LEFT')),
-          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_up, color: Colors.white, size: 20), onTap: () => _tapKey('VK_UP')),
-          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 20), onTap: () => _tapKey('VK_DOWN')),
-          _kbKey('', flex: 1, child: const Icon(Icons.keyboard_arrow_right, color: Colors.white, size: 20), onTap: () => _tapKey('VK_RIGHT')),
-          _kbKey('Enter', flex: 2, onTap: () => _tapKey('VK_ENTER')),
-        ]),
-        const SizedBox(height: 4),
-      ],
+          // 字母行
+          for (final row in letters)
+            _kbRow([
+              for (final ch in row) _kbKey(ch, onTap: () => _tapKey('VK_$ch')),
+              if (row == letters.last) ...[
+                _kbKey('',
+                    flex: 2,
+                    child: const Icon(Icons.backspace_outlined,
+                        color: Colors.white, size: 18),
+                    onTap: () => _tapKey('VK_BACK')),
+              ],
+            ]),
+          // 空格 / 方向键 / 回车
+          _kbRow([
+            _kbKey('Space', flex: 6, onTap: () => _tapKey('VK_SPACE')),
+            _kbKey('',
+                flex: 1,
+                child: const Icon(Icons.keyboard_arrow_left,
+                    color: Colors.white, size: 20),
+                onTap: () => _tapKey('VK_LEFT')),
+            _kbKey('',
+                flex: 1,
+                child: const Icon(Icons.keyboard_arrow_up,
+                    color: Colors.white, size: 20),
+                onTap: () => _tapKey('VK_UP')),
+            _kbKey('',
+                flex: 1,
+                child: const Icon(Icons.keyboard_arrow_down,
+                    color: Colors.white, size: 20),
+                onTap: () => _tapKey('VK_DOWN')),
+            _kbKey('',
+                flex: 1,
+                child: const Icon(Icons.keyboard_arrow_right,
+                    color: Colors.white, size: 20),
+                onTap: () => _tapKey('VK_RIGHT')),
+            _kbKey('Enter', flex: 2, onTap: () => _tapKey('VK_ENTER')),
+          ]),
+          const SizedBox(height: 4),
+        ],
       ),
     );
   }
-
 
   @override
   Widget build(BuildContext context) {
