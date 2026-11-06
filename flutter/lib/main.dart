@@ -103,10 +103,14 @@ Future<void> main(List<String> args) async {
         break;
       case WindowType.Wall:
         desktopType = DesktopType.main;
+        // 画面墙保留系统标题栏，关闭要靠 window_manager 的 onWindowClose 事件。
+        // 子窗口进程默认没初始化 window_manager，不初始化就收不到事件（× 会被 preventClose 吞掉）。
+        await windowManager.ensureInitialized();
         runMultiWindow(
           argument,
           kAppTypeDesktopWall,
         );
+        break;
       default:
         break;
     }

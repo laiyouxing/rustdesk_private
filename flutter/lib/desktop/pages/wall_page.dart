@@ -45,6 +45,9 @@ class _WallPageState extends State<WallPage>
   final List<_WallPeer> _peers = <_WallPeer>[];
   bool _loaded = false;
 
+  /// 关窗只做一次（× 与「关闭」入口可能都会触发）。
+  bool _closing = false;
+
   /// 多选（批量操作）模式：格子上出现勾选圈，点格子选中/取消。
   bool _selectMode = false;
   final Set<String> _selected = <String>{};
@@ -87,32 +90,45 @@ class _WallPageState extends State<WallPage>
 
   @override
   void onWindowClose() {
-    unawaited(_shutdownAndClose());
+    _closeWallWindow();
   }
 
-  /// 关窗：先清群控状态，再关掉多窗口；实在关不掉就退出进程。
+  /// 关窗。
   ///
-  /// 画面墙开在一个独立进程里，进程退出会释放全部会话，不会在后台继续拉流。
-  Future<void> _shutdownAndClose() async {
+  /// 实测（window_manager fork 源码）：
+  ///   - `WindowManager::GetMainWindow()` 直接返回 `native_window`（`window_manager.cpp:159`）；
+  ///   - `native_window` 只在原生 `ensureInitialized` 里赋值（`window_manager_plugin.cpp:328`）；
+  ///   - 子窗口进程从来不调 `ensureInitialized`（只有主窗口和 --cm 调），
+  ///     所以 `postMessage(hWnd=NULL, WM_SYSCOMMAND, SC_CLOSE)` / `ShowWindow(NULL, …)` 全是空操作。
+  /// 而 `main.dart` 对每个子窗口都 `setPreventClose(true)`，点 × 只是把 WM_CLOSE 吞掉、通知 Dart。
+  /// 因此这里只做「先尝试优雅关闭，再硬退出」：计时器不依赖任何 await，到点直接退出进程——
+  /// 进程退出必然销毁窗口并断开全部远程会话，× 一定有效。
+  void _closeWallWindow() {
+    if (_closing) return;
+    _closing = true;
     try {
       _sync.clearWallGroup();
     } catch (_) {}
+    unawaited(_gracefulClose());
+    Timer(const Duration(milliseconds: 300), () => exit(0));
+  }
+
+  /// 尽量优雅地关：通知主窗口注销本窗口，再自己关一次（已 ensureInitialized 时会生效）。
+  /// 每一步都带超时，避免主窗口无响应时把关闭流程挂住。
+  Future<void> _gracefulClose() async {
     try {
       if (kWindowId != null) {
-        await rustDeskWinManager
-            .call(WindowType.Main, kWindowEventHide, {'id': kWindowId!});
+        await rustDeskWinManager.call(WindowType.Main, kWindowEventHide,
+            {'id': kWindowId!}).timeout(const Duration(milliseconds: 150));
       }
     } catch (_) {}
     try {
       final controller = WindowController.fromWindowId(kWindowId!);
-      await controller.setPreventClose(false);
-      await controller.close();
-    } catch (e) {
-      debugPrint('close wall window failed: $e');
-    }
-    // 兜底：窗口没被关掉就直接退出，避免画面墙在后台继续占用带宽。
-    await Future.delayed(const Duration(milliseconds: 400));
-    exit(0);
+      await controller.setPreventClose(false).timeout(
+            const Duration(milliseconds: 150),
+          );
+      await controller.close().timeout(const Duration(milliseconds: 150));
+    } catch (_) {}
   }
 
   @override
@@ -253,8 +269,8 @@ class _WallPageState extends State<WallPage>
     });
     if (!mounted) return;
     if (items.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('地址簿是空的（个人和共享地址簿里都没有设备），先手动填设备 ID')));
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('地址簿是空的（个人和共享地址簿里都没有设备），先手动填设备 ID')));
       return;
     }
     final selected = await showDialog<String>(
@@ -274,7 +290,9 @@ class _WallPageState extends State<WallPage>
                     leading:
                         const Icon(Icons.desktop_windows_outlined, size: 20),
                     title: Text(
-                      item.peer.alias.isNotEmpty ? item.peer.alias : item.peer.id,
+                      item.peer.alias.isNotEmpty
+                          ? item.peer.alias
+                          : item.peer.id,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -303,8 +321,7 @@ class _WallPageState extends State<WallPage>
                         ),
                       ],
                     ),
-                    onTap: () =>
-                        Navigator.of(dialogContext).pop(item.peer.id),
+                    onTap: () => Navigator.of(dialogContext).pop(item.peer.id),
                   ),
               ],
             ),
@@ -372,7 +389,8 @@ class _WallPageState extends State<WallPage>
   }
 
   /// 某一格连上后回报会话 id 与远程分辨率，群控要用它做坐标换算。
-  void _onTileSession(String peerId, UuidValue sessionId, int width, int height) {
+  void _onTileSession(
+      String peerId, UuidValue sessionId, int width, int height) {
     _tileSessions[peerId] = SyncMember(sessionId, width: width, height: height);
     _syncWallTargets();
   }
@@ -1168,8 +1186,7 @@ class _WallTileState extends State<_WallTile> {
               left: 6,
               bottom: 6,
               child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
                   color: widget.isMaster ? Colors.orange : Colors.black54,
                   borderRadius: BorderRadius.circular(4),
