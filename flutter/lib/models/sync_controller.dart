@@ -398,7 +398,8 @@ class SyncController extends ChangeNotifier {
     if (now - _lastAbsMoveMs < absMoveMinGapMs) return;
     _lastAbsMoveMs = now;
     for (final member in _resolveTargets(sourceSessionId)) {
-      if (member.width <= 0 || member.height <= 0) continue;
+      // 尺寸太小说明是占位值（16×10），换算出来会把鼠标压到左上角，直接跳过。
+      if (member.width < 100 || member.height < 100) continue;
       final targetX = (x * member.width / srcWidth).round();
       final targetY = (y * member.height / srcHeight).round();
       try {

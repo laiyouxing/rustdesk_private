@@ -350,8 +350,14 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     setState(() {
       _peers.removeWhere((peer) => peer.id == id);
       _selected.remove(id);
-      if (_peers.isEmpty) _selectMode = false;
+      _tileSessions.remove(id);
+      if (_masterId == id) _masterId = null;
+      if (_peers.isEmpty) {
+        _selectMode = false;
+        _groupControl = false;
+      }
     });
+    _syncWallTargets();
     await _savePeers();
   }
 
@@ -360,8 +366,9 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
 
   // ---- 画面墙群控 ----
   //
-  // 墙上先勾选若干格作为「被控」，再把其中一格点成「主控」；主控格接管键鼠，
-  // 输入会复制给其它被控格。目标集合交给 SyncController，与全局同步开关无关。
+  // 进入群控后，点某一格就把它设成「主控」；**其余已连上的格子自动成为被控**，
+  // 主控格接管键鼠，输入复制给它们。不需要再手动勾选被控（少一步，也不会出现
+  // 「选了主控却没有被控」的空转）。目标集合交给 SyncController，与全局同步开关无关。
 
   bool _groupControl = false;
   String? _masterId;
@@ -370,9 +377,9 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   void _enterGroupControl() {
     setState(() {
       _groupControl = true;
-      _selectMode = true;
-      _masterId = null;
+      _selectMode = false;
       _selected.clear();
+      _masterId = null;
     });
     _syncWallTargets();
   }
@@ -382,17 +389,25 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     setState(() {
       _groupControl = false;
       _masterId = null;
-      _selectMode = false;
-      _selected.clear();
     });
   }
 
-  void _setMaster(String peerId) {
+  /// 群控里点一格：设为主控；再点同一格取消主控（回到「选主控」状态）。
+  void _toggleMaster(String peerId) {
     setState(() {
-      _masterId = peerId;
-      _selected.add(peerId);
+      _masterId = _masterId == peerId ? null : peerId;
     });
     _syncWallTargets();
+  }
+
+  /// 当前会被广播的格子数（已连上、且不是主控）。
+  int get _slaveCount {
+    var count = 0;
+    for (final peer in _peers) {
+      if (peer.id == _masterId) continue;
+      if (_tileSessions.containsKey(peer.id)) count++;
+    }
+    return count;
   }
 
   /// 某一格连上后回报会话 id 与远程分辨率，群控要用它做坐标换算。
@@ -402,16 +417,18 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     _syncWallTargets();
   }
 
-  /// 把当前勾选的格子（排除主控）同步给 SyncController。
+  /// 把「除主控外的全部已连上格子」同步给 SyncController。
   void _syncWallTargets() {
     final targets = <SyncMember>[];
-    for (final id in _selected) {
-      if (id == _masterId) continue;
-      final member = _tileSessions[id];
-      if (member != null) targets.add(member);
+    if (_groupControl && _masterId != null) {
+      for (final peer in _peers) {
+        if (peer.id == _masterId) continue;
+        final member = _tileSessions[peer.id];
+        if (member != null) targets.add(member);
+      }
     }
     _sync.setWallGroup(
-      enabled: _groupControl && _masterId != null,
+      enabled: _groupControl && _masterId != null && targets.isNotEmpty,
       targets: targets,
     );
   }
@@ -436,9 +453,6 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   void _toggleSelect(String id) {
     setState(() {
       if (!_selected.remove(id)) _selected.add(id);
-      if (_masterId != null && !_selected.contains(_masterId)) {
-        _masterId = null;
-      }
     });
     _syncWallTargets();
   }
@@ -447,7 +461,6 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     setState(() {
       if (_allSelected) {
         _selected.clear();
-        _masterId = null;
       } else {
         _selected
           ..clear()
@@ -717,74 +730,13 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     return Scaffold(
       appBar: AppBar(
         title: const Text('画面墙'),
-        actions: _selectMode
-            ? [
-                TextButton(
-                  style: appBarButtonStyle,
-                  onPressed: _toggleSelectAll,
-                  child: Text(_allSelected ? '取消全选' : '全选'),
-                ),
-                if (_groupControl)
-                  TextButton(
-                    style: appBarButtonStyle,
-                    onPressed: _exitGroupControl,
-                    child: Text(
-                      _masterId == null
-                          ? '群控：点格子选被控，长按设主控'
-                          : '结束群控（主控 ${_masterId!}）',
-                      style: const TextStyle(color: Colors.orange),
-                    ),
-                  )
-                else
-                  TextButton(
-                    style: appBarButtonStyle,
-                    onPressed: _enterGroupControl,
-                    child: const Text('群控'),
-                  ),
-                TextButton(
-                  style: appBarButtonStyle,
-                  onPressed: _selected.isEmpty ? null : _openBatchSettings,
-                  child: Text('设置 ${_selected.length}'),
-                ),
-                TextButton(
-                  style: appBarButtonStyle,
-                  onPressed: _selected.isEmpty ? null : _deleteSelected,
-                  child: Text('删除 ${_selected.length}'),
-                ),
-                IconButton(
-                  tooltip: '退出',
-                  onPressed: _exitSelectMode,
-                  icon: const Icon(Icons.close),
-                ),
-              ]
-            : [
-                AnimatedBuilder(
-                  animation: _sync,
-                  builder: (context, _) {
-                    final enabled = _sync.enabled;
-                    return TextButton.icon(
-                      style: appBarButtonStyle,
-                      onPressed: () => _sync.toggle(),
-                      icon: Icon(
-                        enabled ? Icons.sync : Icons.sync_disabled,
-                        size: 18,
-                        color: enabled ? Colors.lightGreenAccent : null,
-                      ),
-                      label: Text(enabled ? '同步：开' : '同步：关'),
-                    );
-                  },
-                ),
-                IconButton(
-                  tooltip: '批量操作',
-                  onPressed: _enterSelectMode,
-                  icon: const Icon(Icons.checklist),
-                ),
-                IconButton(
-                  tooltip: '添加设备',
-                  onPressed: _addPeer,
-                  icon: const Icon(Icons.add),
-                ),
-              ],
+        // 三种模式互斥，标题栏只显示当前模式该有的按钮：
+        // 普通（群控 / 批量操作 / 添加）→ 群控（状态 + 结束）→ 多选（全选 / 设置 / 删除 / 退出）。
+        actions: _groupControl
+            ? _buildGroupControlActions()
+            : _selectMode
+                ? _buildSelectActions(appBarButtonStyle)
+                : _buildNormalActions(appBarButtonStyle),
       ),
       body: !_loaded
           ? const Center(child: CircularProgressIndicator())
@@ -793,6 +745,71 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
               : _buildGrid(),
     );
   }
+
+  /// 普通模式：只留三个入口。
+  ///
+  /// 这里**不再放全局「同步」开关**：那个开关是给普通远程窗口之间互相同步用的，
+  /// 画面墙有独立的群控，两个开关并排只会让人分不清谁在生效。
+  List<Widget> _buildNormalActions(ButtonStyle style) => [
+        TextButton(
+          style: style,
+          onPressed: _enterGroupControl,
+          child: const Text('群控'),
+        ),
+        IconButton(
+          tooltip: '批量操作（多选后可设置 / 删除）',
+          onPressed: _enterSelectMode,
+          icon: const Icon(Icons.checklist),
+        ),
+        IconButton(
+          tooltip: '添加设备',
+          onPressed: _addPeer,
+          icon: const Icon(Icons.add),
+        ),
+      ];
+
+  /// 群控模式：左侧只放状态文字（主控 / 被控数量），右侧只有「结束群控」。
+  List<Widget> _buildGroupControlActions() => [
+        Center(
+          child: Text(
+            _masterId == null
+                ? '群控：点一格当主控，其余格子自动被控'
+                : '群控中：主控 $_masterId · 被控 $_slaveCount 台'
+                    '${_slaveCount == 0 ? '（等其它格子连上）' : ''}',
+            style: const TextStyle(color: Colors.orange, fontSize: 13),
+          ),
+        ),
+        const SizedBox(width: 8),
+        TextButton(
+          style: TextButton.styleFrom(foregroundColor: Colors.white),
+          onPressed: _exitGroupControl,
+          child: const Text('结束群控'),
+        ),
+      ];
+
+  /// 多选（批量操作）模式：全选 → 设置 → 删除 → 退出。
+  List<Widget> _buildSelectActions(ButtonStyle style) => [
+        TextButton(
+          style: style,
+          onPressed: _toggleSelectAll,
+          child: Text(_allSelected ? '取消全选' : '全选'),
+        ),
+        TextButton(
+          style: style,
+          onPressed: _selected.isEmpty ? null : _openBatchSettings,
+          child: Text('设置 ${_selected.length}'),
+        ),
+        TextButton(
+          style: style,
+          onPressed: _selected.isEmpty ? null : _deleteSelected,
+          child: Text('删除 ${_selected.length}'),
+        ),
+        IconButton(
+          tooltip: '退出多选',
+          onPressed: _exitSelectMode,
+          icon: const Icon(Icons.close),
+        ),
+      ];
 
   Widget _buildEmpty() {
     return Center(
@@ -812,39 +829,114 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     );
   }
 
+  /// 网格布局：普通模式每格一样大；群控时主控格占 2×2（列数不够时退回 1×1）。
+  ///
+  /// 用 Stack + 绝对定位自己排，是因为 `GridView` 不支持跨格；这样主控格能真正
+  /// 放大到四格大小，方便在里面操作键鼠。
   Widget _buildGrid() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final columns = (constraints.maxWidth / 360).floor().clamp(1, 4);
-        return GridView.builder(
-          padding: const EdgeInsets.all(12),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: columns,
-            mainAxisSpacing: 12,
-            crossAxisSpacing: 12,
-            childAspectRatio: 16 / 10,
+        const gap = 12.0;
+        const padding = 12.0;
+        final available = constraints.maxWidth - padding * 2;
+        if (available <= 0) return const SizedBox.shrink();
+        final columns = (available / 360).floor().clamp(1, 4);
+        final cellWidth = (available - gap * (columns - 1)) / columns;
+        final cellHeight = cellWidth * 10 / 16;
+        final placements = _placeTiles(columns);
+        var rows = 1;
+        for (final placement in placements) {
+          final bottom = placement.row + placement.rowSpan;
+          if (bottom > rows) rows = bottom;
+        }
+        final contentHeight = rows * cellHeight + (rows - 1) * gap;
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(padding),
+          child: SizedBox(
+            height: contentHeight,
+            child: Stack(
+              children: [
+                for (final placement in placements)
+                  Positioned(
+                    left: placement.col * (cellWidth + gap),
+                    top: placement.row * (cellHeight + gap),
+                    width: placement.colSpan * cellWidth +
+                        (placement.colSpan - 1) * gap,
+                    height: placement.rowSpan * cellHeight +
+                        (placement.rowSpan - 1) * gap,
+                    child: _buildTile(placement.peer),
+                  ),
+              ],
+            ),
           ),
-          itemCount: _peers.length,
-          itemBuilder: (context, index) {
-            final peer = _peers[index];
-            return _WallTile(
-              // 密码变了也要重建（新 key 会重新建连接）。
-              key: ValueKey('${peer.id}|${peer.password}'),
-              peer: peer,
-              onRemove: () => _removePeer(peer.id),
-              onEditPassword: () => _editPassword(peer),
-              selectMode: _selectMode,
-              selected: _selected.contains(peer.id),
-              onToggleSelect: () => _toggleSelect(peer.id),
-              batchSettings: _batchSettings,
-              groupControl: _groupControl,
-              isMaster: _masterId == peer.id,
-              onMakeMaster: () => _setMaster(peer.id),
-              onSession: _onTileSession,
-            );
-          },
         );
       },
+    );
+  }
+
+  /// 行优先排布：主控占 2×2 放在左上角，其它格子依次填剩下的空格。
+  List<_WallPlacement> _placeTiles(int columns) {
+    final placements = <_WallPlacement>[];
+    final occupied = <String>{};
+    bool free(int row, int col) => !occupied.contains('$row,$col');
+    void take(int row, int col, int rowSpan, int colSpan) {
+      for (var dr = 0; dr < rowSpan; dr++) {
+        for (var dc = 0; dc < colSpan; dc++) {
+          occupied.add('${row + dr},${col + dc}');
+        }
+      }
+    }
+
+    _WallPeer? master;
+    if (_groupControl && _masterId != null) {
+      for (final peer in _peers) {
+        if (peer.id == _masterId) {
+          master = peer;
+          break;
+        }
+      }
+    }
+    if (master != null) {
+      final span = columns >= 2 ? 2 : 1;
+      placements
+          .add(_WallPlacement(master, 0, 0, colSpan: span, rowSpan: span));
+      take(0, 0, span, span);
+    }
+
+    var cursorRow = 0;
+    var cursorCol = 0;
+    for (final peer in _peers) {
+      if (master != null && identical(peer, master)) continue;
+      while (true) {
+        if (cursorCol >= columns) {
+          cursorCol = 0;
+          cursorRow++;
+        }
+        if (free(cursorRow, cursorCol)) break;
+        cursorCol++;
+      }
+      placements.add(_WallPlacement(peer, cursorCol, cursorRow));
+      take(cursorRow, cursorCol, 1, 1);
+      cursorCol++;
+    }
+    return placements;
+  }
+
+  Widget _buildTile(_WallPeer peer) {
+    return _WallTile(
+      // 密码变了也要重建（新 key 会重新建连接）。
+      key: ValueKey('${peer.id}|${peer.password}'),
+      peer: peer,
+      onRemove: () => _removePeer(peer.id),
+      onEditPassword: () => _editPassword(peer),
+      selectMode: _selectMode,
+      selected: _selected.contains(peer.id),
+      onToggleSelect: () => _toggleSelect(peer.id),
+      batchSettings: _batchSettings,
+      groupControl: _groupControl,
+      isMaster: _groupControl && _masterId == peer.id,
+      onMakeMaster: () => _toggleMaster(peer.id),
+      onSession: _onTileSession,
     );
   }
 }
@@ -869,6 +961,17 @@ class _BatchSettings {
 
   bool get isEmpty =>
       quality == null && display == null && width == null && password == null;
+}
+
+class _WallPlacement {
+  final _WallPeer peer;
+  final int col;
+  final int row;
+  final int colSpan;
+  final int rowSpan;
+
+  const _WallPlacement(this.peer, this.col, this.row,
+      {this.colSpan = 1, this.rowSpan = 1});
 }
 
 class _WallTile extends StatefulWidget {
@@ -933,15 +1036,25 @@ class _WallTileState extends State<_WallTile> {
   final FocusNode _keyFocusNode = FocusNode(debugLabel: 'wall-master');
 
   /// 把会话 id 与当前预览屏的分辨率回报给墙，群控换算鼠标坐标要用。
+  ///
+  /// 显示器信息还没到时不要回报：`_displayWidth/_displayHeight` 的 16×10 只是
+  /// 布局占位，拿来换算会把鼠标坐标压到左上角一个点。
   void _reportSession() {
     final ffi = _ffi;
     if (ffi == null) return;
-    widget.onSession(
-      widget.peer.id,
-      ffi.sessionId,
-      _displayWidth(ffi),
-      _displayHeight(ffi),
-    );
+    try {
+      final displays = ffi.ffiModel.pi.displays;
+      if (displays.isEmpty) return;
+      final index = _displayIndex(ffi, displays.length);
+      final display = displays[index];
+      if (display.width < 100 || display.height < 100) return;
+      widget.onSession(
+        widget.peer.id,
+        ffi.sessionId,
+        display.width,
+        display.height,
+      );
+    } catch (_) {}
   }
 
   @override
@@ -1264,17 +1377,17 @@ class _WallTileState extends State<_WallTile> {
         ],
       ),
     );
-    if (!widget.selectMode) return card;
+    // 群控模式：点非主控格就把它设成主控；主控格本身不能再包手势，
+    // 否则会把点击/移动吞掉，输入进不到 InputModel。
     if (widget.groupControl) {
-      // 群控：点一下选中/取消被控；长按把这格设成主控。
       if (widget.isMaster) return card;
       return GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: widget.onToggleSelect,
-        onLongPress: widget.onMakeMaster,
+        onTap: widget.onMakeMaster,
         child: card,
       );
     }
+    if (!widget.selectMode) return card;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: widget.onToggleSelect,
