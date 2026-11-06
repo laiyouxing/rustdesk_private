@@ -178,15 +178,32 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   }
 
   /// 从地址簿挑一台已有设备，省得手抄 ID。
+  ///
+  /// 不能只看 `currentAbPeers`：那只是当前选中的那一本地址簿。
+  /// 「别人共享给我的设备」在另外的共享地址簿里，所以这里遍历全部地址簿并去重。
   Future<void> _pickFromAddressBook() async {
-    final peers = <Peer>[];
+    // 记录每台设备来自哪本地址簿，「共享」单独标一下，方便确认选的是别人分享的那台。
+    final items = <({Peer peer, String book, bool shared})>[];
     try {
-      peers.addAll(gFFI.abModel.currentAbPeers);
+      final seen = <String>{};
+      for (final ab in gFFI.abModel.addressbooks.values) {
+        final shared = !ab.isPersonal();
+        for (final peer in ab.peers) {
+          if (peer.id.isEmpty || !seen.add(peer.id)) continue;
+          items.add((peer: peer, book: ab.name(), shared: shared));
+        }
+      }
     } catch (_) {}
+    // 别名在前，其次按 ID，方便在长列表里找。
+    items.sort((a, b) {
+      final byAlias =
+          a.peer.alias.toLowerCase().compareTo(b.peer.alias.toLowerCase());
+      return byAlias != 0 ? byAlias : a.peer.id.compareTo(b.peer.id);
+    });
     if (!mounted) return;
-    if (peers.isEmpty) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('地址簿是空的，先手动填设备 ID')));
+    if (items.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('地址簿是空的（个人和共享地址簿里都没有设备），先手动填设备 ID')));
       return;
     }
     final selected = await showDialog<String>(
@@ -199,18 +216,29 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
             height: 380,
             child: ListView(
               children: [
-                for (final peer in peers)
+                for (final item in items)
                   ListTile(
                     dense: true,
                     leading:
                         const Icon(Icons.desktop_windows_outlined, size: 20),
                     title: Text(
-                      peer.alias.isNotEmpty ? peer.alias : peer.id,
+                      item.peer.alias.isNotEmpty ? item.peer.alias : item.peer.id,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    subtitle: Text(peer.id),
-                    onTap: () => Navigator.of(dialogContext).pop(peer.id),
+                    subtitle: Text(
+                      item.shared
+                          ? '${item.peer.id} · ${item.book}'
+                          : item.peer.id,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: item.shared
+                        ? const Text('共享',
+                            style: TextStyle(fontSize: 11, color: Colors.grey))
+                        : null,
+                    onTap: () =>
+                        Navigator.of(dialogContext).pop(item.peer.id),
                   ),
               ],
             ),
