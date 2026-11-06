@@ -589,17 +589,25 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
 
   @override
   Widget build(BuildContext context) {
+    // AppBar 背景是主题主色（蓝），TextButton 默认文字也是主色，会变成蓝字蓝底看不见，
+    // 所以标题栏里的按钮统一显式指定白色文字。
+    final appBarButtonStyle = TextButton.styleFrom(
+      foregroundColor: Colors.white,
+      disabledForegroundColor: Colors.white38,
+    );
     return Scaffold(
       appBar: AppBar(
         title: const Text('画面墙'),
         actions: _selectMode
             ? [
                 TextButton(
+                  style: appBarButtonStyle,
                   onPressed: _toggleSelectAll,
                   child: Text(_allSelected ? '取消全选' : '全选'),
                 ),
                 if (_groupControl)
                   TextButton(
+                    style: appBarButtonStyle,
                     onPressed: _exitGroupControl,
                     child: Text(
                       _masterId == null
@@ -610,14 +618,17 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
                   )
                 else
                   TextButton(
+                    style: appBarButtonStyle,
                     onPressed: _enterGroupControl,
                     child: const Text('群控'),
                   ),
                 TextButton(
+                  style: appBarButtonStyle,
                   onPressed: _selected.isEmpty ? null : _openBatchSettings,
                   child: Text('设置 ${_selected.length}'),
                 ),
                 TextButton(
+                  style: appBarButtonStyle,
                   onPressed: _selected.isEmpty ? null : _deleteSelected,
                   child: Text('删除 ${_selected.length}'),
                 ),
@@ -633,11 +644,12 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
                   builder: (context, _) {
                     final enabled = _sync.enabled;
                     return TextButton.icon(
+                      style: appBarButtonStyle,
                       onPressed: () => _sync.toggle(),
                       icon: Icon(
                         enabled ? Icons.sync : Icons.sync_disabled,
                         size: 18,
-                        color: enabled ? Colors.blueAccent : null,
+                        color: enabled ? Colors.lightGreenAccent : null,
                       ),
                       label: Text(enabled ? '同步：开' : '同步：关'),
                     );
