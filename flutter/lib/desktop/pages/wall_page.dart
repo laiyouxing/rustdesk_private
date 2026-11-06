@@ -771,12 +771,17 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   /// 群控模式：左侧只放状态文字（主控 / 被控数量），右侧只有「结束群控」。
   List<Widget> _buildGroupControlActions() => [
         Center(
-          child: Text(
-            _masterId == null
-                ? '群控：点一格当主控，其余格子自动被控'
-                : '群控中：主控 $_masterId · 被控 $_slaveCount 台'
-                    '${_slaveCount == 0 ? '（等其它格子连上）' : ''}',
-            style: const TextStyle(color: Colors.orange, fontSize: 13),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Text(
+              _masterId == null
+                  ? '群控：点一格当主控，其余格子自动被控'
+                  : '群控中：主控 $_masterId · 被控 $_slaveCount 台'
+                      '${_slaveCount == 0 ? '（等其它格子连上）' : ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.orange, fontSize: 13),
+            ),
           ),
         ),
         const SizedBox(width: 8),
@@ -960,7 +965,11 @@ class _BatchSettings {
   });
 
   bool get isEmpty =>
-      quality == null && display == null && width == null && password == null;
+      quality == null &&
+      display == null &&
+      width == null &&
+      height == null &&
+      password == null;
 }
 
 class _WallPlacement {
@@ -1158,6 +1167,10 @@ class _WallTileState extends State<_WallTile> {
       });
       // 会话真正连上后再读质量、下发还没应用的批量设置。
       _reportSession();
+      // 显示器信息偶尔比首帧晚到，补报一次，避免群控拿不到目标分辨率。
+      Timer(const Duration(seconds: 2), () {
+        if (mounted && _ffi == ffi && _gotFirstImage) _reportSession();
+      });
       unawaited(_loadQuality());
       final pending = _pendingBatch;
       _pendingBatch = null;
