@@ -345,44 +345,44 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
           const SnackBar(content: Text('地址簿是空的（个人和共享地址簿里都没有设备），先手动填设备 ID')));
       return;
     }
-    final selected = await showDialog<String>(
+    // 已经在墙上的设备直接置灰勾选，避免重复添加；其余用复选框一次选多台。
+    final existing = _peers.map((peer) => peer.id).toSet();
+    final addableIds = items
+        .where((item) => !existing.contains(item.peer.id))
+        .map((item) => item.peer.id)
+        .toList();
+    final picked = <String>{};
+    final confirmed = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) => SimpleDialog(
-        title: Text(
-            '从地址簿选择（在线 ${items.where((i) => i.peer.online).length}/${items.length}）'),
-        children: [
-          SizedBox(
-            width: 420,
-            height: 380,
-            child: ListView(
-              children: [
-                for (final item in items)
-                  ListTile(
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => SimpleDialog(
+          title: Text(
+              '从地址簿选择（在线 ${items.where((i) => i.peer.online).length}/${items.length}）'),
+          children: [
+            SizedBox(
+              width: 460,
+              height: 420,
+              child: ListView.builder(
+                itemCount: items.length,
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  final onWall = existing.contains(item.peer.id);
+                  final checked = onWall || picked.contains(item.peer.id);
+                  return CheckboxListTile(
                     dense: true,
-                    leading:
-                        const Icon(Icons.desktop_windows_outlined, size: 20),
-                    title: Text(
-                      item.peer.alias.isNotEmpty
-                          ? item.peer.alias
-                          : item.peer.id,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: Text(
-                      item.shared
-                          ? '${item.peer.id} · ${item.book}'
-                          : item.peer.id,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
+                    value: checked,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    onChanged: onWall
+                        ? null
+                        : (value) => setDialogState(() {
+                              if (value == true) {
+                                picked.add(item.peer.id);
+                              } else {
+                                picked.remove(item.peer.id);
+                              }
+                            }),
+                    title: Row(
                       children: [
-                        if (item.shared)
-                          const Text('共享',
-                              style:
-                                  TextStyle(fontSize: 11, color: Colors.grey)),
-                        const SizedBox(width: 8),
                         Tooltip(
                           message: item.peer.online ? '在线' : '离线',
                           child: CircleAvatar(
@@ -391,28 +391,96 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
                                 item.peer.online ? Colors.green : Colors.grey,
                           ),
                         ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            item.peer.alias.isNotEmpty
+                                ? item.peer.alias
+                                : item.peer.id,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (item.shared)
+                          const Text('共享',
+                              style:
+                                  TextStyle(fontSize: 11, color: Colors.grey)),
                       ],
                     ),
-                    onTap: () => Navigator.of(dialogContext).pop(item.peer.id),
-                  ),
-              ],
+                    subtitle: Text(
+                      onWall
+                          ? '${item.peer.id} · 已在画面墙'
+                          : (item.shared
+                              ? '${item.peer.id} · ${item.book}'
+                              : item.peer.id),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  );
+                },
+              ),
             ),
-          ),
-        ],
+            Padding(
+              padding: const EdgeInsets.only(right: 12, bottom: 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: addableIds.isEmpty
+                        ? null
+                        : () => setDialogState(() {
+                              if (picked.length == addableIds.length) {
+                                picked.clear();
+                              } else {
+                                picked
+                                  ..clear()
+                                  ..addAll(addableIds);
+                              }
+                            }),
+                    child: Text(
+                        picked.isNotEmpty && picked.length == addableIds.length
+                            ? '清空'
+                            : '全选'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    child: const Text('取消'),
+                  ),
+                  TextButton(
+                    onPressed: picked.isEmpty
+                        ? null
+                        : () => Navigator.of(dialogContext).pop(true),
+                    child: Text('添加 ${picked.length} 台'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
-    if (selected == null || !mounted) return;
+    if (confirmed != true || picked.isEmpty || !mounted) return;
     // 从地址簿选的时候顺便把别名记下来，格子上就能显示「别名：ID」。
-    final err = await WallStore.add(
-      selected,
-      alias: _aliasesFromAddressBook()[selected] ?? '',
-    );
-    if (!mounted) return;
-    if (err != null) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
-      return;
+    final aliases = _aliasesFromAddressBook();
+    var added = 0;
+    String? firstError;
+    for (final id in picked) {
+      final err = await WallStore.add(id, alias: aliases[id] ?? '');
+      if (err == null) {
+        added++;
+      } else {
+        firstError ??= err;
+      }
     }
+    if (!mounted) return;
     await _loadPeers();
+    if (!mounted) return;
+    final failed = picked.length - added;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(failed == 0
+          ? '已添加 $added 台设备到画面墙'
+          : '已添加 $added 台，$failed 台没加上：$firstError'),
+    ));
   }
 
   Future<void> _removePeer(String id) async {
