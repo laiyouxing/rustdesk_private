@@ -71,7 +71,12 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     // 事件走 desktop_multi_window 的 windowEventChannel，只有设置过 method handler
     // 才会把 onEvent 分发给 MultiWindowListener（其他子窗口的标签页里都会设）。
     DesktopMultiWindow.addListener(this);
-    rustDeskWinManager.setMethodHandler((call, fromWindowId) async {});
+    rustDeskWinManager.setMethodHandler((call, fromWindowId) async {
+      // 主窗口再次打开画面墙时不会新建窗口，而是让这个隐藏窗口显示并重连各格。
+      if (call.method == 'wall-show') {
+        unawaited(_handleShowRequest());
+      }
+    });
     // 地址簿里带着设备别名，加载完再刷一次列表，格子上才是「别名：ID」。
     unawaited(_ensureAddressBookLoaded().then((_) {
       if (mounted) unawaited(_loadPeers());
@@ -127,19 +132,55 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
         unawaited(bind.sessionClose(sessionId: member.sessionId));
       } catch (_) {}
     }
-    unawaited(_closeWindowController());
+    _tileSessions.clear();
+    unawaited(_hideSelf());
   }
 
-  Future<void> _closeWindowController() async {
+  /// 关窗 = 隐藏窗口（和 RustDesk 其它子窗口一致）。
+  ///
+  /// `hide()` 走 multi_window 的 `hide` 方法 → 原生 `ShowWindow(hwnd, SW_HIDE)`，
+  /// 不经过 `preventClose` / `WM_CLOSE` / `DefWindowProc` 那条容易出问题的链路，
+  /// 所以一定能生效。窗口对象留着复用：主窗口再点「画面墙」就 `show()` 回来。
+  Future<void> _hideSelf() async {
     try {
-      final controller = WindowController.fromWindowId(kWindowId!);
-      await controller
-          .setPreventClose(false)
-          .timeout(const Duration(milliseconds: 300));
-      await controller.close().timeout(const Duration(milliseconds: 300));
+      await WindowController.fromWindowId(kWindowId!)
+          .hide()
+          .timeout(const Duration(milliseconds: 600));
     } catch (e) {
-      debugPrint('wall: close window failed: $e');
+      debugPrint('wall: hide window failed: $e');
     }
+    try {
+      await rustDeskWinManager.call(WindowType.Main, kWindowEventHide,
+          {"id": kWindowId!}).timeout(const Duration(milliseconds: 600));
+    } catch (_) {}
+    // 隐藏后窗口还活着，下一次点 × 还要能用。
+    _closing = false;
+  }
+
+  /// 主窗口要求重新显示画面墙：先把窗口显示出来，再让每一格重新连一次。
+  Future<void> _handleShowRequest() async {
+    if (!mounted) return;
+    try {
+      await rustDeskWinManager.call(WindowType.Main, kWindowEventShow,
+          {"id": kWindowId!}).timeout(const Duration(milliseconds: 800));
+    } catch (_) {}
+    try {
+      await WindowController.fromWindowId(kWindowId!)
+          .show()
+          .timeout(const Duration(seconds: 2));
+    } catch (e) {
+      debugPrint('wall: show failed: $e');
+    }
+    if (!mounted) return;
+    setState(() {
+      _reconnectToken++;
+      _selected.clear();
+      _selectMode = false;
+      _groupControl = false;
+      _masterId = null;
+    });
+    _sync.clearWallGroup();
+    await _loadPeers();
   }
 
   @override
@@ -401,6 +442,9 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   bool _groupControl = false;
   String? _masterId;
   final Map<String, SyncMember> _tileSessions = <String, SyncMember>{};
+
+  /// 每加一次，格子收到新 token 就重连一次（窗口隐藏后重新打开时用）。
+  int _reconnectToken = 0;
 
   void _enterGroupControl() {
     setState(() {
@@ -970,6 +1014,7 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
       isMaster: _groupControl && _masterId == peer.id,
       onMakeMaster: () => _toggleMaster(peer.id),
       onSession: _onTileSession,
+      reconnectToken: _reconnectToken,
     );
   }
 }
@@ -1029,6 +1074,9 @@ class _WallTile extends StatefulWidget {
   final void Function(String peerId, UuidValue sessionId, int width, int height)
       onSession;
 
+  /// 变化即重连（窗口隐藏后又显示时，会话需要重新建立）。
+  final int reconnectToken;
+
   const _WallTile({
     super.key,
     required this.peer,
@@ -1042,6 +1090,9 @@ class _WallTile extends StatefulWidget {
     this.isMaster = false,
     required this.onMakeMaster,
     required this.onSession,
+
+    /// 变化即重连（窗口隐藏后又显示时，会话需要重新建立）。
+    this.reconnectToken = 0,
   });
 
   @override
@@ -1117,6 +1168,9 @@ class _WallTileState extends State<_WallTile> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _keyFocusNode.requestFocus();
       });
+    }
+    if (widget.reconnectToken != oldWidget.reconnectToken) {
+      unawaited(_retry());
     }
   }
 
@@ -1752,16 +1806,33 @@ class _WallTileState extends State<_WallTile> {
 /// 以独立窗口打开画面墙。
 ///
 /// 不要用 `Navigator.push`：画面墙会顶掉主窗口的首页内容，返回时首页偶尔渲染成空白。
+/// 最近一次打开的画面墙窗口 id：窗口只隐藏不销毁，再点「画面墙」就把它显示回来，
+/// 避免每开一次多一个隐藏窗口、多一份 Flutter 引擎内存。
+int? _wallWindowId;
+
 Future<void> openWallWindow() async {
+  final existing = _wallWindowId;
+  if (existing != null) {
+    try {
+      await DesktopMultiWindow.invokeMethod(
+              existing, 'wall-show', <String, dynamic>{})
+          .timeout(const Duration(seconds: 2));
+      return;
+    } catch (e) {
+      debugPrint('wall: reuse window failed: $e');
+      _wallWindowId = null;
+    }
+  }
   final argument = jsonEncode({'type': WindowType.Wall.index});
   try {
-    await rustDeskWinManager.newSessionWindow(
+    final id = await rustDeskWinManager.newSessionWindow(
       WindowType.Wall,
       '',
       argument,
       <int>[],
       false,
     );
+    if (id > 0) _wallWindowId = id;
   } catch (e) {
     debugPrint('open wall window failed: $e');
   }
