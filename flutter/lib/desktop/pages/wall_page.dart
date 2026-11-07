@@ -178,6 +178,7 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
       _selectMode = false;
       _groupControl = false;
       _masterId = null;
+      _masterFullscreen = false;
     });
     _sync.clearWallGroup();
     await _loadPeers();
@@ -509,6 +510,10 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
 
   bool _groupControl = false;
   String? _masterId;
+
+  /// 主控格是否铺满整个画面墙窗口（其余格子仍在后台被控）。
+  bool _masterFullscreen = false;
+
   final Map<String, SyncMember> _tileSessions = <String, SyncMember>{};
 
   /// 每加一次，格子收到新 token 就重连一次（窗口隐藏后重新打开时用）。
@@ -529,6 +534,7 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
     setState(() {
       _groupControl = false;
       _masterId = null;
+      _masterFullscreen = false;
     });
   }
 
@@ -536,8 +542,16 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   void _toggleMaster(String peerId) {
     setState(() {
       _masterId = _masterId == peerId ? null : peerId;
+      if (_masterId == null) _masterFullscreen = false;
     });
     _syncWallTargets();
+  }
+
+  /// 主控全屏/退出全屏。全屏只是布局变化，其余格子仍留在树里继续被控。
+  void _toggleMasterFullscreen() {
+    setState(() {
+      _masterFullscreen = !_masterFullscreen;
+    });
   }
 
   /// 当前会被广播的格子数（已连上、且不是主控）。
@@ -979,6 +993,38 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   /// 用 Stack + 绝对定位自己排，是因为 `GridView` 不支持跨格；这样主控格能真正
   /// 放大到四格大小，方便在里面操作键鼠。
   Widget _buildGrid() {
+    // 主控全屏：只把主控格铺满窗口。其余格子仍留在树里，
+    // 会话不销毁、群控广播照旧，只是不显示。
+    if (_masterFullscreen && _masterId != null) {
+      _WallPeer? master;
+      for (final peer in _peers) {
+        if (peer.id == _masterId) {
+          master = peer;
+          break;
+        }
+      }
+      if (master != null) {
+        return Padding(
+          padding: const EdgeInsets.all(12),
+          child: Stack(
+            children: [
+              Positioned.fill(child: _buildTile(master)),
+              // 其余格子留在树里（摆在可视区外 + 正常尺寸，避免 1x1 约束导致
+              // 布局溢出告警），会话与群控广播都不受影响，只是看不见。
+              for (final peer in _peers)
+                if (peer.id != master.id)
+                  Positioned(
+                    left: -1000,
+                    top: 0,
+                    width: 320,
+                    height: 200,
+                    child: _buildTile(peer),
+                  ),
+            ],
+          ),
+        );
+      }
+    }
     return LayoutBuilder(
       builder: (context, constraints) {
         const gap = 12.0;
@@ -1083,6 +1129,8 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
       onMakeMaster: () => _toggleMaster(peer.id),
       onSession: _onTileSession,
       reconnectToken: _reconnectToken,
+      fullscreen: _masterFullscreen && _masterId == peer.id,
+      onToggleFullscreen: _toggleMasterFullscreen,
     );
   }
 }
@@ -1145,6 +1193,10 @@ class _WallTile extends StatefulWidget {
   /// 变化即重连（窗口隐藏后又显示时，会话需要重新建立）。
   final int reconnectToken;
 
+  /// 主控格是否全屏（铺满整个画面墙窗口）。
+  final bool fullscreen;
+  final VoidCallback onToggleFullscreen;
+
   const _WallTile({
     super.key,
     required this.peer,
@@ -1161,6 +1213,10 @@ class _WallTile extends StatefulWidget {
 
     /// 变化即重连（窗口隐藏后又显示时，会话需要重新建立）。
     this.reconnectToken = 0,
+
+    /// 主控格是否全屏（铺满整个画面墙窗口）。
+    this.fullscreen = false,
+    required this.onToggleFullscreen,
   });
 
   @override
@@ -1210,6 +1266,8 @@ class _WallTileState extends State<_WallTile> {
       final index = _displayIndex(ffi, displays.length);
       final display = displays[index];
       if (display.width < 100 || display.height < 100) return;
+      // 有真实分辨率了，顺手把输入用的显示矩形算出来（主控格要靠它换算鼠标坐标）。
+      _ensureInputReady(ffi);
       widget.onSession(
         widget.peer.id,
         ffi.sessionId,
@@ -1233,13 +1291,26 @@ class _WallTileState extends State<_WallTile> {
     super.didUpdateWidget(oldWidget);
     // 刚被设成主控：把键盘焦点拿过来，否则按键进不了远程会话。
     if (widget.groupControl && widget.isMaster && !oldWidget.isMaster) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _keyFocusNode.requestFocus();
-      });
+      _activateAsMaster();
+    }
+    if (widget.fullscreen && !oldWidget.fullscreen) {
+      _activateAsMaster();
     }
     if (widget.reconnectToken != oldWidget.reconnectToken) {
       unawaited(_retry());
     }
+  }
+
+  /// 成为主控 / 进入全屏后，把输入链路一次备好：焦点、enter 状态、显示矩形。
+  void _activateAsMaster() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final ffi = _ffi;
+      if (ffi == null) return;
+      _ensureInputReady(ffi);
+      ffi.inputModel.enterOrLeave(true);
+      _keyFocusNode.requestFocus();
+    });
   }
 
   /// 页面下发了批量设置：只有被选中的格子执行。
@@ -1552,7 +1623,22 @@ class _WallTileState extends State<_WallTile> {
               style: const TextStyle(color: Colors.white, fontSize: 11),
             ),
           ),
-          if (!widget.selectMode) _buildMenu(),
+          if (!widget.selectMode) ...[
+            if (widget.groupControl && widget.isMaster)
+              IconButton(
+                tooltip: widget.fullscreen ? '退出全屏' : '主控全屏',
+                iconSize: 16,
+                padding: EdgeInsets.zero,
+                constraints:
+                    const BoxConstraints.tightFor(width: 26, height: 26),
+                icon: Icon(
+                  widget.fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                  color: Colors.white,
+                ),
+                onPressed: widget.onToggleFullscreen,
+              ),
+            _buildMenu(),
+          ],
         ],
       ),
     );
@@ -1741,8 +1827,14 @@ class _WallTileState extends State<_WallTile> {
     if (!widget.groupControl || !widget.isMaster) return child;
     // 点主控格就把键盘焦点要回来：窗口刚激活、或用户先点了别的格子时，
     // 没有这一步按键会一直进不到主控会话。
+    void activate() {
+      _ensureInputReady(ffi);
+      ffi.inputModel.enterOrLeave(true);
+      _keyFocusNode.requestFocus();
+    }
+
     return Listener(
-      onPointerDown: (_) => _keyFocusNode.requestFocus(),
+      onPointerDown: (_) => activate(),
       child: RawKeyFocusScope(
         focusNode: _keyFocusNode,
         onFocusChange: (focused) => ffi.inputModel.enterOrLeave(focused),
@@ -1752,11 +1844,26 @@ class _WallTileState extends State<_WallTile> {
           isCamera: false,
           child: RawPointerMouseRegion(
             inputModel: ffi.inputModel,
+            onPointerDown: (_) => activate(),
             child: child,
           ),
         ),
       ),
     );
+  }
+
+  /// 主控格第一次收到输入前，确保「远程显示矩形」已经算好。
+  ///
+  /// `InputModel._handlePointerDevicePos` 在 `ffiModel.rect == null` 时会直接
+  /// 丢弃所有鼠标事件（`if (rect == null) return null;`），画面墙格子不经过
+  /// RemotePage 的切换屏幕流程，所以这里主动算一次。
+  void _ensureInputReady(FFI ffi) {
+    try {
+      // 不判断是否已有 rect：`updateCurDisplay` 内部会比对新旧矩形，没变化直接返回。
+      unawaited(ffi.ffiModel.updateCurDisplay(ffi.sessionId));
+    } catch (e) {
+      debugPrint('wall: prepare input rect failed: $e');
+    }
   }
 
   Widget _buildContent() {
