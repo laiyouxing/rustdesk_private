@@ -1350,77 +1350,39 @@ class _WallTileState extends State<_WallTile> {
   Widget build(BuildContext context) {
     final card = Card(
       clipBehavior: Clip.antiAlias,
-      child: Stack(
-        fit: StackFit.expand,
+      child: Column(
         children: [
-          _buildContent(),
-          Positioned(
-            left: 6,
-            top: 6,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (widget.selectMode)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 4),
-                      child: Icon(
-                        widget.selected
-                            ? Icons.check_circle
-                            : Icons.radio_button_unchecked,
-                        size: 14,
-                        color: widget.selected
-                            ? Colors.lightBlueAccent
-                            : Colors.white70,
+          // 标题栏放在画面之外：右上角的菜单/移除不再压住远程桌面上的按钮，
+          // 不透明底色也避免半透明按钮看不清、误点移除。
+          _buildHeaderBar(),
+          Expanded(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                _buildContent(),
+                if (widget.groupControl)
+                  Positioned(
+                    left: 6,
+                    bottom: 6,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: widget.isMaster
+                            ? Colors.orange
+                            : const Color(0xFF1B1B1B),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        widget.isMaster ? '主控' : '被控',
+                        style:
+                            const TextStyle(color: Colors.white, fontSize: 11),
                       ),
                     ),
-                  Text(
-                    _tileTitle,
-                    style: const TextStyle(color: Colors.white, fontSize: 11),
                   ),
-                ],
-              ),
+              ],
             ),
           ),
-          if (widget.groupControl)
-            Positioned(
-              left: 6,
-              bottom: 6,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: widget.isMaster ? Colors.orange : Colors.black54,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  widget.isMaster ? '主控' : '被控',
-                  style: const TextStyle(color: Colors.white, fontSize: 11),
-                ),
-              ),
-            ),
-          if (!widget.selectMode)
-            Positioned(
-              right: 0,
-              top: 0,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _buildMenu(),
-                  IconButton(
-                    tooltip: '从画面墙移除',
-                    iconSize: 16,
-                    color: Colors.white70,
-                    onPressed: widget.onRemove,
-                    icon: const Icon(Icons.close),
-                  ),
-                ],
-              ),
-            ),
         ],
       ),
     );
@@ -1439,6 +1401,38 @@ class _WallTileState extends State<_WallTile> {
       behavior: HitTestBehavior.opaque,
       onTap: widget.onToggleSelect,
       child: card,
+    );
+  }
+
+  /// 每格顶部的不透明标题栏：左「别名：ID」（多选时带勾选圈），右「⋮」。
+  Widget _buildHeaderBar() {
+    return Container(
+      height: 26,
+      color: const Color(0xFF262626),
+      padding: const EdgeInsets.only(left: 6, right: 2),
+      child: Row(
+        children: [
+          if (widget.selectMode) ...[
+            Icon(
+              widget.selected
+                  ? Icons.check_circle
+                  : Icons.radio_button_unchecked,
+              size: 14,
+              color: widget.selected ? Colors.lightBlueAccent : Colors.white70,
+            ),
+            const SizedBox(width: 4),
+          ],
+          Expanded(
+            child: Text(
+              _tileTitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 11),
+            ),
+          ),
+          if (!widget.selectMode) _buildMenu(),
+        ],
+      ),
     );
   }
 
@@ -1515,16 +1509,26 @@ class _WallTileState extends State<_WallTile> {
     items.add(const PopupMenuDivider());
     items.add(const PopupMenuItem<String>(
       value: 'remove',
-      child: Text('从画面墙移除'),
+      child: Row(
+        children: [
+          Icon(Icons.delete_outline, size: 16, color: Colors.red),
+          SizedBox(width: 6),
+          Text('从画面墙移除', style: TextStyle(color: Colors.red)),
+        ],
+      ),
     ));
 
     return PopupMenuButton<String>(
       tooltip: '更多操作',
       padding: EdgeInsets.zero,
-      iconSize: 16,
-      icon: const Icon(Icons.more_vert, color: Colors.white70),
       onSelected: _onMenuSelected,
       itemBuilder: (context) => items,
+      // 用 child 而不是 icon：标题栏只有 26 高，IconButton 默认 48×48 会撑破。
+      child: const SizedBox(
+        width: 30,
+        height: 26,
+        child: Icon(Icons.more_vert, size: 18, color: Colors.white),
+      ),
     );
   }
 
@@ -1539,7 +1543,25 @@ class _WallTileState extends State<_WallTile> {
       return;
     }
     if (value == 'remove') {
-      widget.onRemove();
+      // 移除是不可逆操作，先确认一次，避免误点。
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('从画面墙移除'),
+          content: Text('确定把「$_tileTitle」从画面墙移除吗？\n只影响画面墙，设备本身和远程会话配置都不受影响。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('移除', style: TextStyle(color: Colors.red)),
+            ),
+          ],
+        ),
+      );
+      if (confirmed == true && mounted) widget.onRemove();
       return;
     }
     if (ffi == null) return;
