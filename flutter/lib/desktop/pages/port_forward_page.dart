@@ -66,6 +66,8 @@ class _PortForwardPageState extends State<PortForwardPage>
   /// 注意：必须声明成 RxMap，GetX 里 RxMap 无法赋给 Rx<Map<..>>。
   final RxMap<String, dynamic> tunnelStat = <String, dynamic>{}.obs;
   Timer? _statTimer;
+  /// 连接就绪监听：登录成功后收起「等待对方接受 / Logging in…」等提示窗口。
+  Worker? _connReadyWorker;
   late FFI _ffi;
 
   @override
@@ -80,6 +82,14 @@ class _PortForwardPageState extends State<PortForwardPage>
         connToken: widget.connToken,
         isRdp: widget.isRDP);
     Get.put<FFI>(_ffi, tag: 'pf_${widget.id}');
+    // 端口转发没有「首帧画面」，remote_page 里靠 imageReady 关闭连接提示窗口的逻辑
+    // 在本页走不到，导致连接成功后「等待对方接受 / Logging in…」等提示窗口一直挂着。
+    // 这里在登录成功（peer_info 下发、pi.isSet 置真）时主动收起这些提示窗口。
+    _connReadyWorker = ever<bool>(_ffi.ffiModel.pi.isSet, (isSet) {
+      if (isSet && mounted) {
+        _ffi.dialogManager.dismissAll();
+      }
+    });
     debugPrint("Port forward page init success with id ${widget.id}");
     // 定时刷新隧道状态（直连/中继、流量）。1 秒一次足够，开销可忽略。
     _statTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -97,6 +107,8 @@ class _PortForwardPageState extends State<PortForwardPage>
   void dispose() {
     _statTimer?.cancel();
     _statTimer = null;
+    _connReadyWorker?.dispose();
+    _connReadyWorker = null;
     _ffi.close();
     _ffi.dialogManager.dismissAll();
     Get.delete<FFI>(tag: 'pf_${widget.id}');

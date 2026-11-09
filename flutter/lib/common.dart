@@ -1261,6 +1261,7 @@ void msgBox(SessionID sessionId, String type, String title, String text,
   if (link.isNotEmpty) {
     buttons.insert(0, dialogButton('JumpLink', onPressed: jumplink));
   }
+  final msgboxTag = '$sessionId-$type-$title-$text-$link';
   dialogManager.show(
     (setState, close, context) => CustomAlertDialog(
       title: null,
@@ -1269,8 +1270,15 @@ void msgBox(SessionID sessionId, String type, String title, String text,
       onSubmit: hasOk ? submit : null,
       onCancel: hasCancel == true ? cancel : null,
     ),
-    tag: '$sessionId-$type-$title-$text-$link',
+    tag: msgboxTag,
   );
+  // 端口转发的「本地 xxx 已开始监听」只是信息提示，不应一直挂着：3 秒后自动收起。
+  // 其它 success 提示（如 "Connected, waiting for image..."）有自己的关闭时机，不受影响。
+  if (type == 'success' && title == 'Port Forward') {
+    Future.delayed(const Duration(seconds: 3), () {
+      dialogManager.dismissByTag(msgboxTag);
+    });
+  }
 }
 
 Color? _msgboxColor(String type) {

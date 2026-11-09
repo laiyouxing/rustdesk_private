@@ -171,13 +171,13 @@ pub async fn listen(
                 let password = password.clone();
                 let mut forward = Framed::new(forward, BytesCodec::new());
                 match connect_and_login(&id, &password, &mut ui_receiver, interface.clone(), &mut forward, key, token, is_rdp).await {
-                    Ok(Some((stream, direct, secure))) => {
+                    Ok(Some((stream, direct, secure, keep_alive))) => {
                         let interface = interface.clone();
                         let target = format!("{}:{}", remote_host, remote_port);
                         status_set_connected(direct, secure, listen_port, &remote_host, remote_port);
                         tokio::spawn(async move {
                             let began = std::time::Instant::now();
-                            match run_forward(forward, stream, secure).await {
+                            match run_forward(forward, stream, secure, keep_alive).await {
                                 Ok(nbytes) => {
                                     status_set_closed(nbytes);
                                     let elapsed = began.elapsed();
@@ -244,19 +244,46 @@ async fn connect_and_login(
     key: &str,
     token: &str,
     is_rdp: bool,
-) -> ResultType<Option<(Stream, bool, bool)>> {
+) -> ResultType<Option<(Stream, bool, bool, Option<mpsc::UnboundedSender<()>>)>> {
     let conn_type = if is_rdp {
         ConnType::RDP
     } else {
         ConnType::PORT_FORWARD
     };
+    // 中继抖动 / 对端刚上线时建立连接偶发失败，重试几次再报错，避免隧道一用就断。
+    let mut started = None;
+    let mut last_err = None;
+    for attempt in 0..3u32 {
+        match Client::start(id, key, token, conn_type, interface.clone()).await {
+            Ok(v) => {
+                started = Some(v);
+                break;
+            }
+            Err(err) => {
+                log::warn!("port forward: connect attempt {} failed: {err}", attempt + 1);
+                last_err = Some(err);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        600 * (1u64 << attempt),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
     let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server, ..)) =
-        Client::start(id, key, token, conn_type, interface.clone()).await?;
+        match started {
+            Some(v) => v,
+            None => return Err(last_err.unwrap()),
+        };
     interface.update_direct(Some(direct));
     let mut buffer = Vec::new();
     let mut received = false;
 
-    let _keep_it = hc_connection(feedback, rendezvous_server, token).await;
+    // 这个 sender 一旦被 drop，健康检查连接就会关闭（hc_connection_ 里 rx.recv() 返回 None）。
+    // 必须一直持有到转发结束，否则转发期间没有心跳，中继/对端可能把会话判死——表现为隧道
+    // 用一会儿就断。所以作为返回值传出去，由 run_forward 持有。
+    let keep_alive = hc_connection(feedback, rendezvous_server, token).await;
 
     // 被控端版本，登录成功后从 PeerInfo 里取；用它来决定隧道是否加密。
     let mut peer_version = String::new();
@@ -341,7 +368,7 @@ async fn connect_and_login(
             allow_err!(stream.send_bytes(buffer.into()).await);
         }
     }
-    Ok(Some((stream, direct, encrypted)))
+    Ok(Some((stream, direct, encrypted, keep_alive)))
 }
 
 /// 攒批上限：单次转发最多合并这么大的数据，避免大流量时占用过多内存。
@@ -360,6 +387,8 @@ async fn run_forward(
     forward: Framed<TcpStream, BytesCodec>,
     stream: Stream,
     encrypted: bool,
+    // 持有健康检查连接的 sender，保证转发期间心跳不断（drop 即断）。
+    _keep_alive: Option<mpsc::UnboundedSender<()>>,
 ) -> ResultType<u64> {
     log::info!("new port forwarding connection started");
     let mut forward = forward;
