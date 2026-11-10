@@ -1937,6 +1937,56 @@ class InputModel {
     return evtToPeer;
   }
 
+  /// 画面墙主控专用：用「远程像素坐标」直接发送鼠标事件。
+  ///
+  /// 画面墙格子把远程画面按原始分辨率放进 `SizedBox` 再整体缩放，监听器拿到的
+  /// `localPosition` 就等于远程像素坐标。这里不能走 [CanvasModel] 的
+  /// 「窗口全局坐标 - tab/边框」换算（那套只适用于整窗口的 RemotePage），否则
+  /// 坐标会整体偏移——表现为主控格点了没反应或点偏。
+  ///
+  /// [type] 用 [kMouseEventTypeDefault]（移动）、[kMouseEventTypeDown]、
+  /// [kMouseEventTypeUp] 或 `'wheel'`。
+  Map<String, dynamic>? sendMouseAtRemotePixel({
+    required String type,
+    required int x,
+    required int y,
+    int buttons = 0,
+    int wheelX = 0,
+    int wheelY = 0,
+    bool broadcast = true,
+  }) {
+    if (isViewOnly || isViewCamera) return null;
+    Map<String, dynamic> evt;
+    if (type == kMouseEventTypeDefault) {
+      evt = {
+        'type': kMouseEventTypeDefault,
+        'x': '$x',
+        'y': '$y',
+        'buttons': mouseButtonsToPeer(buttons),
+      };
+    } else if (type == kMouseEventTypeDown || type == kMouseEventTypeUp) {
+      evt = {
+        'type': type,
+        'buttons': mouseButtonsToPeer(buttons),
+        'x': '0',
+        'y': '0',
+      };
+    } else if (type == 'wheel') {
+      evt = {'type': 'wheel', 'x': '$wheelX', 'y': '$wheelY'};
+    } else {
+      return null;
+    }
+    modify(evt);
+    final payload = json.encode(evt);
+    bind.sessionSendMouse(sessionId: sessionId, msg: payload);
+    if (broadcast && type != kMouseEventTypeDefault) {
+      // 移动事件带 x/y，需要按各目标分辨率归一化后广播（由调用方做）；
+      // 点击/滚轮与坐标无关，原样复制即可。
+      SyncController.instance.broadcastMouseRaw(sessionId, payload);
+    }
+    return evt;
+  }
+
   Point? handlePointerDevicePos(
     String kind,
     double x,

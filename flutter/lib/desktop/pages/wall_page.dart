@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -1823,6 +1824,8 @@ class _WallTileState extends State<_WallTile> {
   /// `InputModel` 在发按键/鼠标时会把事件复制给同步组成员，而画面墙群控已经把
   /// 被控格登记成成员，所以这里不需要再单独写一遍广播逻辑。
   /// 输入层必须放在按远程分辨率撑开的 `SizedBox` 内部，指针坐标才等于远程像素坐标。
+  /// 鼠标必须用本地坐标直接发送（见 `_WallMouseRegion`）：`InputModel` 默认的坐标
+  /// 换算是「窗口全局坐标 - tab/边框」，墙格子不在窗口左上角，套用会整体偏移。
   Widget _buildInputRegion(FFI ffi, Widget child) {
     if (!widget.groupControl || !widget.isMaster) return child;
     // 点主控格就把键盘焦点要回来：窗口刚激活、或用户先点了别的格子时，
@@ -1839,14 +1842,12 @@ class _WallTileState extends State<_WallTile> {
         focusNode: _keyFocusNode,
         onFocusChange: (focused) => ffi.inputModel.enterOrLeave(focused),
         inputModel: ffi.inputModel,
-        child: RawTouchGestureDetectorRegion(
+        child: _WallMouseRegion(
           ffi: ffi,
-          isCamera: false,
-          child: RawPointerMouseRegion(
-            inputModel: ffi.inputModel,
-            onPointerDown: (_) => activate(),
-            child: child,
-          ),
+          srcWidth: _displayWidth(ffi),
+          srcHeight: _displayHeight(ffi),
+          onActivate: activate,
+          child: child,
         ),
       ),
     );
@@ -1975,6 +1976,117 @@ class _WallTileState extends State<_WallTile> {
     } catch (_) {
       return 1;
     }
+  }
+}
+
+/// 画面墙主控格的鼠标输入层。
+///
+/// 与 RemotePage 不同：墙格子的画面按原始分辨率放在 `SizedBox` 里再由 `FittedBox`
+/// 整体缩放，监听器的 `localPosition` 就是远程像素坐标。所以这里直接用本地坐标
+/// 发送，不走 `InputModel` 的「窗口全局坐标 - tab/边框」换算——那套只适用于整窗口
+/// 的 RemotePage，套到墙格子上会让坐标整体偏移（表现为主控格点了没反应或点偏）。
+class _WallMouseRegion extends StatefulWidget {
+  final FFI ffi;
+  final int srcWidth;
+  final int srcHeight;
+  final VoidCallback onActivate;
+  final Widget child;
+
+  const _WallMouseRegion({
+    required this.ffi,
+    required this.srcWidth,
+    required this.srcHeight,
+    required this.onActivate,
+    required this.child,
+  });
+
+  @override
+  State<_WallMouseRegion> createState() => _WallMouseRegionState();
+}
+
+class _WallMouseRegionState extends State<_WallMouseRegion> {
+  int _lastButtons = 0;
+
+  void _sendMove(Offset local, int buttons) {
+    final x = local.dx.round();
+    final y = local.dy.round();
+    widget.ffi.inputModel.sendMouseAtRemotePixel(
+      type: kMouseEventTypeDefault,
+      x: x,
+      y: y,
+      buttons: buttons,
+      broadcast: false,
+    );
+    // 群控：移动按各目标分辨率归一化后广播（主控自己的会话上面已单独发送）。
+    SyncController.instance.broadcastAbsoluteMove(
+      sourceSessionId: widget.ffi.sessionId,
+      srcWidth: widget.srcWidth,
+      srcHeight: widget.srcHeight,
+      x: x,
+      y: y,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      // Texture 自身不参与命中测试，必须 opaque 才能收到指针事件。
+      behavior: HitTestBehavior.opaque,
+      onPointerHover: (e) => _sendMove(e.localPosition, e.buttons),
+      onPointerDown: (e) {
+        widget.onActivate();
+        _lastButtons = e.buttons;
+        _sendMove(e.localPosition, e.buttons);
+        widget.ffi.inputModel.sendMouseAtRemotePixel(
+          type: kMouseEventTypeDown,
+          x: 0,
+          y: 0,
+          buttons: _lastButtons,
+        );
+      },
+      onPointerMove: (e) {
+        _lastButtons = e.buttons;
+        _sendMove(e.localPosition, e.buttons);
+      },
+      onPointerUp: (e) {
+        widget.ffi.inputModel.sendMouseAtRemotePixel(
+          type: kMouseEventTypeUp,
+          x: 0,
+          y: 0,
+          buttons: _lastButtons,
+        );
+        _lastButtons = e.buttons;
+      },
+      onPointerSignal: (e) {
+        if (e is! PointerScrollEvent) return;
+        var dx = e.scrollDelta.dx.toInt();
+        var dy = e.scrollDelta.dy.toInt();
+        if (dx.abs() > dy.abs()) {
+          dy = 0;
+        } else {
+          dx = 0;
+        }
+        if (dx > 0) {
+          dx = -1;
+        } else if (dx < 0) {
+          dx = 1;
+        }
+        if (dy > 0) {
+          dy = -1;
+        } else if (dy < 0) {
+          dy = 1;
+        }
+        if (dx == 0 && dy == 0) return;
+        widget.ffi.inputModel.sendMouseAtRemotePixel(
+          type: 'wheel',
+          x: 0,
+          y: 0,
+          wheelX: dx,
+          wheelY: dy,
+        );
+      },
+      child: widget.child,
+    );
   }
 }
 

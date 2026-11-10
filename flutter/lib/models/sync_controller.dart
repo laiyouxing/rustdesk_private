@@ -382,6 +382,18 @@ class SyncController extends ChangeNotifier {
     }
   }
 
+  /// 原样把鼠标消息复制给同组会话，不做任何过滤。
+  ///
+  /// 画面墙主控用：坐标已在墙侧按本地预览坐标换算好，点击/滚轮这类消息直接复制
+  /// 即可（绝对移动另走 [broadcastAbsoluteMove] 做分辨率归一化）。
+  void broadcastMouseRaw(UuidValue sourceSessionId, String payload) {
+    for (final member in _resolveTargets(sourceSessionId)) {
+      try {
+        bind.sessionSendMouse(sessionId: member.sessionId, msg: payload);
+      } catch (_) {}
+    }
+  }
+
   /// 绝对鼠标移动：按比例归一化后广播，不同分辨率的机器也能落在同一相对位置。
   ///
   /// [x]/[y] 是源会话远程桌面的像素坐标，[srcWidth]/[srcHeight] 是它的分辨率。
