@@ -207,6 +207,14 @@ impl<T: InvokeUiSession> Remote<T> {
         self.handler.lc.write().unwrap().reconnecting = true;
     }
 
+    /// 自动重连次数耗尽后的明确提示：会话已断开，不再自动重连。
+    ///
+    /// 之前重连耗尽后是静默退出，界面停在最后一帧，看起来像"卡死"。
+    pub fn notify_reconnect_exhausted(&self) {
+        self.handler
+            .msgbox("error", "Connection Error", "Connection lost", "");
+    }
+
     pub async fn io_loop(&mut self, key: &str, token: &str, round: u32) {
         // Reset per-connection state for auto-reconnect path.
         // User-initiated reconnect() clears peer_info via LoginConfigHandler,

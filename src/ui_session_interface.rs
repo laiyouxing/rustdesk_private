@@ -2078,12 +2078,13 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     let mut remote = Remote::new(handler, receiver, sender);
     // Auto-reconnect with exponential backoff to survive transient outages
     // such as Windows login/session switch (host process may restart).
-    // Initial: 1s, then 1.5s, 2.3s, 3.4s... capped at 15s, up to 30 attempts.
-    let max_retries: u32 = 30;
+    // 首次连接失败后最多自动重连 5 次（1s / 1.5s / 2.25s / 3.4s / 5s），
+    // 仍失败就放弃并明确提示"连接已断开"，不再无限重试。
+    let max_reconnects: u32 = 5;
     let mut delay = 1.0f32;
-    for retry in 0..max_retries {
+    for retry in 0..=max_reconnects {
         if retry > 0 {
-            log::info!("Connection lost, auto-reconnect attempt #{}/{} (delay={:.1}s)", retry + 1, max_retries, delay);
+            log::info!("Connection lost, auto-reconnect attempt #{}/{} (delay={:.1}s)", retry, max_reconnects, delay);
             // 标记为重连：Session::handle_login_error 据此区分"网络波动误报密码错误"，
             // 保留已保存的密码自动重试，避免反复弹"重新输入密码"；
             // 无密码/手动接收场景：重连时跳过"输入密码"弹框，直接发空密码由对端接受。
@@ -2105,6 +2106,10 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
         // 避免残留任务向全新的被控端连接发送数据块而被丢弃导致传输失败。
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         remote.prepare_file_jobs_for_reconnect().await;
+        // 5 次重连都失败：明确告诉用户连接已断开，不再自动重连。
+        if retry == max_reconnects {
+            remote.notify_reconnect_exhausted();
+        }
     }
     let _ = remote.sync_jobs_status_to_local().await;
 }
