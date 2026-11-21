@@ -2385,9 +2385,11 @@ pub(super) mod async_tasks {
             ("onlines", onlines.join(",")),
             ("offlines", offlines.join(",")),
         ]);
-        let _res = super::push_global_event(
-            super::APP_TYPE_MAIN,
-            serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
-        );
+        let event = serde_json::ser::to_string(&data).unwrap_or("".to_owned());
+        // 画面墙（appType "wall"）等子窗口也会主动查在线状态，只推给 main 会让它们
+        // 永远收不到结果，界面上就把设备全画成离线。这里推给所有已注册的窗口通道。
+        for channel in super::get_global_event_channels() {
+            let _res = super::push_global_event(&channel, event.clone());
+        }
     }
 }

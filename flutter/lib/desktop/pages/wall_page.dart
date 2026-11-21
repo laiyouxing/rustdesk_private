@@ -37,6 +37,9 @@ const Duration _kSlowHintAfter = Duration(seconds: 8);
 /// 密码类错误不适用宽限期——密码不对重试多少次也没用，直接提示去设置密码。
 const Duration kErrorGrace = Duration(seconds: 15);
 
+/// 在线状态查询结果的事件名，与 Rust 侧 `callback_query_onlines` 对应。
+const String _kCbQueryOnlines = 'callback_query_onlines';
+
 typedef _WallPeer = WallPeerEntry;
 
 /// 画面墙：一屏网格预览多台设备的实时画面（只读，不接收输入）。
@@ -65,6 +68,12 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   final ValueNotifier<_BatchSettings?> _batchSettings =
       ValueNotifier<_BatchSettings?>(null);
 
+  /// 「从地址簿选择」对话框打开期间的重绘入口。
+  ///
+  /// 在线状态是异步查回来的（`callback_query_onlines`），弹框时往往还没到，
+  /// 事件回来后要能重排、重绘对话框，否则用户看到的就是一片灰点（全离线）。
+  VoidCallback? _pickRefresh;
+
   @override
   void initState() {
     super.initState();
@@ -83,6 +92,45 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
       if (mounted) unawaited(_loadPeers());
     }));
     _loadPeers();
+    // 在线查询结果是在这个窗口里查的，就得在这个窗口里接。
+    // `Peers` 只在当前地址簿上更新，而「从地址簿选择」要遍历所有地址簿（含共享），
+    // 所以这里自己再挂一个 handler，覆盖全部地址簿里的设备。
+    platformFFI.registerEventHandler(
+        _kCbQueryOnlines, 'wall_page', (evt) async {
+      _applyOnlineStates(evt);
+    });
+  }
+
+  /// 把 `callback_query_onlines` 的结果写回所有地址簿里的设备，并刷新对话框。
+  void _applyOnlineStates(Map<String, dynamic> evt) {
+    final onlines = (evt['onlines'] as String? ?? '').split(',');
+    final offlines = (evt['offlines'] as String? ?? '').split(',');
+    if (onlines.every((e) => e.isEmpty) && offlines.every((e) => e.isEmpty)) {
+      return;
+    }
+    final onlineSet = onlines.where((e) => e.isNotEmpty).toSet();
+    final offlineSet = offlines.where((e) => e.isNotEmpty).toSet();
+    var changed = false;
+    try {
+      for (final ab in gFFI.abModel.addressbooks.values) {
+        for (final peer in ab.peers) {
+          if (onlineSet.contains(peer.id)) {
+            if (!peer.online) {
+              peer.online = true;
+              changed = true;
+            }
+          } else if (offlineSet.contains(peer.id)) {
+            if (peer.online) {
+              peer.online = false;
+              changed = true;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    if (changed) {
+      _pickRefresh?.call();
+    }
   }
 
   /// 画面墙跑在独立进程里，地址簿本来只在主窗口初始化，这里补一次。
@@ -188,6 +236,8 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
   @override
   void dispose() {
     DesktopMultiWindow.removeListener(this);
+    platformFFI.unregisterEventHandler(_kCbQueryOnlines, 'wall_page');
+    _pickRefresh = null;
     _sync.clearWallGroup();
     _batchSettings.dispose();
     super.dispose();
@@ -329,18 +379,22 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
         }
       }
     } catch (_) {}
+    // 别名在前，其次按 ID，方便在长列表里找；在线的排前面。
+    void sortItems() {
+      items.sort((a, b) {
+        if (a.peer.online != b.peer.online) return a.peer.online ? -1 : 1;
+        final byAlias =
+            a.peer.alias.toLowerCase().compareTo(b.peer.alias.toLowerCase());
+        return byAlias != 0 ? byAlias : a.peer.id.compareTo(b.peer.id);
+      });
+    }
+
     // 画面墙在独立进程里，在线状态不会被周期刷新，这里主动查一次再弹框。
     try {
       await bind.queryOnlines(ids: items.map((e) => e.peer.id).toList());
       await Future.delayed(const Duration(milliseconds: 700));
     } catch (_) {}
-    // 别名在前，其次按 ID，方便在长列表里找；在线的排前面。
-    items.sort((a, b) {
-      if (a.peer.online != b.peer.online) return a.peer.online ? -1 : 1;
-      final byAlias =
-          a.peer.alias.toLowerCase().compareTo(b.peer.alias.toLowerCase());
-      return byAlias != 0 ? byAlias : a.peer.id.compareTo(b.peer.id);
-    });
+    sortItems();
     if (!mounted) return;
     if (items.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -354,113 +408,125 @@ class _WallPageState extends State<WallPage> with MultiWindowListener {
         .map((item) => item.peer.id)
         .toList();
     final picked = <String>{};
+    // 弹框期间在线结果可能才回来（查询超时 3 秒，这里只等 700ms），
+    // 把刷新入口留给事件回调，到了就重排 + 重绘，别让用户一直看灰点。
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (dialogContext, setDialogState) => SimpleDialog(
-          title: Text(
-              '从地址簿选择（在线 ${items.where((i) => i.peer.online).length}/${items.length}）'),
-          children: [
-            SizedBox(
-              width: 460,
-              height: 420,
-              child: ListView.builder(
-                itemCount: items.length,
-                itemBuilder: (context, index) {
-                  final item = items[index];
-                  final onWall = existing.contains(item.peer.id);
-                  final checked = onWall || picked.contains(item.peer.id);
-                  return CheckboxListTile(
-                    dense: true,
-                    value: checked,
-                    controlAffinity: ListTileControlAffinity.leading,
-                    onChanged: onWall
-                        ? null
-                        : (value) => setDialogState(() {
-                              if (value == true) {
-                                picked.add(item.peer.id);
-                              } else {
-                                picked.remove(item.peer.id);
-                              }
-                            }),
-                    title: Row(
-                      children: [
-                        Tooltip(
-                          message: item.peer.online ? '在线' : '离线',
-                          child: CircleAvatar(
-                            radius: 4,
-                            backgroundColor:
-                                item.peer.online ? Colors.green : Colors.grey,
+        builder: (dialogContext, setDialogState) {
+          _pickRefresh = () {
+            if (!dialogContext.mounted) return;
+            setDialogState(sortItems);
+          };
+          // 每次重建都按最新的在线状态重排一次，避免事件刚好落在
+          // 排序与弹框之间时顺序是旧的（颜色已经是新的）。
+          sortItems();
+          return SimpleDialog(
+            title: Text(
+                '从地址簿选择（在线 ${items.where((i) => i.peer.online).length}/${items.length}）'),
+            children: [
+              SizedBox(
+                width: 460,
+                height: 420,
+                child: ListView.builder(
+                  itemCount: items.length,
+                  itemBuilder: (context, index) {
+                    final item = items[index];
+                    final onWall = existing.contains(item.peer.id);
+                    final checked = onWall || picked.contains(item.peer.id);
+                    return CheckboxListTile(
+                      dense: true,
+                      value: checked,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      onChanged: onWall
+                          ? null
+                          : (value) => setDialogState(() {
+                                if (value == true) {
+                                  picked.add(item.peer.id);
+                                } else {
+                                  picked.remove(item.peer.id);
+                                }
+                              }),
+                      title: Row(
+                        children: [
+                          Tooltip(
+                            message: item.peer.online ? '在线' : '离线',
+                            child: CircleAvatar(
+                              radius: 4,
+                              backgroundColor:
+                                  item.peer.online ? Colors.green : Colors.grey,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            item.peer.alias.isNotEmpty
-                                ? item.peer.alias
-                                : item.peer.id,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              item.peer.alias.isNotEmpty
+                                  ? item.peer.alias
+                                  : item.peer.id,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                        ),
-                        if (item.shared)
-                          const Text('共享',
-                              style:
-                                  TextStyle(fontSize: 11, color: Colors.grey)),
-                      ],
-                    ),
-                    subtitle: Text(
-                      onWall
-                          ? '${item.peer.id} · 已在画面墙'
-                          : (item.shared
-                              ? '${item.peer.id} · ${item.book}'
-                              : item.peer.id),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  );
-                },
+                          if (item.shared)
+                            const Text('共享',
+                                style:
+                                    TextStyle(fontSize: 11, color: Colors.grey)),
+                        ],
+                      ),
+                      subtitle: Text(
+                        onWall
+                            ? '${item.peer.id} · 已在画面墙'
+                            : (item.shared
+                                ? '${item.peer.id} · ${item.book}'
+                                : item.peer.id),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    );
+                  },
+                ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.only(right: 12, bottom: 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  TextButton(
-                    onPressed: addableIds.isEmpty
-                        ? null
-                        : () => setDialogState(() {
-                              if (picked.length == addableIds.length) {
-                                picked.clear();
-                              } else {
-                                picked
-                                  ..clear()
-                                  ..addAll(addableIds);
-                              }
-                            }),
-                    child: Text(
-                        picked.isNotEmpty && picked.length == addableIds.length
-                            ? '清空'
-                            : '全选'),
-                  ),
-                  TextButton(
-                    onPressed: () => Navigator.of(dialogContext).pop(false),
-                    child: const Text('取消'),
-                  ),
-                  TextButton(
-                    onPressed: picked.isEmpty
-                        ? null
-                        : () => Navigator.of(dialogContext).pop(true),
-                    child: Text('添加 ${picked.length} 台'),
-                  ),
-                ],
+              Padding(
+                padding: const EdgeInsets.only(right: 12, bottom: 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton(
+                      onPressed: addableIds.isEmpty
+                          ? null
+                          : () => setDialogState(() {
+                                if (picked.length == addableIds.length) {
+                                  picked.clear();
+                                } else {
+                                  picked
+                                    ..clear()
+                                    ..addAll(addableIds);
+                                }
+                              }),
+                      child: Text(
+                          picked.isNotEmpty && picked.length == addableIds.length
+                              ? '清空'
+                              : '全选'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(dialogContext).pop(false),
+                      child: const Text('取消'),
+                    ),
+                    TextButton(
+                      onPressed: picked.isEmpty
+                          ? null
+                          : () => Navigator.of(dialogContext).pop(true),
+                      child: Text('添加 ${picked.length} 台'),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ],
-        ),
+            ],
+          );
+        },
       ),
     );
+    _pickRefresh = null;
     if (confirmed != true || picked.isEmpty || !mounted) return;
     // 从地址簿选的时候顺便把别名记下来，格子上就能显示「别名：ID」。
     final aliases = _aliasesFromAddressBook();
