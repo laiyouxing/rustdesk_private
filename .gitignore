@@ -58,3 +58,5 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+# 机密运维说明，禁止入库
+SERVER-CONNECTION-INFO.md
