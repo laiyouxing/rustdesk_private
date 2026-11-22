@@ -4827,6 +4827,10 @@ async fn select_best_relay(
         known_b.iter().sum::<i64>() / known_b.len() as i64
     };
     let mut best: Option<(i64, String)> = None;
+    // 注意 `results` 的顺序 = `hosts` 的顺序 = 候选顺序 = hbbs 下发的调度顺序
+    // （api-server 已按分数排好序）。下面用**严格小于**比较，评分相同时保留
+    // 先出现的那个，于是平手时调度顺序说了算——这让"人工权重 / 调度权重"在
+    // 同机房、同线路这类延迟打平的场景下真正体现出来，而不是撞运气。
     for (host, b_rtt, reachable, a_rtt) in results {
         if !reachable {
             log::info!("  relay '{}': unreachable, skip", host);
@@ -4859,6 +4863,8 @@ async fn select_best_relay(
             region_penalty,
             score
         );
+        // 严格小于才替换：评分相同时保留先出现的（= 调度顺序靠前的），
+        // 这样平手时调度顺序说了算。
         if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) {
             best = Some((score, host));
         }
