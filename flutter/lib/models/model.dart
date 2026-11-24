@@ -1112,6 +1112,13 @@ class FfiModel with ChangeNotifier {
     // Disable relative mouse mode before reconnecting to ensure cursor is released.
     parent.target?.inputModel.setRelativeMouseMode(false);
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
+    // 重连复用同一个 FFI 实例及其事件流监听器（stream.listen 只在 start() 建立一次）。
+    // 连接断开时 closed 被置 true；若不复位，新一轮回传的 peer_info / 错误弹窗 /
+    // 首帧都会被 `if (closed) return` 吞掉 —— 表现为"正在连接"永不消失、报错也不弹。
+    // 故障 id=231 171 904 就是这个现象。
+    if (parent.target?.closed == true) {
+      parent.target?.closed = false;
+    }
     clearPermissions();
     dialogManager.dismissAll();
     dialogManager.showLoading(translate('Connecting...'),

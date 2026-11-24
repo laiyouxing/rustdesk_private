@@ -56,6 +56,12 @@ const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
 // 登录时 B 端显示器为空（如 RDP 会话切换）的最长等待时间，
 // 超时后向用户报 "No displays" 错误，避免 UI 永远停在"正在连接"。
 const DISPLAYS_EMPTY_TIMEOUT_SECS: u64 = 15;
+// 一轮建连卡在 Connecting 超过该时长即判定为僵死，此时用户/UI 的重连
+// 不再被 "Connecting => return" 静默吞掉，而是强制开启新一轮把界面
+// 从"正在连接"里解救出来。取 30s：单次 TCP 建连超时是 18s
+// （CONNECT_TIMEOUT），加上打洞(3s)/中继回退/secure 握手，正常一轮很少
+// 超过 30s；真正的僵死（故障 id=231 171 904）会远超此值。
+const CONNECT_STUCK_THRESHOLD_SECS: u64 = 30;
 
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
@@ -104,17 +110,32 @@ enum ConnectionState {
 pub struct ConnectionRoundState {
     round: u32,
     state: ConnectionState,
+    /// 本轮进入 Connecting 的时刻，用于识别"建连卡死"。
+    connecting_since: Option<std::time::Instant>,
 }
 
 impl ConnectionRoundState {
     pub fn new_round(&mut self) -> u32 {
         self.round += 1;
         self.state = ConnectionState::Connecting;
+        self.connecting_since = Some(std::time::Instant::now());
         self.round
     }
 
     pub fn set_connected(&mut self) {
         self.state = ConnectionState::Connected;
+        self.connecting_since = None;
+    }
+
+    /// 建连是否已卡死：长时间停留在 Connecting。Connected/Disconnected
+    /// 不算卡死；尚无轮次（connecting_since 为 None）也不误判。
+    pub fn is_connect_stuck(&self) -> bool {
+        match (&self.state, self.connecting_since) {
+            (ConnectionState::Connecting, Some(since)) => {
+                since.elapsed() >= std::time::Duration::from_secs(CONNECT_STUCK_THRESHOLD_SECS)
+            }
+            _ => false,
+        }
     }
 
     pub fn is_round_gt(&self, round: u32) -> bool {
@@ -130,6 +151,7 @@ impl ConnectionRoundState {
             false
         } else {
             self.state = ConnectionState::Disconnected;
+            self.connecting_since = None;
             true
         }
     }
@@ -140,6 +162,8 @@ impl Default for ConnectionRoundState {
         Self {
             round: 0,
             state: ConnectionState::Connecting,
+            // 默认不视为"卡死"：真正的轮次都经 new_round() 计时。
+            connecting_since: None,
         }
     }
 }
@@ -1281,13 +1305,29 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn reconnect(&self, force_relay: bool) {
-        // 1. If current session is connecting, do not reconnect.
+        // 1. If current session is connecting, do not reconnect — UNLESS the
+        //    connection has been stuck in Connecting for too long (僵死)。
+        //    旧逻辑在 Connecting 时无条件 return，一旦某轮 io_loop 卡在
+        //    Client::start 内（异常断开后旧线程还没退出），用户/UI 的重连
+        //    会被静默吞掉，界面永远停在"正在连接"（故障 id=231 171 904）。
+        //    这里对"卡死"网开一面：提升 round 开启新一轮，界面得以恢复。
         // 2. If the connection is established, send `Data::Close`.
         // 3. If the connection is disconnected, do nothing.
         let mut connection_round_state_lock = self.connection_round_state.lock().unwrap();
         if self.thread.lock().unwrap().is_some() {
             match connection_round_state_lock.state {
-                ConnectionState::Connecting => return,
+                ConnectionState::Connecting => {
+                    if !connection_round_state_lock.is_connect_stuck() {
+                        return;
+                    }
+                    log::warn!(
+                        "Reconnect: connection stuck in Connecting > {}s, forcing a new round",
+                        CONNECT_STUCK_THRESHOLD_SECS
+                    );
+                    // 不 send(Data::Close)：旧 io_loop 可能卡在 Client::start，
+                    // 收不到 channel 消息。靠提升 round 让它的 set_disconnected
+                    // 失效，旧线程自然退出；新一轮用新 round 建连。
+                }
                 ConnectionState::Connected => self.send(Data::Close),
                 ConnectionState::Disconnected => {}
             }
