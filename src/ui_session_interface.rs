@@ -1865,7 +1865,32 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 let gen = self.displays_empty_retries.fetch_add(1, Ordering::SeqCst) + 1;
                 let handler = self.clone();
                 tokio::spawn(async move {
-                    sleep(DISPLAYS_EMPTY_TIMEOUT_SECS as f32).await;
+                    // RDP 会话切换期间 B 端显示器可能在数秒后才恢复。查询只发一次
+                    // 不足以覆盖这段窗口，这里周期性重发查询，让 B 端重新枚举显示器；
+                    // 一旦恢复，B 端回传的带 displays 的 PeerInfo 会触发 need_resume。
+                    const QUERY_INTERVAL_SECS: u64 = 2;
+                    let mut elapsed = 0u64;
+                    while elapsed < DISPLAYS_EMPTY_TIMEOUT_SECS {
+                        sleep(QUERY_INTERVAL_SECS as f32).await;
+                        // 代数变化说明显示器已恢复或开启了新连接轮次，退出等待。
+                        if handler.displays_empty_retries.load(Ordering::SeqCst) != gen {
+                            return;
+                        }
+                        let still_empty = handler
+                            .lc
+                            .read()
+                            .unwrap()
+                            .peer_info
+                            .as_ref()
+                            .map_or(false, |p| p.displays.is_empty());
+                        if !still_empty {
+                            return;
+                        }
+                        elapsed += QUERY_INTERVAL_SECS;
+                        if elapsed < DISPLAYS_EMPTY_TIMEOUT_SECS {
+                            handler.send_message_query(0);
+                        }
+                    }
                     let still_empty = handler
                         .lc
                         .read()
@@ -1873,9 +1898,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                         .peer_info
                         .as_ref()
                         .map_or(false, |p| p.displays.is_empty());
-                    if still_empty
-                        && handler.displays_empty_retries.load(Ordering::SeqCst) == gen
-                    {
+                    if still_empty && handler.displays_empty_retries.load(Ordering::SeqCst) == gen {
                         log::warn!(
                             "Peer displays still empty after {}s, showing error",
                             DISPLAYS_EMPTY_TIMEOUT_SECS

@@ -197,6 +197,19 @@ fn displays_to_msg(displays: Vec<DisplayInfo>) -> Message {
     msg_out
 }
 
+/// 重新枚举当前显示器并构造带 displays 的 PeerInfo 消息。
+///
+/// 用于响应客户端的显示器查询：RDP 会话切换等场景下，登录时 B 端显示器可能
+/// 暂时为空，客户端会卡在"正在连接"并周期性重发查询。这里把恢复后的显示器
+/// 列表回传给客户端，触发其 need_resume 逻辑完成连接。
+/// 只枚举物理显示器，不强制插入虚拟显示器，因此不依赖虚拟显示器驱动。
+pub fn refresh_displays_and_get_msg() -> Option<Message> {
+    let displays = try_get_displays().ok()?;
+    check_update_displays(&displays);
+    let infos = SYNC_DISPLAYS.lock().unwrap().displays.clone();
+    Some(displays_to_msg(infos))
+}
+
 fn check_get_displays_changed_msg() -> Option<Message> {
     #[cfg(target_os = "linux")]
     {

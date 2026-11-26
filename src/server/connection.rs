@@ -3829,6 +3829,15 @@ impl Connection {
                             self.video_source(),
                         ) {
                             self.send(msg_out).await;
+                        } else if self.video_source() == VideoSource::Monitor {
+                            // make_display_changed_msg 在显示器为空（如 RDP 会话切换窗口期）
+                            // 时会返回 None，导致客户端的查询收不到任何回应、一直卡在
+                            // "正在连接"。这里改为重新枚举显示器并回传带 displays 的
+                            // PeerInfo，触发客户端的 need_resume 逻辑完成连接。
+                            // 只枚举物理显示器，不依赖虚拟显示器驱动。
+                            if let Some(msg_out) = display_service::refresh_displays_and_get_msg() {
+                                self.send(msg_out).await;
+                            }
                         }
                     }
                     _ => {}
