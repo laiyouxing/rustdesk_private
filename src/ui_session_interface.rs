@@ -1671,6 +1671,28 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
+    /// 若对端报告了多个 Windows 会话，触发会话选择（或确认已选会话）。
+    /// 返回 true 表示会话选择/切换流程已启动，此时显示器为空属正常等待
+    /// （B 端正处于 wait_session_id_confirm，等客户端挑一个有显示的会话），
+    /// 不应走 "No displays" 的报错兜底。
+    pub fn handle_windows_sessions(&self, pi: &PeerInfo) -> bool {
+        if pi.windows_sessions.sessions.is_empty() {
+            return false;
+        }
+        let selected = self
+            .lc
+            .read()
+            .unwrap()
+            .selected_windows_session_id
+            .to_owned();
+        if selected == Some(pi.windows_sessions.current_sid) {
+            self.send_selected_session_id(pi.windows_sessions.current_sid.to_string());
+        } else {
+            self.set_multiple_windows_session(pi.windows_sessions.sessions.clone());
+        }
+        true
+    }
+
     #[inline]
     pub fn request_init_msgs(&self, display: usize) {
         self.send_message_query(display);
@@ -1858,6 +1880,11 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 // 会合并登录时保存的原始 peer_info 补跑本函数完成连接。
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
+                // RDP 占用期间 console 会话往往没有显示器，而 RDP 会话本身有正常桌面。
+                // 若对端报告了多个会话，先触发会话选择让用户挑一个有显示的会话（选择
+                // 后 B 端切会话重连，会开启新连接轮次使下面的兜底定时器失效）。此时
+                // 显示器为空是预期的，不能走 "No displays" 报错。
+                let waiting_session_choice = self.handle_windows_sessions(&pi);
                 // 时间兜底：B 端不会重发 LoginResponse，若显示器一直不恢复，
                 // 超时后报错，避免 UI 永远停在"正在连接"。
                 // displays_empty_retries 在此用作代数标记：每次进入空显示器等待、
@@ -1898,13 +1925,19 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                         .peer_info
                         .as_ref()
                         .map_or(false, |p| p.displays.is_empty());
-                    if still_empty && handler.displays_empty_retries.load(Ordering::SeqCst) == gen {
+                    if still_empty
+                        && handler.displays_empty_retries.load(Ordering::SeqCst) == gen
+                    {
                         log::warn!(
                             "Peer displays still empty after {}s, showing error",
                             DISPLAYS_EMPTY_TIMEOUT_SECS
                         );
                         let msg = if handler.is_view_camera() {
                             "No cameras"
+                        } else if waiting_session_choice {
+                            // 有多个会话但显示器一直为空：多半是 console 会话无显示、
+                            // RDP 会话才有画面。给出可操作的指引，而不是死胡同的报错。
+                            "no_displays_select_rdp_session"
                         } else {
                             "No displays"
                         };
@@ -1963,19 +1996,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 crate::platform::windows::add_recent_document(&path);
             }
         }
-        if !pi.windows_sessions.sessions.is_empty() {
-            let selected = self
-                .lc
-                .read()
-                .unwrap()
-                .selected_windows_session_id
-                .to_owned();
-            if selected == Some(pi.windows_sessions.current_sid) {
-                self.send_selected_session_id(pi.windows_sessions.current_sid.to_string());
-            } else {
-                self.set_multiple_windows_session(pi.windows_sessions.sessions.clone());
-            }
-        }
+        self.handle_windows_sessions(&pi);
     }
 
     async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream) {

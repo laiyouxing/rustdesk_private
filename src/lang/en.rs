@@ -298,5 +298,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Direct Success Rate", "Direct Success Rate"),
         ("peer_cone_nat", "Peer Cone"),
         ("peer_symmetric_nat", "Peer Symmetric"),
+        ("no_displays_select_rdp_session", "The current session has no display. Please select the Remote Desktop (RDP) session from the session list."),
     ].iter().cloned().collect();
 }

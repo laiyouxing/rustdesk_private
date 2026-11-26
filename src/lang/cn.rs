@@ -781,5 +781,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Direct Success Rate", "直连成功率"),
         ("peer_cone_nat", "对端锥形"),
         ("peer_symmetric_nat", "对端对称"),
+        ("no_displays_select_rdp_session", "当前会话没有显示器，请在会话列表中选择远程桌面(RDP)会话"),
     ].iter().cloned().collect();
 }
