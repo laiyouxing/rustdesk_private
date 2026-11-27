@@ -300,7 +300,17 @@ extern "C"
 
     // https://github.com/TigerVNC/tigervnc/blob/8c6c584377feba0e3b99eecb3ef33b28cee318cb/win/rfb_win32/Service.cxx
 
-    // Determine whether the thread's current desktop is the input one
+    // Determine whether the thread's current desktop is the input one.
+    //
+    // RDP / lock-screen note: while the session is locked or switching
+    // (mstsc disconnected, or the user logging in at the Winlogon secure
+    // desktop), OpenInputDesktop(..., GENERIC_WRITE) fails with access denied.
+    // Returning FALSE there made desktop_changed()/try_change_desktop() believe
+    // the desktop "really changed", so the video service kept bailing with
+    // "Desktop changed" and the headless display could never be plugged in -
+    // the user then saw "No displays" right after login. When the desktop
+    // cannot be opened reliably we report "no change"; only a confirmed name
+    // difference counts as a real change.
     BOOL
     inputDesktopSelected()
     {
@@ -312,7 +322,10 @@ extern "C"
                                            DESKTOP_SWITCHDESKTOP | GENERIC_WRITE);
         if (!input)
         {
-            return FALSE;
+            // Locked / secure desktop / session switching: cannot open the
+            // input desktop. Report "no change" to avoid a false "changed"
+            // signal that breaks capture after RDP disconnect / login.
+            return TRUE;
         }
 
         DWORD size;
@@ -322,12 +335,12 @@ extern "C"
         if (!GetUserObjectInformation(current, UOI_NAME, currentname, sizeof(currentname), &size))
         {
             CloseDesktop(input);
-            return FALSE;
+            return TRUE;
         }
         if (!GetUserObjectInformation(input, UOI_NAME, inputname, sizeof(inputname), &size))
         {
             CloseDesktop(input);
-            return FALSE;
+            return TRUE;
         }
         CloseDesktop(input);
         // flog("%s %s\n", currentname, inputname);
